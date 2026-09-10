@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+research_agent/.env
+research_agent/outputs/*
+!research_agent/outputs/.gitkeep
+research_agent/algorithms/candidates/*
+*.zip
+._*
+.DS_Store
