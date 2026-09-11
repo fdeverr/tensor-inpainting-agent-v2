@@ -12,6 +12,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run the tool-based, no-LLM Day 3 research workflow."
     )
     parser.add_argument("--image", required=True)
+    parser.add_argument("--mat-key", help="MAT variable name; auto-detected when omitted")
     parser.add_argument("--output-dir", default="research_agent/outputs")
     parser.add_argument("--mask-type", choices=("random", "block"), default="block")
     parser.add_argument("--missing-rate", type=float, default=0.4)
@@ -22,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-interval", type=int, default=10)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--skip-learned-metrics", action="store_true")
     return parser
 
 
@@ -35,11 +37,13 @@ def main() -> None:
             missing_rate=args.missing_rate,
             seed=args.seed,
             image_size=args.image_size or None,
+            mat_key=args.mat_key,
             max_steps=args.max_steps,
             validation_ratio=args.validation_ratio,
             validation_interval=args.validation_interval,
             patience=args.patience,
             device=args.device,
+            learned_metrics=not args.skip_learned_metrics,
         )
     )
     comparison = state["results"]["comparison"]

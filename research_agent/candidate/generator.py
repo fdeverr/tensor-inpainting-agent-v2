@@ -13,9 +13,9 @@ from ..method_selector import _json_from_text
 from .schemas import CandidateProposal
 
 
-PROMPT_VERSION = "day5-deep-candidate-v3"
+PROMPT_VERSION = "day5-multidimensional-candidate-v8"
 ALLOWED_CHANGES = [
-    "coordinate MLPs or Fourier-feature MLPs that continuously generate matrix/CP/Tucker factors",
+    "coordinate MLPs or Fourier-feature MLPs that continuously generate factors for any supported tensor baseline",
     "replace one or more learned factor tables with MLP-generated continuous factors",
     "convolutional decoders or convolutional residual refiners trained from scratch on the current image",
     "lightweight axial, patch, windowed, or latent-token self-attention/Transformer blocks",
@@ -37,8 +37,30 @@ FORBIDDEN_CHANGES = [
 
 BASE_CLASS_NAMES = {
     "matrix": "MatrixFactorization",
+    "mode3": "Mode3Factorization",
     "cp": "CPDecomposition",
+    "nonnegative_cp": "NonnegativeCPDecomposition",
     "tucker": "TuckerDecomposition",
+    "btd": "BlockTermDecomposition",
+    "tsvd": "TSVDDecomposition",
+    "nonnegative_tucker": "NonnegativeTuckerDecomposition",
+    "hierarchical_tucker": "HierarchicalTuckerDecomposition",
+    "tt": "TensorTrainDecomposition",
+    "tensor_ring": "TensorRingDecomposition",
+}
+
+BASE_SOURCE_FILES = {
+    "matrix": "matrix_factorization.py",
+    "mode3": "mode3_factorization.py",
+    "cp": "cp.py",
+    "nonnegative_cp": "nonnegative_cp.py",
+    "tucker": "tucker.py",
+    "btd": "block_term.py",
+    "tsvd": "t_svd.py",
+    "nonnegative_tucker": "nonnegative_tucker.py",
+    "hierarchical_tucker": "hierarchical_tucker.py",
+    "tt": "tensor_train.py",
+    "tensor_ring": "tensor_ring.py",
 }
 
 
@@ -73,8 +95,8 @@ class CandidateTensorInpaintingModel({base_class}):
 
     def loss_terms(self, prediction, observed, train_mask):
         terms = super().loss_terms(prediction, observed, train_mask)
-        vertical_tv = torch.abs(prediction[1:, :, :] - prediction[:-1, :, :]).mean()
-        horizontal_tv = torch.abs(prediction[:, 1:, :] - prediction[:, :-1, :]).mean()
+        vertical_tv = torch.abs(prediction[1:, ...] - prediction[:-1, ...]).mean()
+        horizontal_tv = torch.abs(prediction[:, 1:, ...] - prediction[:, :-1, ...]).mean()
         terms["tv_regularization"] = self.tv_weight * (vertical_tv + horizontal_tv)
         return terms
 
@@ -149,11 +171,10 @@ def load_improver_context(base_run_dir: str) -> Dict[str, Any]:
     if base_method not in BASE_CLASS_NAMES:
         raise ValueError("base run has unsupported selected_model")
 
+    models_dir = Path(__file__).resolve().parents[1] / "core/models"
     source_paths = {
-        "matrix": Path(__file__).resolve().parents[1]
-        / "core/models/matrix_factorization.py",
-        "cp": Path(__file__).resolve().parents[1] / "core/models/cp.py",
-        "tucker": Path(__file__).resolve().parents[1] / "core/models/tucker.py",
+        method: models_dir / filename
+        for method, filename in BASE_SOURCE_FILES.items()
     }
     history_path = Path(state["artifacts"]["tensor_history"])
     history_payload = json.loads(history_path.read_text(encoding="utf-8"))
@@ -255,9 +276,10 @@ class CandidateGenerator:
                         "width-channel factor from normalized coordinates using an MLP."
                     ),
                     (
-                        "For CP/Tucker, replace height_factor, width_factor, or "
-                        "channel_factor lookup tables with coordinate MLP outputs and "
-                        "perform the usual einsum/mode products."
+                        "For A-mode3-E/CP/Nonnegative CP/Tucker/BTD/t-SVD/Nonnegative Tucker/"
+                        "Hierarchical Tucker/TT/Tensor Ring, replace one or more spatial "
+                        "factor/core tables with coordinate MLP outputs and retain the "
+                        "corresponding contraction."
                     ),
                 ],
                 "deep_examples": [
@@ -268,7 +290,10 @@ class CandidateGenerator:
                 ],
                 "resource_rules": [
                     "All modules are initialized from scratch and optimized only through the fixed masked loss.",
-                    "The implementation must support arbitrary H and W from image_shape.",
+                    (
+                        "The implementation must support arbitrary H and W and both "
+                        "[H,W,C] and [H,W,T,C] image_shape values."
+                    ),
                     "Keep parameter count and activation memory practical for original-resolution images.",
                     "Never construct an [H*W, H*W] attention matrix.",
                 ],
@@ -311,10 +336,21 @@ class CandidateGenerator:
                     "torch",
                     "BaseTensorInpaintingModel",
                     "MatrixFactorization",
+                    "Mode3Factorization",
                     "CPDecomposition",
+                    "NonnegativeCPDecomposition",
                     "TuckerDecomposition",
+                    "BlockTermDecomposition",
+                    "TSVDDecomposition",
+                    "NonnegativeTuckerDecomposition",
+                    "HierarchicalTuckerDecomposition",
+                    "TensorTrainDecomposition",
+                    "TensorRingDecomposition",
                 ],
-                "forward_output": "float tensor [H, W, 3] with finite values",
+                "forward_output": (
+                    "finite floating tensor matching image_shape: [H,W,C] for "
+                    "color/MSI or [H,W,T,C] for video"
+                ),
                 "exact_method_signatures": {
                     "forward": "forward(self)",
                     "loss_terms": (
@@ -333,6 +369,12 @@ class CandidateGenerator:
                     (
                         "Every base class owns channel_bias and image_shape. Never "
                         "register, assign, or replace either protected attribute."
+                    ),
+                    (
+                        "Built-in models flatten every trailing dimension into a joint "
+                        "feature mode and restore image_shape at the output. Direct "
+                        "architectures must likewise use self.feature_count and "
+                        "self._restore_shape; never hard-code three output channels."
                     ),
                     (
                         "Call the chosen superclass __init__ exactly once before adding "

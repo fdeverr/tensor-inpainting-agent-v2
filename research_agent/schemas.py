@@ -25,7 +25,9 @@ class ExperimentConfig:
     missing_rate: float = 0.4
     seed: int = 42
     image_size: Optional[int] = 128
+    mat_key: Optional[str] = None
     missing_fill_value: float = 0.0
+    learned_metrics: bool = True
 
     def validate(self) -> None:
         image_path = Path(self.image_path)
@@ -40,8 +42,12 @@ class ExperimentConfig:
             raise ValueError("missing_rate must be strictly between 0 and 1")
         if self.image_size is not None and self.image_size < 8:
             raise ValueError("image_size must be at least 8, or None to keep the source size")
+        if self.mat_key is not None and not self.mat_key.strip():
+            raise ValueError("mat_key must be a non-empty string or None")
         if not 0.0 <= self.missing_fill_value <= 1.0:
             raise ValueError("missing_fill_value must be in [0, 1]")
+        if not isinstance(self.learned_metrics, bool):
+            raise ValueError("learned_metrics must be a bool")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -63,6 +69,11 @@ class ExperimentResult:
     composite_ssim: float
     runtime_seconds: float
     image_shape: list
+    lpips: Optional[float] = None
+    maniqa: Optional[float] = None
+    clip_iqa: Optional[float] = None
+    musiq: Optional[float] = None
+    learned_metric_status: Dict[str, Any] = field(default_factory=dict)
     artifacts: Dict[str, str] = field(default_factory=dict)
     notes: Dict[str, str] = field(default_factory=dict)
 
@@ -70,7 +81,19 @@ class ExperimentResult:
         return asdict(self)
 
 
-SUPPORTED_MODEL_NAMES = {"matrix", "cp", "tucker"}
+SUPPORTED_MODEL_NAMES = {
+    "matrix",
+    "mode3",
+    "cp",
+    "nonnegative_cp",
+    "tucker",
+    "btd",
+    "tsvd",
+    "nonnegative_tucker",
+    "hierarchical_tucker",
+    "tt",
+    "tensor_ring",
+}
 
 
 @dataclass(frozen=True)
@@ -119,7 +142,9 @@ class Day2ExperimentConfig:
     missing_rate: float = 0.4
     seed: int = 42
     image_size: Optional[int] = 128
+    mat_key: Optional[str] = None
     missing_fill_value: float = 0.0
+    learned_metrics: bool = True
 
     def validate(self) -> None:
         ExperimentConfig(
@@ -129,7 +154,9 @@ class Day2ExperimentConfig:
             missing_rate=self.missing_rate,
             seed=self.seed,
             image_size=self.image_size,
+            mat_key=self.mat_key,
             missing_fill_value=self.missing_fill_value,
+            learned_metrics=self.learned_metrics,
         ).validate()
         if self.model_name not in SUPPORTED_MODEL_NAMES:
             raise ValueError(

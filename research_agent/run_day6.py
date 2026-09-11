@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-interval", type=int, default=10)
     parser.add_argument("--patience", type=int, default=40)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--skip-learned-metrics", action="store_true")
     parser.add_argument("--minimum-psnr-delta", type=float, default=0.2)
     parser.add_argument("--ssim-tolerance", type=float, default=0.002)
     parser.add_argument("--smoke-timeout", type=float, default=10.0)
@@ -52,6 +53,7 @@ def main() -> None:
             validation_interval=args.validation_interval,
             patience=args.patience,
             device=args.device,
+            learned_metrics=not args.skip_learned_metrics,
             minimum_psnr_delta=args.minimum_psnr_delta,
             ssim_tolerance=args.ssim_tolerance,
             smoke_timeout_seconds=args.smoke_timeout,

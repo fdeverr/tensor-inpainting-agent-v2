@@ -11,8 +11,16 @@ import yaml
 
 METHOD_FILE_NAMES = {
     "matrix": "matrix_factorization.md",
+    "mode3": "mode3_factorization.md",
     "cp": "cp_decomposition.md",
+    "nonnegative_cp": "nonnegative_cp_decomposition.md",
     "tucker": "tucker_decomposition.md",
+    "btd": "block_term_decomposition.md",
+    "tsvd": "t_svd_decomposition.md",
+    "nonnegative_tucker": "nonnegative_tucker_decomposition.md",
+    "hierarchical_tucker": "hierarchical_tucker_decomposition.md",
+    "tt": "tensor_train_decomposition.md",
+    "tensor_ring": "tensor_ring_decomposition.md",
 }
 
 

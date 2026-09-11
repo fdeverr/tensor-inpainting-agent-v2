@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import itertools
 import json
-import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -12,8 +11,8 @@ import numpy as np
 import torch
 
 from ..schemas import TrainingConfig
-from .data import save_image
-from .metrics import composite_ssim, missing_region_mse, missing_region_psnr
+from .data import save_image, save_mat_companion, save_tensor_data
+from .metrics import evaluate_reconstruction_metrics
 from .trainer import (
     ModelBuilder,
     fit_tensor_model_on_all_observations,
@@ -192,6 +191,7 @@ def final_fit_and_evaluate(
     training_config: TrainingConfig,
     seed: int,
     output_dir: str,
+    include_learned_metrics: bool = True,
 ) -> Dict[str, Any]:
     """Refit on all observations, then and only then evaluate hidden pixels."""
 
@@ -213,22 +213,30 @@ def final_fit_and_evaluate(
     )
     completed = output.reconstruction.copy()
     completed[observed_mask] = observed_image[observed_mask]
-    psnr = missing_region_psnr(completed, ground_truth, observed_mask)
-    metrics = {
-        "missing_mse": missing_region_mse(completed, ground_truth, observed_mask),
-        "missing_psnr": psnr if math.isfinite(psnr) else None,
-        "perfect_reconstruction": not math.isfinite(psnr),
-        "composite_ssim": composite_ssim(completed, ground_truth, observed_mask),
-    }
+    metrics = evaluate_reconstruction_metrics(
+        completed,
+        ground_truth,
+        observed_mask,
+        device=training_config.device,
+        include_learned_metrics=include_learned_metrics,
+    )
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    raw_path = directory / "model_raw.png"
-    completed_path = directory / "model_completed.png"
+    raw_path = directory / "model_raw.npy"
+    completed_path = directory / "model_completed.npy"
+    raw_mat_path = directory / "model_raw.mat"
+    completed_mat_path = directory / "model_completed.mat"
+    raw_preview_path = directory / "model_raw_preview.png"
+    completed_preview_path = directory / "model_completed_preview.png"
     checkpoint_path = directory / "model.pt"
     history_path = directory / "final_fit_history.json"
     metrics_path = directory / "metrics.json"
-    save_image(str(raw_path), output.reconstruction)
-    save_image(str(completed_path), completed)
+    save_tensor_data(str(raw_path), output.reconstruction)
+    save_tensor_data(str(completed_path), completed)
+    raw_mat = save_mat_companion(str(raw_mat_path), output.reconstruction)
+    completed_mat = save_mat_companion(str(completed_mat_path), completed)
+    save_image(str(raw_preview_path), output.reconstruction)
+    save_image(str(completed_preview_path), completed)
     torch.save(
         {
             "model_name": model_name,
@@ -240,6 +248,19 @@ def final_fit_and_evaluate(
         checkpoint_path,
     )
     _write_json(history_path, {"history": output.history})
+    artifacts = {
+        "raw_reconstruction": str(raw_path),
+        "reconstruction": str(completed_path),
+        "raw_preview": str(raw_preview_path),
+        "preview": str(completed_preview_path),
+        "checkpoint": str(checkpoint_path),
+        "history": str(history_path),
+        "metrics": str(metrics_path),
+    }
+    if raw_mat is not None:
+        artifacts["raw_reconstruction_mat"] = raw_mat
+    if completed_mat is not None:
+        artifacts["reconstruction_mat"] = completed_mat
     result = {
         "model_name": model_name,
         "hyperparameters": selected_trial["hyperparameters"],
@@ -255,13 +276,7 @@ def final_fit_and_evaluate(
         ),
         "parameter_count": output.parameter_count,
         "observed_pixels_used": int(output.fit_mask.sum()),
-        "artifacts": {
-            "raw_reconstruction": str(raw_path),
-            "reconstruction": str(completed_path),
-            "checkpoint": str(checkpoint_path),
-            "history": str(history_path),
-            "metrics": str(metrics_path),
-        },
+        "artifacts": artifacts,
     }
     _write_json(metrics_path, result)
     return result

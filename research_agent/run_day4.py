@@ -12,16 +12,37 @@ def build_parser() -> argparse.ArgumentParser:
         description="Retrieve tensor knowledge, select a method, and run it."
     )
     parser.add_argument("--image", required=True)
+    parser.add_argument("--mat-key", help="MAT variable name; auto-detected when omitted")
     parser.add_argument("--output-dir", default="research_agent/outputs")
     parser.add_argument("--mask-type", choices=("random", "block"), default="block")
     parser.add_argument("--missing-rate", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image-size", type=int, default=128)
+    parser.add_argument(
+        "--base-model",
+        choices=(
+            "auto",
+            "matrix",
+            "mode3",
+            "cp",
+            "nonnegative_cp",
+            "tucker",
+            "btd",
+            "tsvd",
+            "nonnegative_tucker",
+            "hierarchical_tucker",
+            "tt",
+            "tensor_ring",
+        ),
+        default="auto",
+        help="automatically select or explicitly fix the base tensor decomposition",
+    )
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--validation-ratio", type=float, default=0.1)
     parser.add_argument("--validation-interval", type=int, default=10)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--skip-learned-metrics", action="store_true")
     parser.add_argument(
         "--llm-mode",
         choices=("auto", "off", "required"),
@@ -46,11 +67,14 @@ def main() -> None:
             missing_rate=args.missing_rate,
             seed=args.seed,
             image_size=args.image_size or None,
+            mat_key=args.mat_key,
+            model_name=args.base_model,
             max_steps=args.max_steps,
             validation_ratio=args.validation_ratio,
             validation_interval=args.validation_interval,
             patience=args.patience,
             device=args.device,
+            learned_metrics=not args.skip_learned_metrics,
             llm_mode=args.llm_mode,
             retrieval_top_k=args.retrieval_top_k,
         )
@@ -68,6 +92,9 @@ def main() -> None:
     print("  fallback_reason: %s" % diagnostics["fallback_reason"])
     print("  interpolation_psnr: %s" % _metric_text(interpolation["missing_psnr"]))
     print("  tensor_psnr: %s" % _metric_text(tensor["missing_psnr"]))
+    for key in ("lpips", "maniqa", "clip_iqa", "musiq"):
+        value = tensor.get(key)
+        print("  tensor_%s: %s" % (key, "N/A" if value is None else "%.6f" % value))
     print("  winner: %s" % comparison["winner"])
     print("  method_plan: %s" % state["artifacts"]["method_plan"])
     print("  state: %s" % state["artifacts"]["state"])

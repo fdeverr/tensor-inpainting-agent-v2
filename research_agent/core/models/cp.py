@@ -11,17 +11,18 @@ from .base import BaseTensorInpaintingModel
 
 
 class CPDecomposition(BaseTensorInpaintingModel):
-    """Represent an RGB image as a sum of rank-one third-order tensors."""
+    """Represent spatial/feature data as a sum of rank-one tensors."""
 
     def __init__(
         self,
-        image_shape: Tuple[int, int, int],
+        image_shape: Tuple[int, ...],
         initial_channel_mean: Sequence[float],
         rank: int = 12,
         init_scale: float = 0.2,
     ) -> None:
         super().__init__(image_shape, initial_channel_mean)
-        height, width, channels = self.image_shape
+        height, width = self.image_shape[:2]
+        features = self.feature_count
         if rank < 1:
             raise ValueError("CP rank must be positive")
         if init_scale <= 0.0:
@@ -30,7 +31,7 @@ class CPDecomposition(BaseTensorInpaintingModel):
         self.rank = int(rank)
         self.height_factor = nn.Parameter(torch.empty(height, self.rank))
         self.width_factor = nn.Parameter(torch.empty(width, self.rank))
-        self.channel_factor = nn.Parameter(torch.empty(channels, self.rank))
+        self.channel_factor = nn.Parameter(torch.empty(features, self.rank))
         nn.init.normal_(self.height_factor, mean=0.0, std=init_scale)
         nn.init.normal_(self.width_factor, mean=0.0, std=init_scale)
         nn.init.normal_(self.channel_factor, mean=0.0, std=init_scale)
@@ -42,10 +43,9 @@ class CPDecomposition(BaseTensorInpaintingModel):
             self.width_factor,
             self.channel_factor,
         )
-        return decomposition + self.channel_bias
+        return self._restore_shape(decomposition + self.channel_bias)
 
     @classmethod
-    def search_space(cls, image_shape: Tuple[int, int, int]) -> Dict[str, Any]:
+    def search_space(cls, image_shape: Tuple[int, ...]) -> Dict[str, Any]:
         del image_shape
         return {"rank": [4, 8, 12, 16, 24], "init_scale": [0.1, 0.2, 0.3]}
-

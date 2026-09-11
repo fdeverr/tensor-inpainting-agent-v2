@@ -1,5 +1,6 @@
 seed: 42
 image_size: 128
+base_model: auto
 mask_type: block
 missing_rate: 0.4
 missing_fill_value: 0.0
@@ -15,4 +16,5 @@ minimum_psnr_delta: 0.2
 ssim_tolerance: 0.002
 smoke_timeout_seconds: 10.0
 device: auto
+learned_metrics: true
 llm_mode: auto

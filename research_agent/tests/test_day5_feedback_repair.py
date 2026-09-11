@@ -117,6 +117,7 @@ def test_candidate_prompt_matches_the_executable_model_contract():
 
     assert contract["trainer_editable"] is False
     assert "TuckerDecomposition" in contract["preloaded_symbols"]
+    assert "Mode3Factorization" in contract["preloaded_symbols"]
     assert "from typing import ..." in contract["import_rules"][
         "forbidden_examples"
     ]

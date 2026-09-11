@@ -41,8 +41,16 @@ FORBIDDEN_CALLS = {
 ALLOWED_BASE_NAMES = {
     "BaseTensorInpaintingModel",
     "MatrixFactorization",
+    "Mode3Factorization",
     "CPDecomposition",
+    "NonnegativeCPDecomposition",
     "TuckerDecomposition",
+    "BlockTermDecomposition",
+    "TSVDDecomposition",
+    "NonnegativeTuckerDecomposition",
+    "HierarchicalTuckerDecomposition",
+    "TensorTrainDecomposition",
+    "TensorRingDecomposition",
 }
 REQUIRED_CLASS_NAME = "CandidateTensorInpaintingModel"
 PROTECTED_BASE_ATTRIBUTES = {"channel_bias", "image_shape"}

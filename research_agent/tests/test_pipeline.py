@@ -33,6 +33,7 @@ def test_day1_pipeline_writes_reproducible_artifacts(tmp_path):
         missing_rate=0.4,
         seed=42,
         image_size=None,
+        learned_metrics=False,
     )
 
     result = run_day1_baseline(config)
@@ -60,6 +61,7 @@ def test_day1_pipeline_repeats_mask_reconstruction_and_metrics(tmp_path):
         missing_rate=0.35,
         seed=19,
         image_size=None,
+        learned_metrics=False,
     )
 
     first = run_day1_baseline(config)

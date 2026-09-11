@@ -16,6 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run method selection, candidate generation, fair evaluation, and reporting."
     )
     parser.add_argument("--image", required=True)
+    parser.add_argument("--mat-key", help="MAT variable name; auto-detected when omitted")
     parser.add_argument("--prompt", default=DEFAULT_RESEARCH_PROMPT)
     parser.add_argument("--output-dir", default="research_agent/outputs")
     parser.add_argument("--candidate-root", default="research_agent/algorithms/candidates")
@@ -24,6 +25,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--missing-rate", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image-size", type=int, default=128)
+    parser.add_argument(
+        "--base-model",
+        choices=(
+            "auto",
+            "matrix",
+            "mode3",
+            "cp",
+            "nonnegative_cp",
+            "tucker",
+            "btd",
+            "tsvd",
+            "nonnegative_tucker",
+            "hierarchical_tucker",
+            "tt",
+            "tensor_ring",
+        ),
+        default="auto",
+        help="automatically select or explicitly fix the base tensor decomposition",
+    )
     parser.add_argument("--method-max-steps", type=int, default=1000)
     parser.add_argument(
         "--fair-max-steps",
@@ -37,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-interval", type=int, default=10)
     parser.add_argument("--patience", type=int, default=40)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument(
+        "--skip-learned-metrics",
+        action="store_true",
+        help="skip LPIPS/MANIQA/CLIP-IQA/MUSIQ evaluation",
+    )
     parser.add_argument("--llm-mode", choices=("auto", "off", "required"), default="auto")
     parser.add_argument("--retrieval-top-k", type=int, default=8)
     parser.add_argument("--minimum-psnr-delta", type=float, default=0.2)
@@ -58,6 +83,8 @@ def main() -> None:
             missing_rate=args.missing_rate,
             seed=args.seed,
             image_size=args.image_size or None,
+            mat_key=args.mat_key,
+            base_model=args.base_model,
             method_max_steps=args.method_max_steps,
             fair_max_steps=args.fair_max_steps,
             tuning_trials=args.tuning_trials,
@@ -66,6 +93,7 @@ def main() -> None:
             validation_interval=args.validation_interval,
             patience=args.patience,
             device=args.device,
+            learned_metrics=not args.skip_learned_metrics,
             llm_mode=args.llm_mode,
             retrieval_top_k=args.retrieval_top_k,
             minimum_psnr_delta=args.minimum_psnr_delta,
@@ -83,7 +111,19 @@ def main() -> None:
         % ("infinite (perfect)" if best_psnr is None else "%.4f dB" % best_psnr)
     )
     print("  best_ssim: %.4f" % state["best_available"]["metrics"]["composite_ssim"])
+    best_metrics = state["best_available"]["metrics"]
+    for key, label in (
+        ("lpips", "LPIPS"),
+        ("maniqa", "MANIQA"),
+        ("clip_iqa", "CLIP-IQA"),
+        ("musiq", "MUSIQ"),
+    ):
+        value = best_metrics.get(key)
+        print("  best_%s: %s" % (label.lower(), "N/A" if value is None else "%.4f" % value))
     print("  completion: %s" % state["artifacts"]["best_completion"])
+    print("  completion_data: %s" % state["artifacts"]["best_completion_data"])
+    if "best_completion_mat" in state["artifacts"]:
+        print("  completion_mat: %s" % state["artifacts"]["best_completion_mat"])
     print("  comparison_images:")
     for role, path in state["artifacts"].get("comparison_images", {}).items():
         print("    %s: %s" % (role, path))

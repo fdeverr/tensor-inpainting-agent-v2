@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from ..candidate import candidate_builder, load_validated_candidate
-from ..core.data import load_observation_mask, load_rgb_image
+from ..core.data import load_observation_mask, load_tensor_data
 from ..core.fair_experiment import final_fit_and_evaluate
 from ..schemas import TrainingConfig
 from .framework import ToolParameter, ToolResponse
@@ -35,6 +35,13 @@ class AlgorithmRunnerTool(ResearchTool):
             ToolParameter(name="output_dir", type="string", description="本次运行输出目录"),
             ToolParameter(name="seed", type="integer", description="随机种子", required=False, default=42),
             ToolParameter(name="device", type="string", description="auto、cpu 或 cuda", required=False, default="auto"),
+            ToolParameter(
+                name="learned_metrics",
+                type="boolean",
+                description="是否计算 LPIPS/MANIQA/CLIP-IQA/MUSIQ",
+                required=False,
+                default=True,
+            ),
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
@@ -52,9 +59,9 @@ class AlgorithmRunnerTool(ResearchTool):
             if approved_manifest.get("code_sha256") != source_manifest.get("code_sha256"):
                 raise ValueError("approved manifest code hash is inconsistent")
 
-            observed = load_rgb_image(_required_string(parameters, "corrupted_path"), None)
+            observed = load_tensor_data(_required_string(parameters, "corrupted_path"), None)
             mask = load_observation_mask(_required_string(parameters, "mask_path"))
-            ground_truth = load_rgb_image(
+            ground_truth = load_tensor_data(
                 _required_string(parameters, "ground_truth_path"), None
             )
             training = TrainingConfig(
@@ -81,6 +88,9 @@ class AlgorithmRunnerTool(ResearchTool):
                 training_config=training,
                 seed=int(parameters.get("seed", 42)),
                 output_dir=_required_string(parameters, "output_dir"),
+                include_learned_metrics=bool(
+                    parameters.get("learned_metrics", True)
+                ),
             )
             return ToolResponse.success(
                 text="已晋升算法运行完成。",

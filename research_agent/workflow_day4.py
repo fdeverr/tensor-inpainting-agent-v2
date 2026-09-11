@@ -7,13 +7,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .knowledge import LocalKnowledgeRetriever
-from .method_selector import MethodSelector, llm_from_environment
+from .method_selector import (
+    MethodSelector,
+    _spatial_feature_shape,
+    llm_from_environment,
+    manual_method_plan,
+)
+from .schemas import SUPPORTED_MODEL_NAMES
 from .workflow import Day3Workflow, Day3WorkflowConfig, _write_json
 
 
 SELECTION_QUERY = (
-    "Choose matrix, CP, or Tucker tensor decomposition for image inpainting "
-    "using missing pattern, channel correlation, local smoothness, high frequency, "
+    "Choose matrix, A mode-3 E, CP, Nonnegative CP, Tucker, BTD, t-SVD, "
+    "Nonnegative Tucker, "
+    "Hierarchical Tucker, Tensor Train, or Tensor Ring "
+    "decomposition for color image, MSI, or video tensor inpainting "
+    "using missing pattern, channel/feature correlation, local smoothness, high frequency, "
     "spatial anisotropy, rank guidance, limitations, and failure modes."
 )
 
@@ -35,8 +44,13 @@ class Day4WorkflowConfig(Day3WorkflowConfig):
             raise ValueError("missing_rate must be strictly between 0 and 1")
         if self.image_size is not None and self.image_size < 8:
             raise ValueError("image_size must be at least 8 or None")
-        if self.model_name != "auto":
-            raise ValueError("Day 4 model_name must be auto")
+        if self.mat_key is not None and not self.mat_key.strip():
+            raise ValueError("mat_key must be a non-empty string or None")
+        if self.model_name not in {"auto", *SUPPORTED_MODEL_NAMES}:
+            raise ValueError(
+                "model_name must be auto or one of %s"
+                % sorted(SUPPORTED_MODEL_NAMES)
+            )
         if self.max_steps < 1:
             raise ValueError("max_steps must be positive")
         if not 0.0 < self.validation_ratio < 1.0:
@@ -45,6 +59,8 @@ class Day4WorkflowConfig(Day3WorkflowConfig):
             raise ValueError("validation_interval and patience must be positive")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be auto, cpu, or cuda")
+        if not isinstance(self.learned_metrics, bool):
+            raise ValueError("learned_metrics must be a bool")
         if self.llm_mode not in {"auto", "off", "required"}:
             raise ValueError("llm_mode must be auto, off, or required")
         if self.retrieval_top_k < 1:
@@ -78,27 +94,67 @@ def _candidates_from_plan(
     learning_rate = float(suggestions.get("learning_rate", 0.03))
     if not 1e-5 <= learning_rate <= 1.0:
         learning_rate = 0.03
-    if method in {"matrix", "cp"}:
-        max_rank = (
-            int(profile["image_shape"][0]) if method == "matrix" else 64
-        )
+    if method in {
+        "matrix",
+        "mode3",
+        "cp",
+        "nonnegative_cp",
+        "tsvd",
+        "tensor_ring",
+    }:
+        height, width, channels = _spatial_feature_shape(profile)
+        max_rank = {
+            "matrix": min(height, width * channels),
+            "mode3": min(height * width, channels),
+            "cp": 64,
+            "nonnegative_cp": 64,
+            "tsvd": min(height, width),
+            "tensor_ring": min(16, height, width),
+        }[method]
         ranks = _positive_ints(
             suggestions.get("rank_candidates"),
             maximum=max_rank,
         )
         if not ranks:
             return None
-        init_scale = float(
-            suggestions.get("init_scale", 0.1 if method == "matrix" else 0.2)
-        )
+        default_init_scale = 0.2 if method == "cp" else 0.1
+        init_scale = float(suggestions.get("init_scale", default_init_scale))
         if not 0.0 < init_scale <= 1.0:
-            init_scale = 0.1 if method == "matrix" else 0.2
+            init_scale = default_init_scale
         return [
             {
                 "hyperparameters": {"rank": rank, "init_scale": init_scale},
                 "learning_rate": learning_rate,
             }
             for rank in ranks[:3]
+        ]
+
+    if method == "tt":
+        height, width, channels = _spatial_feature_shape(profile)
+        rank_1 = _positive_ints(
+            suggestions.get("rank_1_candidates"),
+            maximum=min(height, width * channels),
+        )
+        rank_2 = _positive_ints(
+            suggestions.get("rank_2_candidates"),
+            maximum=min(height * width, channels),
+        )
+        if not rank_1 or not rank_2:
+            return None
+        init_scale = float(suggestions.get("init_scale", 0.1))
+        if not 0.0 < init_scale <= 1.0:
+            init_scale = 0.1
+        count = min(3, max(len(rank_1), len(rank_2)))
+        return [
+            {
+                "hyperparameters": {
+                    "rank_1": rank_1[min(index, len(rank_1) - 1)],
+                    "rank_2": rank_2[min(index, len(rank_2) - 1)],
+                    "init_scale": init_scale,
+                },
+                "learning_rate": learning_rate,
+            }
+            for index in range(count)
         ]
 
     rank_h = _positive_ints(
@@ -109,27 +165,67 @@ def _candidates_from_plan(
         suggestions.get("rank_w_candidates"),
         maximum=int(profile["image_shape"][1]),
     )
-    rank_c = _positive_ints(suggestions.get("rank_c_candidates"), maximum=3)
+    _, _, feature_count = _spatial_feature_shape(profile)
+    rank_c = _positive_ints(
+        suggestions.get("rank_c_candidates"), maximum=feature_count
+    )
     if not rank_h or not rank_w or not rank_c:
         return None
     init_scale = float(suggestions.get("init_scale", 0.15))
     if not 0.0 < init_scale <= 1.0:
         init_scale = 0.15
-    count = min(3, max(len(rank_h), len(rank_w), len(rank_c)))
+    extra_values: Dict[str, List[int]] = {}
+    if method == "btd":
+        num_blocks = _positive_ints(
+            suggestions.get("num_blocks_candidates"), maximum=4
+        )
+        if not num_blocks:
+            return None
+        extra_values["num_blocks"] = num_blocks
+    elif method == "hierarchical_tucker":
+        rank_spatial = _positive_ints(
+            suggestions.get("rank_spatial_candidates"),
+            maximum=min(
+                int(profile["image_shape"][0]) * int(profile["image_shape"][1]),
+                feature_count,
+            ),
+        )
+        if not rank_spatial:
+            return None
+        extra_values["rank_spatial"] = rank_spatial
+    elif method not in {"tucker", "nonnegative_tucker"}:
+        return None
+
+    candidate_lengths = [len(rank_h), len(rank_w), len(rank_c)] + [
+        len(values) for values in extra_values.values()
+    ]
+    count = min(3, max(candidate_lengths))
     candidates = []
     for index in range(count):
+        hyperparameters = {
+            "rank_h": rank_h[min(index, len(rank_h) - 1)],
+            "rank_w": rank_w[min(index, len(rank_w) - 1)],
+            "rank_c": rank_c[min(index, len(rank_c) - 1)],
+            "init_scale": init_scale,
+        }
+        for name, values in extra_values.items():
+            hyperparameters[name] = values[min(index, len(values) - 1)]
+        if (
+            method == "hierarchical_tucker"
+            and hyperparameters["rank_spatial"]
+            > min(
+                hyperparameters["rank_h"] * hyperparameters["rank_w"],
+                hyperparameters["rank_c"],
+            )
+        ):
+            continue
         candidates.append(
             {
-                "hyperparameters": {
-                    "rank_h": rank_h[min(index, len(rank_h) - 1)],
-                    "rank_w": rank_w[min(index, len(rank_w) - 1)],
-                    "rank_c": rank_c[min(index, len(rank_c) - 1)],
-                    "init_scale": init_scale,
-                },
+                "hyperparameters": hyperparameters,
                 "learning_rate": learning_rate,
             }
         )
-    return candidates
+    return candidates or None
 
 
 class Day4Workflow(Day3Workflow):
@@ -160,7 +256,16 @@ class Day4Workflow(Day3Workflow):
             query=SELECTION_QUERY,
             top_k=self.config.retrieval_top_k,
         )
-        selection = self.selector.select(profile=profile, retrieval=retrieval)
+        if self.config.model_name == "auto":
+            selection = self.selector.select(profile=profile, retrieval=retrieval)
+        else:
+            selection = {
+                "plan": manual_method_plan(self.config.model_name, profile),
+                "attempts": 0,
+                "fallback_reason": None,
+                "validation_errors": [],
+                "raw_outputs": [],
+            }
         plan = selection["plan"]
         plan_payload = plan.model_dump()
 
@@ -190,7 +295,7 @@ class Day4Workflow(Day3Workflow):
             "attempts": selection["attempts"],
             "fallback_reason": selection["fallback_reason"],
             "validation_errors": selection["validation_errors"],
-            "llm_used": self.llm_used,
+            "llm_used": self.llm_used and self.config.model_name == "auto",
         }
         return plan_payload
 

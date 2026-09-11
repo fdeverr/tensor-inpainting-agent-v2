@@ -10,13 +10,14 @@ from typing import Any, Dict, Optional
 
 from .agent_tools.framework import TraceLogger
 from .reporting import build_method_results, write_research_report
+from .schemas import SUPPORTED_MODEL_NAMES
 from .workflow import _make_run_id, _write_json
 from .workflow_day4 import Day4WorkflowConfig, run_day4_workflow
 from .workflow_day5 import Day5WorkflowConfig, run_day5_workflow
 from .workflow_day6 import Day6WorkflowConfig, run_day6_workflow
 
 
-DEFAULT_RESEARCH_PROMPT = "请分析图像和缺失模式，选择合适的张量分解，并在公平实验下提出、验证和改进一个补全算法。"
+DEFAULT_RESEARCH_PROMPT = "请分析彩图、MSI 或视频张量及其缺失模式，选择合适的张量分解，并在公平实验下提出、验证和改进一个补全算法。"
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,8 @@ class FullWorkflowConfig:
     missing_rate: float = 0.4
     seed: int = 42
     image_size: Optional[int] = 128
+    mat_key: Optional[str] = None
+    base_model: str = "auto"
     method_max_steps: int = 1000
     fair_max_steps: int = 2000
     tuning_trials: int = 4
@@ -43,6 +46,7 @@ class FullWorkflowConfig:
     minimum_psnr_delta: float = 0.2
     ssim_tolerance: float = 0.002
     smoke_timeout_seconds: float = 10.0
+    learned_metrics: bool = True
 
     def validate(self) -> None:
         if not Path(self.image_path).is_file():
@@ -55,12 +59,21 @@ class FullWorkflowConfig:
             raise ValueError("missing_rate must be in (0, 1)")
         if self.image_size is not None and self.image_size < 8:
             raise ValueError("image_size must be at least 8 or None")
+        if self.mat_key is not None and not self.mat_key.strip():
+            raise ValueError("mat_key must be a non-empty string or None")
+        if self.base_model not in {"auto", *SUPPORTED_MODEL_NAMES}:
+            raise ValueError(
+                "base_model must be auto or one of %s"
+                % sorted(SUPPORTED_MODEL_NAMES)
+            )
         if min(self.method_max_steps, self.fair_max_steps) < 1:
             raise ValueError("training steps must be positive")
         if not 1 <= self.tuning_trials <= 5:
             raise ValueError("tuning_trials must be in [1, 5]")
         if not 1 <= self.max_improvement_rounds <= 2:
             raise ValueError("max_improvement_rounds must be in [1, 2]")
+        if not isinstance(self.learned_metrics, bool):
+            raise ValueError("learned_metrics must be a bool")
 
 
 def _score(metrics: Dict[str, Any]) -> float:
@@ -76,7 +89,11 @@ def _export_comparison_images(
 
     directory = run_dir / "comparison_images"
     directory.mkdir(parents=True, exist_ok=True)
-    sources = {"corrupted_input": day4["artifacts"]["corrupted"]}
+    sources = {
+        "corrupted_input": day4["artifacts"].get(
+            "corrupted_preview", day4["artifacts"]["corrupted"]
+        )
+    }
     output_names = {
         "corrupted_input": "00_corrupted_input.png",
         "interpolation_baseline": "01_manhattan_interpolation.png",
@@ -86,7 +103,7 @@ def _export_comparison_images(
     for result in method_results:
         role = result["role"]
         if role in output_names:
-            sources[role] = result["reconstruction"]
+            sources[role] = result.get("preview", result["reconstruction"])
 
     exported = {}
     for role, source in sources.items():
@@ -166,7 +183,7 @@ class FullResearchWorkflow:
         try:
             # ── 阶段 1：方法选择（Day 4 工作流）──────────────────────────
             # 输入：图片、mask 类型/缺失率、训练预算（Day4WorkflowConfig）
-            # 作用：分析图像 → 最近邻插值 → 检索知识库选择 Matrix/CP/Tucker → 训练基础张量模型
+            # 作用：分析图像 → 最近邻插值 → 自动/手动选择十一种分解之一 → 训练基础张量模型
             # 输出：day4 state（selected_model、image_profile、插值/张量指标、run 目录路径）
             self.state["stage"] = "METHOD_SELECTION"
             self._save()
@@ -181,11 +198,14 @@ class FullResearchWorkflow:
                     missing_rate=self.config.missing_rate,
                     seed=self.config.seed,
                     image_size=self.config.image_size,
+                    mat_key=self.config.mat_key,
+                    model_name=self.config.base_model,
                     max_steps=self.config.method_max_steps,
                     validation_ratio=self.config.validation_ratio,
                     validation_interval=self.config.validation_interval,
                     patience=self.config.patience,
                     device=self.config.device,
+                    learned_metrics=self.config.learned_metrics,
                     llm_mode=self.config.llm_mode,
                     retrieval_top_k=self.config.retrieval_top_k,
                 )
@@ -237,6 +257,7 @@ class FullResearchWorkflow:
                         validation_interval=self.config.validation_interval,
                         patience=self.config.patience,
                         device=self.config.device,
+                        learned_metrics=self.config.learned_metrics,
                         minimum_psnr_delta=self.config.minimum_psnr_delta,
                         ssim_tolerance=self.config.ssim_tolerance,
                         smoke_timeout_seconds=self.config.smoke_timeout_seconds,
@@ -272,15 +293,30 @@ class FullResearchWorkflow:
                 if item["eligible_for_final_output"]
             ]
             winner = max(eligible, key=lambda item: _score(item["metrics"]))
-            best_path = self.run_dir / "best_completion.png"
-            shutil.copy2(winner["reconstruction"], best_path)
+            best_data_path = self.run_dir / "best_completion.npy"
+            best_mat_path = self.run_dir / "best_completion.mat"
+            best_preview_path = self.run_dir / "best_completion.png"
+            shutil.copy2(winner["reconstruction"], best_data_path)
+            shutil.copy2(winner["preview"], best_preview_path)
+            winner_mat = winner.get("reconstruction_mat")
+            if winner_mat:
+                shutil.copy2(winner_mat, best_mat_path)
             self.state["best_available"] = {
                 **winner,
                 "source_reconstruction": winner["reconstruction"],
-                "reconstruction": str(best_path),
+                "source_preview": winner["preview"],
+                "reconstruction": str(best_data_path),
+                "preview": str(best_preview_path),
             }
+            if winner_mat:
+                self.state["best_available"]["reconstruction_mat"] = str(
+                    best_mat_path
+                )
             self.state["candidate_accepted"] = bool(day6 and day6["accepted"])
-            self.state["artifacts"]["best_completion"] = str(best_path)
+            self.state["artifacts"]["best_completion"] = str(best_preview_path)
+            self.state["artifacts"]["best_completion_data"] = str(best_data_path)
+            if winner_mat:
+                self.state["artifacts"]["best_completion_mat"] = str(best_mat_path)
             self.state["stage"] = "COMPLETED"
             self._save()
             write_research_report(

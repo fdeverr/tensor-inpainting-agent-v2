@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from typing import Any, Dict, List, Literal, Optional
@@ -24,13 +25,27 @@ class MethodPlan(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    method: Literal["matrix", "cp", "tucker"]
+    method: Literal[
+        "matrix",
+        "mode3",
+        "cp",
+        "nonnegative_cp",
+        "tucker",
+        "btd",
+        "tsvd",
+        "nonnegative_tucker",
+        "hierarchical_tucker",
+        "tt",
+        "tensor_ring",
+    ]
     reason: str = Field(min_length=20, max_length=1200)
     evidence: List[EvidenceReference] = Field(min_length=1, max_length=6)
     confidence: float = Field(ge=0.0, le=1.0)
     suggested_hyperparameters: Dict[str, Any]
     risks: List[str] = Field(min_length=1, max_length=6)
-    selection_mode: Literal["llm", "llm_repaired", "deterministic_fallback"] = "llm"
+    selection_mode: Literal[
+        "llm", "llm_repaired", "deterministic_fallback", "manual"
+    ] = "llm"
 
     @field_validator("suggested_hyperparameters") #用classmethod验证suggested_hyperparameters字段
     @classmethod
@@ -72,7 +87,15 @@ HYPERPARAMETER_CONTRACTS = {
         "required": ["rank_candidates"],
         "optional": ["learning_rate", "init_scale"],
     },
+    "mode3": {
+        "required": ["rank_candidates"],
+        "optional": ["learning_rate", "init_scale"],
+    },
     "cp": {
+        "required": ["rank_candidates"],
+        "optional": ["learning_rate", "init_scale"],
+    },
+    "nonnegative_cp": {
         "required": ["rank_candidates"],
         "optional": ["learning_rate", "init_scale"],
     },
@@ -84,7 +107,52 @@ HYPERPARAMETER_CONTRACTS = {
         ],
         "optional": ["learning_rate", "init_scale"],
     },
+    "btd": {
+        "required": [
+            "num_blocks_candidates",
+            "rank_h_candidates",
+            "rank_w_candidates",
+            "rank_c_candidates",
+        ],
+        "optional": ["learning_rate", "init_scale"],
+    },
+    "tsvd": {
+        "required": ["rank_candidates"],
+        "optional": ["learning_rate", "init_scale"],
+    },
+    "nonnegative_tucker": {
+        "required": [
+            "rank_h_candidates",
+            "rank_w_candidates",
+            "rank_c_candidates",
+        ],
+        "optional": ["learning_rate", "init_scale"],
+    },
+    "hierarchical_tucker": {
+        "required": [
+            "rank_h_candidates",
+            "rank_w_candidates",
+            "rank_c_candidates",
+            "rank_spatial_candidates",
+        ],
+        "optional": ["learning_rate", "init_scale"],
+    },
+    "tt": {
+        "required": ["rank_1_candidates", "rank_2_candidates"],
+        "optional": ["learning_rate", "init_scale"],
+    },
+    "tensor_ring": {
+        "required": ["rank_candidates"],
+        "optional": ["learning_rate", "init_scale"],
+    },
 }
+
+
+def _spatial_feature_shape(profile: Dict[str, Any]) -> tuple[int, int, int]:
+    shape = tuple(int(value) for value in profile["image_shape"])
+    if len(shape) not in (3, 4):
+        raise ValueError("profile image_shape must be [H,W,C] or [H,W,T,C]")
+    return shape[0], shape[1], int(math.prod(shape[2:]))
 
 
 def _validate_hyperparameter_contract(
@@ -110,13 +178,24 @@ def _validate_hyperparameter_contract(
             % (plan.method, unexpected)
         )
 
+    height, width, channels = _spatial_feature_shape(profile)
+    single_rank_maximum = {
+        "matrix": min(height, width * channels),
+        "mode3": min(height * width, channels),
+        "cp": 64,
+        "nonnegative_cp": 64,
+        "tsvd": min(height, width),
+        "tensor_ring": min(16, height, width),
+    }.get(plan.method, 64)
     maxima = {
-        "rank_candidates": (
-            int(profile["image_shape"][0]) if plan.method == "matrix" else 64
-        ),
+        "rank_candidates": single_rank_maximum,
         "rank_h_candidates": int(profile["image_shape"][0]),
         "rank_w_candidates": int(profile["image_shape"][1]),
-        "rank_c_candidates": int(profile["image_shape"][2]),
+        "rank_c_candidates": channels,
+        "rank_1_candidates": min(height, width * channels),
+        "rank_2_candidates": min(height * width, channels),
+        "num_blocks_candidates": 4,
+        "rank_spatial_candidates": min(height * width, channels),
     }
     for field_name in required:
         values = suggestions[field_name]
@@ -147,21 +226,110 @@ def _validate_hyperparameter_contract(
 
 def _default_hyperparameters(method: str, profile: Dict[str, Any]) -> Dict[str, Any]:
     if method == "matrix":
-        return {"rank_candidates": [8, 16], "init_scale": 0.1}
+        height, width, channels = _spatial_feature_shape(profile)
+        max_rank = min(height, width * channels)
+        return {
+            "rank_candidates": sorted(
+                {max(1, min(max_rank, value)) for value in (8, 16)}
+            ),
+            "init_scale": 0.1,
+        }
+    if method == "mode3":
+        _, _, channels = _spatial_feature_shape(profile)
+        return {
+            "rank_candidates": sorted(
+                {max(1, min(channels, value)) for value in (1, 2, 4, 8, 16, 32)}
+            ),
+            "init_scale": 0.1,
+        }
     if method == "cp":
         return {"rank_candidates": [8, 12], "init_scale": 0.2}
+    if method == "nonnegative_cp":
+        return {"rank_candidates": [8, 12], "init_scale": 0.1}
+    if method == "tsvd":
+        height, width, _ = _spatial_feature_shape(profile)
+        max_rank = min(height, width)
+        return {
+            "rank_candidates": sorted(
+                {max(1, min(max_rank, value)) for value in (2, 4, 8, 16)}
+            ),
+            "init_scale": 0.1,
+        }
+    if method == "tt":
+        height, width, channels = _spatial_feature_shape(profile)
+        max_rank_1 = min(height, width * channels)
+        max_rank_2 = min(height * width, channels)
+        return {
+            "rank_1_candidates": sorted(
+                {max(1, min(max_rank_1, value)) for value in (4, 8, 16)}
+            ),
+            "rank_2_candidates": sorted(
+                {max(1, min(max_rank_2, value)) for value in (1, 2, 3, 4, 8, 16)}
+            ),
+            "init_scale": 0.1,
+        }
+    if method == "tensor_ring":
+        height, width, _ = _spatial_feature_shape(profile)
+        max_rank = min(16, height, width)
+        return {
+            "rank_candidates": sorted(
+                {max(1, min(max_rank, value)) for value in (2, 4, 6)}
+            ),
+            "init_scale": 0.1,
+        }
+    height, width, channels = _spatial_feature_shape(profile)
+    if method == "btd":
+        return {
+            "num_blocks_candidates": [1, 2, 3],
+            "rank_h_candidates": sorted(
+                {max(1, min(height, value)) for value in (4, 8, 16)}
+            ),
+            "rank_w_candidates": sorted(
+                {max(1, min(width, value)) for value in (4, 8, 16)}
+            ),
+            "rank_c_candidates": sorted(
+                {max(1, min(channels, value)) for value in (1, 2, 3, 4, 8, 16)}
+            ),
+            "init_scale": 0.1,
+        }
+    if method == "hierarchical_tucker":
+        return {
+            "rank_h_candidates": sorted(
+                {max(1, min(height, value)) for value in (4, 8, 16)}
+            ),
+            "rank_w_candidates": sorted(
+                {max(1, min(width, value)) for value in (4, 8, 16)}
+            ),
+            "rank_c_candidates": [channels],
+            "rank_spatial_candidates": sorted(
+                {max(1, min(channels, value)) for value in (1, 2, 4, 8)}
+            ),
+            "init_scale": 0.1,
+        }
     aspect_ratio = float(profile["image_aspect_ratio"])
     if aspect_ratio >= 1.6:
         return {
-            "rank_h_candidates": [8, 12],
-            "rank_w_candidates": [12, 16],
-            "rank_c_candidates": [2, 3],
+            "rank_h_candidates": sorted(
+                {max(1, min(height, value)) for value in (8, 12)}
+            ),
+            "rank_w_candidates": sorted(
+                {max(1, min(width, value)) for value in (12, 16)}
+            ),
+            "rank_c_candidates": sorted(
+                {max(1, min(channels, value)) for value in (2, 3)}
+            ),
             "init_scale": 0.15,
         }
     return {
-        "rank_h_candidates": [8, 16],
-        "rank_w_candidates": [8, 16],
-        "rank_c_candidates": [2, 3],
+        "rank_h_candidates": sorted(
+            {max(1, min(height, value)) for value in (8, 16)}
+        ),
+        "rank_w_candidates": sorted(
+            {max(1, min(width, value)) for value in (8, 16)}
+        ),
+        "rank_c_candidates": sorted(
+            {max(1, min(channels, value)) for value in (2, 3)}
+        ),
         "init_scale": 0.15,
     }
 
@@ -172,10 +340,11 @@ def deterministic_method_plan(
 ) -> MethodPlan:
     """Create a reproducible fallback from activated, weighted rules."""
 
-    scores = {"matrix": 0.0, "cp": 0.0, "tucker": 0.0}
+    method_names = tuple(HYPERPARAMETER_CONTRACTS)
+    scores = {method: 0.0 for method in method_names}
     for rule in retrieval["active_rules"]:
         scores[str(rule["prefer"])] += float(rule.get("weight", 1.0))
-    method = max(("matrix", "cp", "tucker"), key=lambda name: (scores[name], name))
+    method = max(method_names, key=lambda name: (scores[name], name))
     supporting_rules = [
         rule for rule in retrieval["active_rules"] if rule["prefer"] == method
     ]
@@ -197,7 +366,11 @@ def deterministic_method_plan(
         ]
         reason = "No profile rule dominated, so the highest-scoring local evidence was used."
     total_score = sum(scores.values())
-    confidence = scores[method] / total_score if total_score > 0 else 1.0 / 3.0
+    confidence = (
+        scores[method] / total_score
+        if total_score > 0
+        else 1.0 / len(method_names)
+    )
     return MethodPlan(
         method=method,
         reason=(
@@ -219,6 +392,39 @@ def deterministic_method_plan(
         ],
         selection_mode="deterministic_fallback",
     )
+
+
+def manual_method_plan(method: str, profile: Dict[str, Any]) -> MethodPlan:
+    """Create a validated plan when the caller explicitly fixes the base method."""
+
+    if method not in HYPERPARAMETER_CONTRACTS:
+        raise ValueError("unsupported manual tensor method: %s" % method)
+    plan = MethodPlan(
+        method=method,
+        reason=(
+            "The base tensor decomposition was explicitly fixed by the user, so "
+            "automatic method ranking was bypassed while bounded tuning remains "
+            "enabled."
+        ),
+        evidence=[
+            EvidenceReference(
+                source="user_cli:--base-model",
+                claim=(
+                    "The user explicitly selected %s as the base decomposition."
+                    % method
+                ),
+            )
+        ],
+        confidence=1.0,
+        suggested_hyperparameters=_default_hyperparameters(method, profile),
+        risks=[
+            "A manually fixed decomposition may be less suitable than another "
+            "method for this image."
+        ],
+        selection_mode="manual",
+    )
+    _validate_hyperparameter_contract(plan, profile)
+    return plan
 
 
 class MethodSelector:
@@ -258,9 +464,7 @@ class MethodSelector:
                     "keys may be omitted. Do not invent aliases such as rank, "
                     "spatial_rank_candidates, or channel_rank_candidates."
                 ),
-                "matrix": HYPERPARAMETER_CONTRACTS["matrix"],
-                "cp": HYPERPARAMETER_CONTRACTS["cp"],
-                "tucker": HYPERPARAMETER_CONTRACTS["tucker"],
+                **HYPERPARAMETER_CONTRACTS,
             },
             "output_schema": schema,
         }
@@ -269,7 +473,11 @@ class MethodSelector:
                 "role": "system",
                 "content": (
                     "You are a tensor-decomposition method selector. Return one JSON "
-                    "object only. Choose exactly one of matrix, cp, or tucker. Every "
+                    "object only. Choose exactly one of matrix, mode3, cp, "
+                    "nonnegative_cp, tucker, btd, tsvd, nonnegative_tucker, "
+                    "hierarchical_tucker, tt, or tensor_ring. Here mode3 means "
+                    "X = A ×₃ E; btd is Block-Term "
+                    "Decomposition; tsvd is a low-tubal-rank t-product model. Every "
                     "reason must cite supplied profile values or allowed evidence sources. "
                     "Never request or infer missing-region ground truth or final metrics."
                 ),

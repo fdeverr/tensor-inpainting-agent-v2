@@ -7,8 +7,9 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
+from .schemas import SUPPORTED_MODEL_NAMES
 from .workflow import _make_run_id, _write_json
 from .workflow_full import FullWorkflowConfig, run_full_workflow
 
@@ -23,12 +24,15 @@ class BenchmarkConfig:
     approved_root: str = "research_agent/algorithms/approved"
     seed: int = 42
     image_size: int = 64
+    mat_key: Optional[str] = None
+    base_model: str = "auto"
     method_max_steps: int = 50
     fair_max_steps: int = 50
     tuning_trials: int = 2
     max_improvement_rounds: int = 1
     device: str = "auto"
     llm_mode: str = "off"
+    learned_metrics: bool = True
 
     def validate(self) -> None:
         if not self.image_paths:
@@ -40,6 +44,15 @@ class BenchmarkConfig:
             raise ValueError("mask_types may contain only random and block")
         if not self.missing_rates or any(not 0.0 < rate < 1.0 for rate in self.missing_rates):
             raise ValueError("missing_rates must be in (0, 1)")
+        if self.base_model not in {"auto", *SUPPORTED_MODEL_NAMES}:
+            raise ValueError(
+                "base_model must be auto or one of %s"
+                % sorted(SUPPORTED_MODEL_NAMES)
+            )
+        if not isinstance(self.learned_metrics, bool):
+            raise ValueError("learned_metrics must be a bool")
+        if self.mat_key is not None and not self.mat_key.strip():
+            raise ValueError("mat_key must be a non-empty string or None")
 
 
 def aggregate_cases(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -52,12 +65,35 @@ def aggregate_cases(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
             roles.setdefault(method["role"], []).append(method)
     methods = {}
     for role, rows in roles.items():
-        psnr = [
-            row["metrics"]["missing_psnr"]
-            for row in rows
-            if row["metrics"]["missing_psnr"] is not None
-        ]
-        ssim = [row["metrics"]["composite_ssim"] for row in rows]
+        def values(metric_name: str) -> List[float]:
+            return [
+                float(row["metrics"][metric_name])
+                for row in rows
+                if row.get("metrics", {}).get(metric_name) is not None
+            ]
+
+        def summary(metric_values: List[float]) -> tuple:
+            if not metric_values:
+                return None, None
+            return (
+                statistics.fmean(metric_values),
+                statistics.pstdev(metric_values)
+                if len(metric_values) > 1
+                else 0.0,
+            )
+
+        psnr = values("missing_psnr")
+        ssim = values("composite_ssim")
+        lpips = values("lpips")
+        maniqa = values("maniqa")
+        clip_iqa = values("clip_iqa")
+        musiq = values("musiq")
+        mean_psnr, std_psnr = summary(psnr)
+        mean_ssim, std_ssim = summary(ssim)
+        mean_lpips, std_lpips = summary(lpips)
+        mean_maniqa, std_maniqa = summary(maniqa)
+        mean_clip_iqa, std_clip_iqa = summary(clip_iqa)
+        mean_musiq, std_musiq = summary(musiq)
         runtimes = [
             row["runtime_seconds"]
             for row in rows
@@ -67,15 +103,21 @@ def aggregate_cases(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
         methods[role] = {
             "evaluated_cases": len(rows),
             "unavailable_or_failed_cases": len(cases) - len(rows),
-            "mean_missing_psnr": statistics.fmean(psnr) if psnr else None,
-            "std_missing_psnr": (
-                statistics.pstdev(psnr) if len(psnr) > 1 else 0.0 if psnr else None
-            ),
+            "mean_missing_psnr": mean_psnr,
+            "std_missing_psnr": std_psnr,
             "perfect_reconstruction_cases": sum(
                 row["metrics"]["missing_psnr"] is None for row in rows
             ),
-            "mean_composite_ssim": statistics.fmean(ssim),
-            "std_composite_ssim": statistics.pstdev(ssim) if len(ssim) > 1 else 0.0,
+            "mean_composite_ssim": mean_ssim,
+            "std_composite_ssim": std_ssim,
+            "mean_lpips": mean_lpips,
+            "std_lpips": std_lpips,
+            "mean_maniqa": mean_maniqa,
+            "std_maniqa": std_maniqa,
+            "mean_clip_iqa": mean_clip_iqa,
+            "std_clip_iqa": std_clip_iqa,
+            "mean_musiq": mean_musiq,
+            "std_musiq": std_musiq,
             "mean_runtime_seconds": statistics.fmean(runtimes) if runtimes else None,
             "mean_parameter_count": statistics.fmean(parameters),
         }
@@ -91,6 +133,11 @@ def aggregate_cases(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _benchmark_markdown(state: Dict[str, Any]) -> str:
+    def mean_std(item: Dict[str, Any], name: str) -> str:
+        mean = item.get("mean_%s" % name)
+        std = item.get("std_%s" % name)
+        return "N/A" if mean is None else "%.4f ± %.4f" % (mean, std)
+
     lines = [
         "# Tensor Inpainting Agent Benchmark",
         "",
@@ -103,8 +150,8 @@ def _benchmark_markdown(state: Dict[str, Any]) -> str:
         "",
         "## 聚合结果",
         "",
-        "| 角色 | 完成 | 未评估/失败 | PSNR mean ± std | SSIM mean ± std | 平均训练时间 | 平均参数量 |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| 角色 | 完成 | 未评估/失败 | PSNR ↑ | SSIM ↑ | LPIPS ↓ | MANIQA ↑ | CLIP-IQA ↑ | MUSIQ ↑ | 平均训练时间 | 平均参数量 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for role, item in state["aggregate"]["methods_by_role"].items():
         runtime = (
@@ -119,14 +166,17 @@ def _benchmark_markdown(state: Dict[str, Any]) -> str:
             % (item["mean_missing_psnr"], item["std_missing_psnr"])
         )
         lines.append(
-            "| %s | %d | %d | %s | %.4f ± %.4f | %s | %.1f |"
+            "| %s | %d | %d | %s | %s | %s | %s | %s | %s | %s | %.1f |"
             % (
                 role,
                 item["evaluated_cases"],
                 item["unavailable_or_failed_cases"],
                 psnr_text,
-                item["mean_composite_ssim"],
-                item["std_composite_ssim"],
+                mean_std(item, "composite_ssim"),
+                mean_std(item, "lpips"),
+                mean_std(item, "maniqa"),
+                mean_std(item, "clip_iqa"),
+                mean_std(item, "musiq"),
                 runtime,
                 item["mean_parameter_count"],
             )
@@ -156,6 +206,7 @@ def _benchmark_markdown(state: Dict[str, Any]) -> str:
         [
             "",
             "> 注意：少量图片上的 quick benchmark 只用于端到端回归，不足以支持泛化结论。",
+            "> LPIPS 为全参考指标；MANIQA、CLIP-IQA、MUSIQ 为无参考指标。N/A 表示该运行未启用指标或依赖/权重不可用。",
             "",
         ]
     )
@@ -186,11 +237,14 @@ def run_benchmark(config: BenchmarkConfig) -> Dict[str, Any]:
                             missing_rate=missing_rate,
                             seed=case_seed,
                             image_size=config.image_size,
+                            mat_key=config.mat_key,
+                            base_model=config.base_model,
                             method_max_steps=config.method_max_steps,
                             fair_max_steps=config.fair_max_steps,
                             tuning_trials=config.tuning_trials,
                             max_improvement_rounds=config.max_improvement_rounds,
                             device=config.device,
+                            learned_metrics=config.learned_metrics,
                             llm_mode=config.llm_mode,
                         )
                     )

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from .agent_tools import build_research_tool_registry
 from .agent_tools.framework import ToolStatus, TraceLogger
+from .schemas import SUPPORTED_MODEL_NAMES
 
 
 STAGES = (
@@ -46,6 +47,7 @@ class Day3WorkflowConfig:
     missing_rate: float = 0.4
     seed: int = 42
     image_size: Optional[int] = 128
+    mat_key: Optional[str] = None
     model_name: str = "tucker"
     max_steps: int = 200
     validation_ratio: float = 0.1
@@ -53,6 +55,7 @@ class Day3WorkflowConfig:
     patience: int = 20
     device: str = "auto"
     candidates: Optional[List[Dict[str, Any]]] = field(default=None)
+    learned_metrics: bool = True
 
     def validate(self) -> None:
         if not Path(self.image_path).is_file():
@@ -63,12 +66,16 @@ class Day3WorkflowConfig:
             raise ValueError("missing_rate must be strictly between 0 and 1")
         if self.image_size is not None and self.image_size < 8:
             raise ValueError("image_size must be at least 8 or None")
+        if self.mat_key is not None and not self.mat_key.strip():
+            raise ValueError("mat_key must be a non-empty string or None")
         if self.model_name != "tucker":
             raise ValueError("Day 3 workflow intentionally fixes model_name to tucker")
         if self.max_steps < 1:
             raise ValueError("max_steps must be positive")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be auto, cpu, or cuda")
+        if not isinstance(self.learned_metrics, bool):
+            raise ValueError("learned_metrics must be a bool")
 
 
 class WorkflowExecutionError(RuntimeError):
@@ -249,6 +256,7 @@ class Day3Workflow:
                     "missing_rate": self.config.missing_rate,
                     "seed": self.config.seed,
                     "image_size": self.config.image_size,
+                    "mat_key": self.config.mat_key,
                 },
             )
             self.state["artifacts"].update(analysis.data["artifacts"])
@@ -256,10 +264,10 @@ class Day3Workflow:
             # This path is never returned by AnalyzeImageTool and therefore is
             # unavailable to a future LLM controller.  Only the deterministic
             # evaluator branch knows the fixed internal artifact name.
-            ground_truth_path = str(self.run_dir / "evaluation_ground_truth.png")
+            ground_truth_path = str(self.run_dir / "evaluation_ground_truth.npy")
             self._transition("CREATED", "ANALYZED")
 
-            interpolation_path = self.run_dir / "interpolated.png"
+            interpolation_path = self.run_dir / "interpolated.npy"
             print("🧩 正在计算 Manhattan 最近邻插值基线…", flush=True)
             interpolation = self._call_tool(
                 "run_interpolation",
@@ -273,12 +281,22 @@ class Day3Workflow:
             self.state["artifacts"]["interpolation"] = interpolation.data[
                 "artifacts"
             ]["reconstruction"]
+            self.state["artifacts"]["interpolation_preview"] = interpolation.data[
+                "artifacts"
+            ]["preview"]
+            if "reconstruction_mat" in interpolation.data["artifacts"]:
+                self.state["artifacts"]["interpolation_mat"] = interpolation.data[
+                    "artifacts"
+                ]["reconstruction_mat"]
             self._transition("ANALYZED", "INTERPOLATED")
 
-            print("🧠 正在检索经验并选择 Matrix / CP / Tucker 基线…", flush=True)
+            print(
+                "🧠 正在检索经验并从 11 种张量分解中选择基线…",
+                flush=True,
+            )
             method_plan = self._select_method()
             selected_model = method_plan["method"]
-            if selected_model not in {"matrix", "cp", "tucker"}:
+            if selected_model not in SUPPORTED_MODEL_NAMES:
                 raise WorkflowExecutionError(
                     "method selector returned unsupported model %r" % selected_model
                 )
@@ -379,6 +397,8 @@ class Day3Workflow:
                     "ground_truth_path": ground_truth_path,
                     "mask_path": self.state["artifacts"]["mask"],
                     "output_path": str(baseline_metrics_path),
+                    "device": self.config.device,
+                    "learned_metrics": self.config.learned_metrics,
                 },
             )
             tensor_evaluation = self._call_tool(
@@ -393,6 +413,8 @@ class Day3Workflow:
                     "ground_truth_path": ground_truth_path,
                     "mask_path": self.state["artifacts"]["mask"],
                     "output_path": str(tensor_metrics_path),
+                    "device": self.config.device,
+                    "learned_metrics": self.config.learned_metrics,
                 },
             )
             self.state["artifacts"]["interpolation_metrics"] = str(
@@ -404,6 +426,11 @@ class Day3Workflow:
                 "missing_psnr",
                 "perfect_reconstruction",
                 "composite_ssim",
+                "lpips",
+                "maniqa",
+                "clip_iqa",
+                "musiq",
+                "learned_metric_status",
             )
             self.state["results"]["interpolation_metrics"] = {
                 key: baseline_evaluation.data[key] for key in metric_keys

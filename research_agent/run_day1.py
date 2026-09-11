@@ -13,6 +13,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run the reproducible Day 1 interpolation baseline."
     )
     parser.add_argument("--image", required=True, help="Path to a complete benchmark image")
+    parser.add_argument("--mat-key", help="MAT variable name; auto-detected when omitted")
     parser.add_argument(
         "--output-dir",
         default="research_agent/outputs",
@@ -32,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resize the largest side to this value; use 0 to keep source size",
     )
     parser.add_argument("--missing-fill-value", type=float, default=0.0)
+    parser.add_argument("--skip-learned-metrics", action="store_true")
     return parser
 
 
@@ -44,7 +46,9 @@ def main() -> None:
         missing_rate=args.missing_rate,
         seed=args.seed,
         image_size=args.image_size or None,
+        mat_key=args.mat_key,
         missing_fill_value=args.missing_fill_value,
+        learned_metrics=not args.skip_learned_metrics,
     )
     result = run_day1_baseline(config)
 
@@ -54,6 +58,10 @@ def main() -> None:
     print("  actual_missing_rate: %.4f" % result.actual_missing_rate)
     print("  missing_region_psnr: %s" % psnr_text)
     print("  composite_ssim: %.6f" % result.composite_ssim)
+    print("  lpips: %s" % ("N/A" if result.lpips is None else "%.6f" % result.lpips))
+    print("  maniqa: %s" % ("N/A" if result.maniqa is None else "%.6f" % result.maniqa))
+    print("  clip_iqa: %s" % ("N/A" if result.clip_iqa is None else "%.6f" % result.clip_iqa))
+    print("  musiq: %s" % ("N/A" if result.musiq is None else "%.6f" % result.musiq))
     print("  artifacts: %s" % result.artifacts["metrics"])
 
 

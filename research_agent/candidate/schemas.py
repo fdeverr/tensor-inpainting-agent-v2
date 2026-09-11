@@ -23,7 +23,19 @@ class CandidateProposal(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    base_method: Literal["matrix", "cp", "tucker"]
+    base_method: Literal[
+        "matrix",
+        "mode3",
+        "cp",
+        "nonnegative_cp",
+        "tucker",
+        "btd",
+        "tsvd",
+        "nonnegative_tucker",
+        "hierarchical_tucker",
+        "tt",
+        "tensor_ring",
+    ]
     architecture_family: Literal[
         "tensor_decomposition",
         "coordinate_mlp",

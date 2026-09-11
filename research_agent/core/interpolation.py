@@ -18,8 +18,8 @@ def nearest_neighbor_fill(
     truth values from the missing locations.
     """
 
-    if observed_image.ndim != 3 or observed_image.shape[2] != 3:
-        raise ValueError("observed_image must have shape [H, W, 3]")
+    if observed_image.ndim not in (3, 4):
+        raise ValueError("observed_image must have shape [H,W,C] or [H,W,T,C]")
     if observed_mask.shape != observed_image.shape[:2] or observed_mask.dtype != np.bool_:
         raise ValueError("observed_mask must be bool and match image height and width")
     if not observed_mask.any():
@@ -44,4 +44,3 @@ def nearest_neighbor_fill(
             queue.append((next_y, next_x))
 
     return reconstructed
-

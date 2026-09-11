@@ -2,10 +2,12 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from research_agent.workflow_day4 import (
     Day4WorkflowConfig,
+    _candidates_from_plan,
     run_day4_workflow,
 )
 from research_agent.workflow_day5 import (
@@ -26,6 +28,119 @@ def _write_small_image(path: Path) -> None:
     Image.fromarray(np.rint(np.clip(image, 0, 1) * 255).astype(np.uint8)).save(path)
 
 
+def test_new_tensor_network_plans_become_bounded_tuning_candidates():
+    profile = {"image_shape": [64, 128, 3]}
+    tt_candidates = _candidates_from_plan(
+        {
+            "method": "tt",
+            "suggested_hyperparameters": {
+                "rank_1_candidates": [4, 8],
+                "rank_2_candidates": [2, 3],
+                "init_scale": 0.1,
+            },
+        },
+        profile,
+    )
+    ring_candidates = _candidates_from_plan(
+        {
+            "method": "tensor_ring",
+            "suggested_hyperparameters": {
+                "rank_candidates": [2, 4, 6],
+                "init_scale": 0.1,
+            },
+        },
+        profile,
+    )
+    mode3_candidates = _candidates_from_plan(
+        {
+            "method": "mode3",
+            "suggested_hyperparameters": {
+                "rank_candidates": [1, 2, 3],
+                "init_scale": 0.1,
+            },
+        },
+        profile,
+    )
+    nonnegative_cp_candidates = _candidates_from_plan(
+        {
+            "method": "nonnegative_cp",
+            "suggested_hyperparameters": {
+                "rank_candidates": [4, 8, 12],
+                "init_scale": 0.1,
+            },
+        },
+        profile,
+    )
+    btd_candidates = _candidates_from_plan(
+        {
+            "method": "btd",
+            "suggested_hyperparameters": {
+                "num_blocks_candidates": [1, 2],
+                "rank_h_candidates": [4, 8],
+                "rank_w_candidates": [6, 12],
+                "rank_c_candidates": [2, 3],
+                "init_scale": 0.1,
+            },
+        },
+        profile,
+    )
+    tsvd_candidates = _candidates_from_plan(
+        {
+            "method": "tsvd",
+            "suggested_hyperparameters": {
+                "rank_candidates": [2, 4, 8],
+                "init_scale": 0.1,
+            },
+        },
+        profile,
+    )
+    nonnegative_candidates = _candidates_from_plan(
+        {
+            "method": "nonnegative_tucker",
+            "suggested_hyperparameters": {
+                "rank_h_candidates": [4, 8],
+                "rank_w_candidates": [6, 12],
+                "rank_c_candidates": [2, 3],
+                "init_scale": 0.1,
+            },
+        },
+        profile,
+    )
+    hierarchical_candidates = _candidates_from_plan(
+        {
+            "method": "hierarchical_tucker",
+            "suggested_hyperparameters": {
+                "rank_h_candidates": [4, 8],
+                "rank_w_candidates": [6, 12],
+                "rank_c_candidates": [3],
+                "rank_spatial_candidates": [1, 2, 3],
+                "init_scale": 0.1,
+            },
+        },
+        profile,
+    )
+
+    assert [item["hyperparameters"]["rank_1"] for item in tt_candidates] == [4, 8]
+    assert [item["hyperparameters"]["rank_2"] for item in tt_candidates] == [2, 3]
+    assert [item["hyperparameters"]["rank"] for item in ring_candidates] == [2, 4, 6]
+    assert [item["hyperparameters"]["rank"] for item in mode3_candidates] == [1, 2, 3]
+    assert [
+        item["hyperparameters"]["rank"]
+        for item in nonnegative_cp_candidates
+    ] == [4, 8, 12]
+    assert [item["hyperparameters"]["num_blocks"] for item in btd_candidates] == [1, 2]
+    assert [item["hyperparameters"]["rank"] for item in tsvd_candidates] == [2, 4, 8]
+    assert all(
+        set(item["hyperparameters"])
+        == {"rank_h", "rank_w", "rank_c", "init_scale"}
+        for item in nonnegative_candidates
+    )
+    assert [
+        item["hyperparameters"]["rank_spatial"]
+        for item in hierarchical_candidates
+    ] == [1, 2, 3]
+
+
 def test_day4_fallback_selects_and_trains_a_valid_method(tmp_path):
     image_path = tmp_path / "image.png"
     _write_small_image(image_path)
@@ -40,6 +155,7 @@ def test_day4_fallback_selects_and_trains_a_valid_method(tmp_path):
             validation_interval=3,
             patience=10,
             device="cpu",
+            learned_metrics=False,
             llm_mode="off",
             retrieval_top_k=5,
         )
@@ -47,7 +163,19 @@ def test_day4_fallback_selects_and_trains_a_valid_method(tmp_path):
 
     assert state["stage"] == "COMPLETED"
     plan = state["results"]["method_plan"]
-    assert plan["method"] in {"matrix", "cp", "tucker"}
+    assert plan["method"] in {
+        "matrix",
+        "mode3",
+        "cp",
+        "nonnegative_cp",
+        "tucker",
+        "btd",
+        "tsvd",
+        "nonnegative_tucker",
+        "hierarchical_tucker",
+        "tt",
+        "tensor_ring",
+    }
     assert plan["selection_mode"] == "deterministic_fallback"
     assert state["selected_model"] == plan["method"]
     assert state["results"]["training"]["model_name"] == plan["method"]
@@ -91,6 +219,7 @@ def test_day4_fallback_selects_and_trains_a_valid_method(tmp_path):
             validation_interval=1,
             patience=5,
             device="cpu",
+            learned_metrics=False,
         )
     )
     assert day6_state["stage"] == "COMPLETED"
@@ -104,3 +233,59 @@ def test_day4_fallback_selects_and_trains_a_valid_method(tmp_path):
         "candidate_accepted",
         "maximum_improvement_rounds_reached",
     }
+
+
+@pytest.mark.parametrize(
+    "model_name,expected_hyperparameters",
+    (
+        ("mode3", {"rank", "init_scale"}),
+        ("nonnegative_cp", {"rank", "init_scale"}),
+        ("btd", {"num_blocks", "rank_h", "rank_w", "rank_c", "init_scale"}),
+        ("tsvd", {"rank", "init_scale"}),
+        (
+            "nonnegative_tucker",
+            {"rank_h", "rank_w", "rank_c", "init_scale"},
+        ),
+        (
+            "hierarchical_tucker",
+            {"rank_h", "rank_w", "rank_c", "rank_spatial", "init_scale"},
+        ),
+        ("tt", {"rank_1", "rank_2", "init_scale"}),
+    ),
+)
+def test_day4_manual_selection_is_preserved_through_training(
+    tmp_path,
+    model_name,
+    expected_hyperparameters,
+):
+    image_path = tmp_path / ("manual-%s.png" % model_name)
+    _write_small_image(image_path)
+
+    state = run_day4_workflow(
+        Day4WorkflowConfig(
+            image_path=str(image_path),
+            output_dir=str(tmp_path / "outputs"),
+            image_size=None,
+            model_name=model_name,
+            missing_rate=0.3,
+            seed=17,
+            max_steps=3,
+            validation_interval=1,
+            patience=3,
+            device="cpu",
+            learned_metrics=False,
+            llm_mode="off",
+            retrieval_top_k=5,
+        )
+    )
+
+    assert state["stage"] == "COMPLETED"
+    assert state["selected_model"] == model_name
+    assert state["results"]["method_plan"]["selection_mode"] == "manual"
+    assert state["results"]["selector_diagnostics"]["attempts"] == 0
+    assert state["results"]["selector_diagnostics"]["llm_used"] is False
+    assert state["results"]["training"]["model_name"] == model_name
+    assert (
+        set(state["results"]["training"]["hyperparameters"])
+        == expected_hyperparameters
+    )

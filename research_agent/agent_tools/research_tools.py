@@ -1,7 +1,7 @@
 """Deterministic Tensor Inpainting Agent Framework tools around the Day 1/2 experiment core.
 
-The tools exchange paths and small JSON payloads.  They never place image
-arrays or model tensors in an Agent context.
+The tools exchange paths and small JSON payloads. They never place complete
+image/MSI/video arrays or model tensors in an Agent context.
 """
 
 from __future__ import annotations
@@ -17,14 +17,18 @@ import torch
 from ..core.data import (
     apply_observation_mask,
     load_observation_mask,
-    load_rgb_image,
+    load_tensor_data,
     save_image,
+    save_mat_companion,
     save_mask,
+    save_tensor_data,
+    to_rgb_preview,
 )
 from ..core.interpolation import nearest_neighbor_fill
 from ..core.masks import generate_observation_mask
-from ..core.metrics import composite_ssim, missing_region_mse, missing_region_psnr
+from ..core.metrics import evaluate_reconstruction_metrics
 from ..core.models import get_default_hyperparameters
+from ..core.models.registry import MODEL_CLASSES
 from ..core.trainer import fit_tensor_model_on_all_observations, train_tensor_model
 from ..schemas import SUPPORTED_MASK_TYPES, SUPPORTED_MODEL_NAMES, TrainingConfig
 from .framework import Tool, ToolErrorCode, ToolParameter, ToolResponse
@@ -45,10 +49,10 @@ def _required_string(parameters: Dict[str, Any], name: str) -> str:
 
 
 def _load_observed_pair(corrupted_path: str, mask_path: str) -> tuple:
-    corrupted = load_rgb_image(corrupted_path, max_size=None)
+    corrupted = load_tensor_data(corrupted_path, max_size=None)
     observed_mask = load_observation_mask(mask_path)
     if corrupted.shape[:2] != observed_mask.shape:
-        raise ValueError("corrupted image and mask shapes do not match")
+        raise ValueError("corrupted tensor and mask shapes do not match")
     return corrupted, observed_mask
 
 
@@ -67,22 +71,16 @@ def _metric_payload(
     reconstruction: np.ndarray,
     ground_truth: np.ndarray,
     observed_mask: np.ndarray,
+    device: str = "auto",
+    include_learned_metrics: bool = True,
 ) -> Dict[str, Any]:
-    psnr = missing_region_psnr(reconstruction, ground_truth, observed_mask)
-    return {
-        "missing_mse": missing_region_mse(
-            reconstruction,
-            ground_truth,
-            observed_mask,
-        ),
-        "missing_psnr": psnr if math.isfinite(psnr) else None,
-        "perfect_reconstruction": not math.isfinite(psnr),
-        "composite_ssim": composite_ssim(
-            reconstruction,
-            ground_truth,
-            observed_mask,
-        ),
-    }
+    return evaluate_reconstruction_metrics(
+        reconstruction,
+        ground_truth,
+        observed_mask,
+        device=device,
+        include_learned_metrics=include_learned_metrics,
+    )
 
 
 def _missing_component_statistics(observed_mask: np.ndarray) -> tuple:
@@ -121,23 +119,31 @@ def _visible_structure_statistics(
 ) -> Dict[str, Any]:
     """Compute structure features without sampling artificially hidden values."""
 
-    visible_pixels = image[observed_mask]
-    if np.all(visible_pixels.std(axis=0) > 1e-8):
-        correlation_matrix = np.corrcoef(visible_pixels, rowvar=False)
+    height, width = image.shape[:2]
+    flattened = image.reshape(height, width, -1)
+    visible_pixels = flattened[observed_mask]
+    feature_count = flattened.shape[-1]
+    sampled_indices = np.unique(
+        np.linspace(0, feature_count - 1, min(feature_count, 16), dtype=int)
+    )
+    sampled_pixels = visible_pixels[:, sampled_indices]
+    if sampled_pixels.shape[1] == 1:
+        correlation_matrix = np.ones((1, 1), dtype=np.float64)
+    elif np.all(sampled_pixels.std(axis=0) > 1e-8):
+        correlation_matrix = np.corrcoef(sampled_pixels, rowvar=False)
         correlation_matrix = np.nan_to_num(correlation_matrix, nan=0.0)
     else:
-        correlation_matrix = np.eye(3, dtype=np.float64)
-    off_diagonal = correlation_matrix[np.triu_indices(3, k=1)]
+        correlation_matrix = np.eye(sampled_pixels.shape[1], dtype=np.float64)
+    off_diagonal = correlation_matrix[
+        np.triu_indices(correlation_matrix.shape[0], k=1)
+    ]
 
     horizontal_pairs = observed_mask[:, 1:] & observed_mask[:, :-1]
     vertical_pairs = observed_mask[1:, :] & observed_mask[:-1, :]
     absolute_differences = []
     squared_gray_differences = []
-    gray = (
-        0.299 * image[..., 0]
-        + 0.587 * image[..., 1]
-        + 0.114 * image[..., 2]
-    )
+    preview = to_rgb_preview(image)
+    gray = 0.299 * preview[..., 0] + 0.587 * preview[..., 1] + 0.114 * preview[..., 2]
     if horizontal_pairs.any():
         absolute_differences.append(
             np.abs(image[:, 1:] - image[:, :-1])[horizontal_pairs]
@@ -166,8 +172,9 @@ def _visible_structure_statistics(
     high_frequency_ratio = high_frequency_energy / (visible_gray_energy + 1e-12)
     return {
         "visible_channel_correlation_matrix": correlation_matrix.tolist(),
+        "correlation_sampled_feature_indices": sampled_indices.tolist(),
         "visible_mean_absolute_channel_correlation": float(
-            np.abs(off_diagonal).mean()
+            np.abs(off_diagonal).mean() if off_diagonal.size else 0.0
         ),
         "visible_mean_local_absolute_difference": mean_local_difference,
         "visible_local_smoothness_score": float(
@@ -177,36 +184,32 @@ def _visible_structure_statistics(
     }
 
 
-def _default_candidates(model_name: str) -> List[Dict[str, Any]]:
-    if model_name == "matrix":
-        return [
-            {"hyperparameters": {"rank": 8, "init_scale": 0.1}, "learning_rate": 0.03},
-            {"hyperparameters": {"rank": 16, "init_scale": 0.1}, "learning_rate": 0.03},
-        ]
-    if model_name == "cp":
-        return [
-            {"hyperparameters": {"rank": 8, "init_scale": 0.2}, "learning_rate": 0.03},
-            {"hyperparameters": {"rank": 12, "init_scale": 0.2}, "learning_rate": 0.03},
-        ]
+def _default_candidates(
+    model_name: str,
+    image_shape: tuple[int, ...],
+) -> List[Dict[str, Any]]:
+    """Build two valid defaults from the selected model's bounded search space."""
+
+    model_class = MODEL_CLASSES[model_name]
+    search_space = model_class.search_space(image_shape)
+    defaults = get_default_hyperparameters(model_name)
+    primary = {
+        name: value if value in options else options[-1]
+        for name, options in search_space.items()
+        for value in [defaults.get(name, options[0])]
+    }
+    alternatives = []
+    for name, options in search_space.items():
+        alternative = next((value for value in options if value != primary[name]), None)
+        if alternative is not None:
+            varied = dict(primary)
+            varied[name] = alternative
+            alternatives.append(varied)
+            break
+    configurations = [primary, *alternatives]
     return [
-        {
-            "hyperparameters": {
-                "rank_h": 8,
-                "rank_w": 8,
-                "rank_c": 3,
-                "init_scale": 0.15,
-            },
-            "learning_rate": 0.03,
-        },
-        {
-            "hyperparameters": {
-                "rank_h": 16,
-                "rank_w": 16,
-                "rank_c": 3,
-                "init_scale": 0.15,
-            },
-            "learning_rate": 0.03,
-        },
+        {"hyperparameters": item, "learning_rate": 0.03}
+        for item in configurations
     ]
 
 
@@ -229,14 +232,14 @@ class ResearchTool(Tool):
 
 
 class AnalyzeImageTool(ResearchTool):
-    """Create a masked experiment case and summarize only visible pixels."""
+    """Create a masked image/MSI/video case and summarize visible samples."""
 
     def __init__(self) -> None:
         super().__init__(
             name="analyze_image",
             description=(
-                "创建可复现实验 mask，并根据可见像素返回图像尺寸、缺失率、"
-                "通道统计和局部平滑度。"
+                "读取彩图或 MAT 格式的 MSI/视频，创建可复现实验 mask，并根据"
+                "可见位置返回数据尺寸、缺失率、特征统计和局部平滑度。"
             ),
         )
 
@@ -254,6 +257,12 @@ class AnalyzeImageTool(ResearchTool):
                 description="最长边缩放尺寸",
                 required=False,
                 default=128,
+            ),
+            ToolParameter(
+                name="mat_key",
+                type="string",
+                description="MAT 文件中的变量名；省略时自动选择",
+                required=False,
             ),
         ]
 
@@ -274,8 +283,16 @@ class AnalyzeImageTool(ResearchTool):
             if image_size is not None and image_size < 8:
                 raise ValueError("image_size must be at least 8")
 
-            ground_truth = load_rgb_image(image_path, max_size=image_size)
-            height, width, _ = ground_truth.shape
+            mat_key = parameters.get("mat_key")
+            if mat_key is not None and (not isinstance(mat_key, str) or not mat_key.strip()):
+                raise ValueError("mat_key must be a non-empty string when provided")
+            ground_truth, source_metadata = load_tensor_data(
+                image_path,
+                max_size=image_size,
+                mat_key=mat_key,
+                return_metadata=True,
+            )
+            height, width = ground_truth.shape[:2]
             observed_mask = generate_observation_mask(
                 height=height,
                 width=width,
@@ -285,15 +302,23 @@ class AnalyzeImageTool(ResearchTool):
             )
             corrupted = apply_observation_mask(ground_truth, observed_mask)
             run_dir.mkdir(parents=True, exist_ok=True)
-            ground_truth_path = run_dir / "evaluation_ground_truth.png"
-            corrupted_path = run_dir / "corrupted.png"
+            ground_truth_path = run_dir / "evaluation_ground_truth.npy"
+            corrupted_path = run_dir / "corrupted.npy"
+            ground_truth_mat_path = run_dir / "evaluation_ground_truth.mat"
+            corrupted_mat_path = run_dir / "corrupted.mat"
+            ground_truth_preview_path = run_dir / "evaluation_ground_truth_preview.png"
+            corrupted_preview_path = run_dir / "corrupted_preview.png"
             mask_path = run_dir / "mask.png"
             profile_path = run_dir / "image_profile.json"
-            save_image(str(ground_truth_path), ground_truth)
-            save_image(str(corrupted_path), corrupted)
+            save_tensor_data(str(ground_truth_path), ground_truth)
+            save_tensor_data(str(corrupted_path), corrupted)
+            save_mat_companion(str(ground_truth_mat_path), ground_truth)
+            corrupted_mat = save_mat_companion(str(corrupted_mat_path), corrupted)
+            save_image(str(ground_truth_preview_path), ground_truth)
+            save_image(str(corrupted_preview_path), corrupted)
             save_mask(str(mask_path), observed_mask)
 
-            visible_pixels = ground_truth[observed_mask]
+            visible_pixels = ground_truth.reshape(height, width, -1)[observed_mask]
             component_count, largest_hole_ratio = _missing_component_statistics(
                 observed_mask
             )
@@ -303,7 +328,11 @@ class AnalyzeImageTool(ResearchTool):
             )
             profile = {
                 "run_id": run_id,
-                "image_shape": [height, width, 3],
+                "image_shape": list(ground_truth.shape),
+                "data_type": source_metadata["data_type"],
+                "feature_shape": source_metadata["feature_shape"],
+                "feature_count": source_metadata["feature_count"],
+                "source_metadata": source_metadata,
                 "mask_type": mask_type,
                 "requested_missing_rate": missing_rate,
                 "actual_missing_rate": float((~observed_mask).mean()),
@@ -318,19 +347,27 @@ class AnalyzeImageTool(ResearchTool):
                 "analysis_scope": "visible_pixels_only",
             }
             _write_json(profile_path, profile)
+            artifacts = {
+                "corrupted": str(corrupted_path),
+                "corrupted_preview": str(corrupted_preview_path),
+                "mask": str(mask_path),
+                "profile": str(profile_path),
+            }
+            if corrupted_mat is not None:
+                artifacts["corrupted_mat"] = corrupted_mat
             return ToolResponse.success(
                 text=(
-                    "图像分析完成：shape=%s，实际缺失率=%.4f。"
-                    % (profile["image_shape"], profile["actual_missing_rate"])
+                    "数据分析完成：type=%s，shape=%s，实际缺失率=%.4f。"
+                    % (
+                        profile["data_type"],
+                        profile["image_shape"],
+                        profile["actual_missing_rate"],
+                    )
                 ),
                 data={
                     "run_id": run_id,
                     "profile": profile,
-                    "artifacts": {
-                        "corrupted": str(corrupted_path),
-                        "mask": str(mask_path),
-                        "profile": str(profile_path),
-                    },
+                    "artifacts": artifacts,
                 },
             )
         except (KeyError, TypeError, ValueError) as error:
@@ -345,15 +382,27 @@ class RunInterpolationTool(ResearchTool):
     def __init__(self) -> None:
         super().__init__(
             name="run_interpolation",
-            description="仅根据 corrupted image 和 mask 运行最近邻插值并保存图片。",
+            description="仅根据缺损张量和二维空间 mask 运行最近邻插值并保存完整数据。",
         )
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
             ToolParameter(name="run_id", type="string", description="工作流运行 ID"),
-            ToolParameter(name="corrupted_path", type="string", description="缺损图片路径"),
+            ToolParameter(name="corrupted_path", type="string", description="缺损张量路径"),
             ToolParameter(name="mask_path", type="string", description="观测 mask 路径"),
             ToolParameter(name="output_path", type="string", description="插值结果路径"),
+            ToolParameter(
+                name="preview_path",
+                type="string",
+                description="RGB 预览图路径",
+                required=False,
+            ),
+            ToolParameter(
+                name="mat_output_path",
+                type="string",
+                description="完整 MAT 插值结果路径",
+                required=False,
+            ),
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
@@ -364,14 +413,31 @@ class RunInterpolationTool(ResearchTool):
                 _required_string(parameters, "mask_path"),
             )
             output_path = Path(_required_string(parameters, "output_path"))
+            preview_path = Path(
+                str(
+                    parameters.get("preview_path")
+                    or output_path.with_name(output_path.stem + "_preview.png")
+                )
+            )
+            mat_output_path = Path(
+                str(parameters.get("mat_output_path") or output_path.with_suffix(".mat"))
+            )
             reconstruction = nearest_neighbor_fill(corrupted, observed_mask)
-            save_image(str(output_path), reconstruction)
+            save_tensor_data(str(output_path), reconstruction)
+            mat_output = save_mat_companion(str(mat_output_path), reconstruction)
+            save_image(str(preview_path), reconstruction)
+            artifacts = {
+                "reconstruction": str(output_path),
+                "preview": str(preview_path),
+            }
+            if mat_output is not None:
+                artifacts["reconstruction_mat"] = mat_output
             return ToolResponse.success(
                 text="最近邻插值完成。",
                 data={
                     "run_id": run_id,
                     "algorithm": "nearest_neighbor_manhattan",
-                    "artifacts": {"reconstruction": str(output_path)},
+                    "artifacts": artifacts,
                 },
             )
         except (KeyError, TypeError, ValueError) as error:
@@ -398,7 +464,11 @@ class TuneTensorModelTool(ResearchTool):
             ToolParameter(name="corrupted_path", type="string", description="缺损图片路径"),
             ToolParameter(name="mask_path", type="string", description="观测 mask 路径"),
             ToolParameter(name="output_path", type="string", description="调参结果 JSON 路径"),
-            ToolParameter(name="model_name", type="string", description="matrix、cp 或 tucker"),
+            ToolParameter(
+                name="model_name",
+                type="string",
+                description="SUPPORTED_MODEL_NAMES 中的张量分解名称",
+            ),
             ToolParameter(name="seed", type="integer", description="随机种子"),
             ToolParameter(name="candidates", type="array", description="候选配置列表", required=False),
             ToolParameter(name="max_steps", type="integer", description="每个 trial 最大步数", required=False, default=200),
@@ -410,13 +480,19 @@ class TuneTensorModelTool(ResearchTool):
             run_id = _required_string(parameters, "run_id")
             model_name = _required_string(parameters, "model_name")
             if model_name not in SUPPORTED_MODEL_NAMES:
-                raise ValueError("model_name must be matrix, cp, or tucker")
+                raise ValueError(
+                    "model_name must be one of %s"
+                    % ", ".join(sorted(SUPPORTED_MODEL_NAMES))
+                )
             corrupted, observed_mask = _load_observed_pair(
                 _required_string(parameters, "corrupted_path"),
                 _required_string(parameters, "mask_path"),
             )
             seed = int(parameters["seed"])
-            candidates = parameters.get("candidates") or _default_candidates(model_name)
+            candidates = parameters.get("candidates") or _default_candidates(
+                model_name,
+                tuple(int(value) for value in corrupted.shape),
+            )
             if not isinstance(candidates, list) or not candidates:
                 raise ValueError("candidates must be a non-empty list")
 
@@ -509,7 +585,11 @@ class TrainTensorModelTool(ResearchTool):
             ToolParameter(name="corrupted_path", type="string", description="缺损图片路径"),
             ToolParameter(name="mask_path", type="string", description="观测 mask 路径"),
             ToolParameter(name="output_dir", type="string", description="模型产物目录"),
-            ToolParameter(name="model_name", type="string", description="matrix、cp 或 tucker"),
+            ToolParameter(
+                name="model_name",
+                type="string",
+                description="SUPPORTED_MODEL_NAMES 中的张量分解名称",
+            ),
             ToolParameter(name="hyperparameters", type="object", description="模型超参数"),
             ToolParameter(name="learning_rate", type="number", description="学习率"),
             ToolParameter(name="selected_steps", type="integer", description="调参阶段选出的步数"),
@@ -522,7 +602,10 @@ class TrainTensorModelTool(ResearchTool):
             run_id = _required_string(parameters, "run_id")
             model_name = _required_string(parameters, "model_name")
             if model_name not in SUPPORTED_MODEL_NAMES:
-                raise ValueError("model_name must be matrix, cp, or tucker")
+                raise ValueError(
+                    "model_name must be one of %s"
+                    % ", ".join(sorted(SUPPORTED_MODEL_NAMES))
+                )
             hyperparameters = parameters.get("hyperparameters")
             if not isinstance(hyperparameters, dict):
                 raise ValueError("hyperparameters must be an object")
@@ -554,15 +637,23 @@ class TrainTensorModelTool(ResearchTool):
 
             output_dir = Path(_required_string(parameters, "output_dir"))
             output_dir.mkdir(parents=True, exist_ok=True)
-            raw_path = output_dir / "model_raw.png"
-            completed_path = output_dir / "model_completed.png"
+            raw_path = output_dir / "model_raw.npy"
+            completed_path = output_dir / "model_completed.npy"
+            raw_mat_path = output_dir / "model_raw.mat"
+            completed_mat_path = output_dir / "model_completed.mat"
+            raw_preview_path = output_dir / "model_raw_preview.png"
+            completed_preview_path = output_dir / "model_completed_preview.png"
             history_path = output_dir / "final_fit_history.json"
             checkpoint_path = output_dir / "model.pt"
             result_path = output_dir / "training_result.json"
             completed = output.reconstruction.copy()
             completed[observed_mask] = corrupted[observed_mask]
-            save_image(str(raw_path), output.reconstruction)
-            save_image(str(completed_path), completed)
+            save_tensor_data(str(raw_path), output.reconstruction)
+            save_tensor_data(str(completed_path), completed)
+            raw_mat = save_mat_companion(str(raw_mat_path), output.reconstruction)
+            completed_mat = save_mat_companion(str(completed_mat_path), completed)
+            save_image(str(raw_preview_path), output.reconstruction)
+            save_image(str(completed_preview_path), completed)
             _write_json(history_path, {"history": output.history})
             torch.save(
                 {
@@ -589,6 +680,19 @@ class TrainTensorModelTool(ResearchTool):
                 "ground_truth_used": False,
             }
             _write_json(result_path, result)
+            artifacts = {
+                "raw_reconstruction": str(raw_path),
+                "reconstruction": str(completed_path),
+                "raw_preview": str(raw_preview_path),
+                "preview": str(completed_preview_path),
+                "history": str(history_path),
+                "checkpoint": str(checkpoint_path),
+                "training_result": str(result_path),
+            }
+            if raw_mat is not None:
+                artifacts["raw_reconstruction_mat"] = raw_mat
+            if completed_mat is not None:
+                artifacts["reconstruction_mat"] = completed_mat
             return ToolResponse.success(
                 text=(
                     "最终拟合完成：使用 %d 个观测像素训练 %d 步。"
@@ -596,13 +700,7 @@ class TrainTensorModelTool(ResearchTool):
                 ),
                 data={
                     **result,
-                    "artifacts": {
-                        "raw_reconstruction": str(raw_path),
-                        "reconstruction": str(completed_path),
-                        "history": str(history_path),
-                        "checkpoint": str(checkpoint_path),
-                        "training_result": str(result_path),
-                    },
+                    "artifacts": artifacts,
                 },
             )
         except (KeyError, TypeError, ValueError) as error:
@@ -617,28 +715,45 @@ class EvaluateReconstructionTool(ResearchTool):
     def __init__(self) -> None:
         super().__init__(
             name="evaluate_reconstruction",
-            description="训练和选择结束后，使用 Ground Truth 计算缺失区域 PSNR 与 SSIM。",
+            description=(
+                "训练和选择结束后，计算 PSNR、SSIM、LPIPS、MANIQA、"
+                "CLIP-IQA 与 MUSIQ。"
+            ),
         )
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
             ToolParameter(name="run_id", type="string", description="工作流运行 ID"),
             ToolParameter(name="algorithm_name", type="string", description="算法名称"),
-            ToolParameter(name="reconstruction_path", type="string", description="重建图片路径"),
-            ToolParameter(name="ground_truth_path", type="string", description="仅用于最终评估的完整图片"),
+            ToolParameter(name="reconstruction_path", type="string", description="重建张量路径"),
+            ToolParameter(name="ground_truth_path", type="string", description="仅用于最终评估的完整张量"),
             ToolParameter(name="mask_path", type="string", description="观测 mask 路径"),
             ToolParameter(name="output_path", type="string", description="指标 JSON 路径"),
+            ToolParameter(
+                name="device",
+                type="string",
+                description="学习式 IQA 指标使用的 auto、cpu 或 cuda",
+                required=False,
+                default="auto",
+            ),
+            ToolParameter(
+                name="learned_metrics",
+                type="boolean",
+                description="是否计算 LPIPS/MANIQA/CLIP-IQA/MUSIQ",
+                required=False,
+                default=True,
+            ),
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
         try:
             run_id = _required_string(parameters, "run_id")
             algorithm_name = _required_string(parameters, "algorithm_name")
-            reconstruction = load_rgb_image(
+            reconstruction = load_tensor_data(
                 _required_string(parameters, "reconstruction_path"),
                 max_size=None,
             )
-            ground_truth = load_rgb_image(
+            ground_truth = load_tensor_data(
                 _required_string(parameters, "ground_truth_path"),
                 max_size=None,
             )
@@ -648,8 +763,16 @@ class EvaluateReconstructionTool(ResearchTool):
             if reconstruction.shape != ground_truth.shape:
                 raise ValueError("reconstruction and ground truth shapes do not match")
             if observed_mask.shape != ground_truth.shape[:2]:
-                raise ValueError("mask and image shapes do not match")
-            metrics = _metric_payload(reconstruction, ground_truth, observed_mask)
+                raise ValueError("mask and tensor spatial shapes do not match")
+            metrics = _metric_payload(
+                reconstruction,
+                ground_truth,
+                observed_mask,
+                device=str(parameters.get("device", "auto")),
+                include_learned_metrics=bool(
+                    parameters.get("learned_metrics", True)
+                ),
+            )
             result = {
                 "run_id": run_id,
                 "algorithm_name": algorithm_name,

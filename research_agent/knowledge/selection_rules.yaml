@@ -17,6 +17,18 @@ rules:
     reason: Tucker can allocate a small channel rank while retaining separate spatial ranks.
     keywords: [channel, correlation, RGB, channel rank]
 
+  - condition: channel_correlation_high
+    prefer: mode3
+    weight: 1.0
+    reason: A mode-3 E directly models a low-dimensional RGB subspace, but its independent spatial coefficients limit extrapolation.
+    keywords: [channel, correlation, RGB, mode-3, A mode3 E, channel subspace]
+
+  - condition: channel_correlation_high
+    prefer: tsvd
+    weight: 0.75
+    reason: t-SVD couples spatial matrices through third-mode Fourier tubes, although RGB provides only two real-FFT frequency bins.
+    keywords: [channel, correlation, RGB, t-SVD, tubal rank, t-product]
+
   - condition: channel_correlation_low
     prefer: cp
     weight: 1.0
@@ -28,6 +40,12 @@ rules:
     weight: 2.0
     reason: A dominant hole calls for the more expressive global interaction core, while still warning about extrapolation risk.
     keywords: [large hole, block, core, extrapolation]
+
+  - condition: large_contiguous_hole
+    prefer: hierarchical_tucker
+    weight: 1.0
+    reason: Hierarchical Tucker compresses spatial interactions through a dimension tree while retaining separate height and width factors.
+    keywords: [large hole, hierarchy, dimension tree, spatial transfer]
 
   - condition: many_small_holes
     prefer: cp
@@ -41,14 +59,50 @@ rules:
     reason: Tucker supports unequal height and width ranks for anisotropic images.
     keywords: [aspect ratio, anisotropic, height rank, width rank]
 
+  - condition: image_aspect_ratio_high
+    prefer: tt
+    weight: 1.5
+    reason: Tensor Train offers a parameter-efficient sequential factorization for anisotropic spatial modes.
+    keywords: [aspect ratio, anisotropic, Tensor Train, TT rank, mode ordering]
+
   - condition: local_smoothness_high
     prefer: matrix
     weight: 1.0
     reason: A simple global low-rank unfolding is often sufficient for very smooth visible structure.
     keywords: [smooth, low rank, matrix, global]
 
+  - condition: local_smoothness_high
+    prefer: nonnegative_tucker
+    weight: 0.75
+    reason: Nonnegative Tucker is compatible with nonnegative image intensity structure and yields additive parts, but its positivity constraint may reduce flexibility.
+    keywords: [smooth, nonnegative, image intensity, additive parts, Tucker]
+
+  - condition: local_smoothness_high
+    prefer: nonnegative_cp
+    weight: 0.6
+    reason: Nonnegative CP provides a compact additive parts model for nonnegative image intensities, but may underfit complex signed interactions.
+    keywords: [smooth, nonnegative, CP, additive parts, image intensity]
+
   - condition: high_frequency_high
     prefer: tucker
     weight: 1.0
     reason: Tucker offers more flexible spatial capacity, although later spatial priors may still be needed.
     keywords: [high frequency, texture, spatial rank, Tucker]
+
+  - condition: high_frequency_high
+    prefer: btd
+    weight: 1.25
+    reason: BTD sums several compact Tucker blocks and can allocate multiple components to repeated or heterogeneous texture.
+    keywords: [high frequency, texture, BTD, Block-Term, multiple blocks]
+
+  - condition: high_frequency_high
+    prefer: tensor_ring
+    weight: 1.25
+    reason: Tensor Ring adds cyclic cross-mode capacity that can represent repeated texture more flexibly than a small CP model.
+    keywords: [high frequency, repeated texture, Tensor Ring, cyclic rank]
+
+  - condition: many_small_holes
+    prefer: tensor_ring
+    weight: 1.0
+    reason: Tensor Ring is a compact alternative when dispersed observations support cyclic cross-mode interactions.
+    keywords: [many holes, dispersed, Tensor Ring, cyclic interaction]

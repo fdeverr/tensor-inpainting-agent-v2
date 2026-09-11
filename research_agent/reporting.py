@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +28,10 @@ def build_method_results(
             "parameter_count": 0,
             "eligible_for_final_output": True,
             "reconstruction": day4["artifacts"]["interpolation"],
+            "reconstruction_mat": day4["artifacts"].get("interpolation_mat"),
+            "preview": day4["artifacts"].get(
+                "interpolation_preview", day4["artifacts"]["interpolation"]
+            ),
         }
     ]
     if day6 is None:
@@ -39,6 +44,12 @@ def build_method_results(
                 "parameter_count": day4["results"]["training"]["parameter_count"],
                 "eligible_for_final_output": True,
                 "reconstruction": day4["artifacts"]["tensor_reconstruction"],
+                "reconstruction_mat": day4["artifacts"].get(
+                    "tensor_reconstruction_mat"
+                ),
+                "preview": day4["artifacts"].get(
+                    "tensor_preview", day4["artifacts"]["tensor_reconstruction"]
+                ),
             }
         )
         return results
@@ -57,6 +68,12 @@ def build_method_results(
                 "parameter_count": baseline["parameter_count"],
                 "eligible_for_final_output": True,
                 "reconstruction": baseline["artifacts"]["reconstruction"],
+                "reconstruction_mat": baseline["artifacts"].get(
+                    "reconstruction_mat"
+                ),
+                "preview": baseline["artifacts"].get(
+                    "preview", baseline["artifacts"]["reconstruction"]
+                ),
             },
             {
                 "algorithm": (
@@ -70,6 +87,12 @@ def build_method_results(
                 "parameter_count": candidate["parameter_count"],
                 "eligible_for_final_output": accepted,
                 "reconstruction": candidate["artifacts"]["reconstruction"],
+                "reconstruction_mat": candidate["artifacts"].get(
+                    "reconstruction_mat"
+                ),
+                "preview": candidate["artifacts"].get(
+                    "preview", candidate["artifacts"]["reconstruction"]
+                ),
             },
         ]
     )
@@ -77,7 +100,7 @@ def build_method_results(
 
 
 def _comparison_image_lines(final_state: Dict[str, Any]) -> List[str]:
-    """Render a side-by-side Markdown gallery using top-level copied artifacts."""
+    """Render a side-by-side gallery with equal-width image columns."""
 
     images = final_state.get("artifacts", {}).get("comparison_images", {})
     if not images:
@@ -94,7 +117,6 @@ def _comparison_image_lines(final_state: Dict[str, Any]) -> List[str]:
         ),
     ]
     available = [(key, label) for key, label in ordered if key in images]
-    labels = [label for _, label in available]
     paths = []
     for key, _ in available:
         image_path = Path(images[key])
@@ -103,16 +125,28 @@ def _comparison_image_lines(final_state: Dict[str, Any]) -> List[str]:
         except ValueError:
             pass
         paths.append(image_path.as_posix())
+    column_width = "%.6f%%" % (100.0 / len(available))
+    header_cells = "".join(
+        '<th width="%s" align="center">%s</th>'
+        % (column_width, escape(label))
+        for _, label in available
+    )
+    image_cells = "".join(
+        (
+            '<td width="%s" align="center" valign="top">'
+            '<img src="%s" alt="%s" width="100%%" />'
+            "</td>"
+        )
+        % (column_width, escape(path, quote=True), escape(label, quote=True))
+        for (_, label), path in zip(available, paths)
+    )
     return [
         "## 效果图对比",
         "",
-        "| %s |" % " | ".join(labels),
-        "|%s|" % "|".join("---" for _ in labels),
-        "| %s |"
-        % " | ".join(
-            "![%s](%s)" % (label, path)
-            for label, path in zip(labels, paths)
-        ),
+        '<table width="100%" style="table-layout: fixed; width: 100%;">',
+        "  <thead><tr>%s</tr></thead>" % header_cells,
+        "  <tbody><tr>%s</tr></tbody>" % image_cells,
+        "</table>",
         "",
         "候选图即使未通过 Judge 也会保留，但不会被当作最终可用结果。",
         "",
@@ -141,13 +175,20 @@ def render_research_report(
         "- 候选实验结论：`%s`"
         % (day6["rounds"][-1]["judgment"]["decision"] if day6 else "not_evaluated"),
         "- 最终输出算法：`%s`" % final_state["best_available"]["algorithm"],
-        "- 最终补全图：`%s`" % final_state["artifacts"]["best_completion"],
+        "- 最终补全数据：`%s`"
+        % final_state["artifacts"].get(
+            "best_completion_data", final_state["artifacts"]["best_completion"]
+        ),
+        "- 最终补全 MAT：`%s`"
+        % final_state["artifacts"].get("best_completion_mat", "N/A"),
+        "- 最终补全预览：`%s`" % final_state["artifacts"]["best_completion"],
         "",
         "## 数据与缺失模式",
         "",
         "| 项目 | 值 |",
         "|---|---:|",
-        "| 图像尺寸 | `%s` |" % profile["image_shape"],
+        "| 数据类型 | `%s` |" % profile.get("data_type", "color_image"),
+        "| 张量尺寸 | `%s` |" % profile["image_shape"],
         "| Mask 类型 | `%s` |" % profile["mask_type"],
         "| 实际缺失率 | %s |" % _number(profile["actual_missing_rate"]),
         "| 缺失连通区域数 | %d |" % profile["missing_component_count"],
@@ -182,8 +223,8 @@ def render_research_report(
             "",
             "## 最终指标",
             "",
-            "| 方法 | 角色 | Missing PSNR ↑ | Composite SSIM ↑ | 最终拟合时间 | 参数量 | 可作为最终输出 |",
-            "|---|---|---:|---:|---:|---:|---|",
+            "| 方法 | 角色 | Missing PSNR ↑ | Composite SSIM ↑ | LPIPS ↓ | MANIQA ↑ | CLIP-IQA ↑ | MUSIQ ↑ | 最终拟合时间 | 参数量 | 可作为最终输出 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
     for item in final_state["method_results"]:
@@ -194,17 +235,27 @@ def render_research_report(
             else _number(item["runtime_seconds"]) + " s"
         )
         lines.append(
-            "| %s | %s | %s | %s | %s | %d | %s |"
+            "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %d | %s |"
             % (
                 item["algorithm"],
                 item["role"],
                 _number(metrics["missing_psnr"]),
                 _number(metrics["composite_ssim"]),
+                _number(metrics.get("lpips")),
+                _number(metrics.get("maniqa")),
+                _number(metrics.get("clip_iqa")),
+                _number(metrics.get("musiq")),
                 runtime,
                 item["parameter_count"],
                 "是" if item["eligible_for_final_output"] else "否",
             )
         )
+    lines.extend(
+        [
+            "",
+            "LPIPS 为全参考感知距离（越低越好）；MANIQA、CLIP-IQA 与 MUSIQ 为无参考质量评估（越高越好）。它们仅适用于 RGB `[H,W,3]`，MSI/视频会明确跳过；PSNR 和 SSIM 仍在全部波段/帧/通道上计算。`N/A` 的具体原因记录在 state JSON 的 `learned_metric_status` 中。",
+        ]
+    )
     if day6:
         judgment = day6["rounds"][-1]["judgment"]
         lines.extend(

@@ -3,20 +3,26 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 
 from ..schemas import Day2ExperimentConfig
-from .data import apply_observation_mask, load_rgb_image, save_image, save_mask
+from .data import (
+    apply_observation_mask,
+    load_tensor_data,
+    save_image,
+    save_mat_companion,
+    save_mask,
+    save_tensor_data,
+)
 from .interpolation import nearest_neighbor_fill
 from .masks import generate_observation_mask
-from .metrics import composite_ssim, missing_region_mse, missing_region_psnr
+from .metrics import evaluate_reconstruction_metrics
 from .trainer import fit_tensor_model_on_all_observations, train_tensor_model
 
 
@@ -32,22 +38,20 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
         output_file.write("\n")
 
 
-def _safe_psnr(value: float) -> Optional[float]:
-    return value if math.isfinite(value) else None
-
-
 def _evaluate(
     reconstruction,
     ground_truth,
     observed_mask,
+    device: str,
+    include_learned_metrics: bool,
 ) -> Dict[str, Any]:
-    psnr = missing_region_psnr(reconstruction, ground_truth, observed_mask)
-    return {
-        "missing_mse": missing_region_mse(reconstruction, ground_truth, observed_mask),
-        "missing_psnr": _safe_psnr(psnr),
-        "perfect_reconstruction": not math.isfinite(psnr),
-        "composite_ssim": composite_ssim(reconstruction, ground_truth, observed_mask),
-    }
+    return evaluate_reconstruction_metrics(
+        reconstruction,
+        ground_truth,
+        observed_mask,
+        device=device,
+        include_learned_metrics=include_learned_metrics,
+    )
 
 
 def run_day2_experiment(config: Day2ExperimentConfig) -> Dict[str, Any]:
@@ -59,8 +63,12 @@ def run_day2_experiment(config: Day2ExperimentConfig) -> Dict[str, Any]:
     run_dir = Path(config.output_dir) / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    ground_truth = load_rgb_image(config.image_path, max_size=config.image_size)
-    height, width, _ = ground_truth.shape
+    ground_truth = load_tensor_data(
+        config.image_path,
+        max_size=config.image_size,
+        mat_key=config.mat_key,
+    )
+    height, width = ground_truth.shape[:2]
     observed_mask = generate_observation_mask(
         height=height,
         width=width,
@@ -110,6 +118,18 @@ def run_day2_experiment(config: Day2ExperimentConfig) -> Dict[str, Any]:
         "selection_completed": str(run_dir / "selection_completed.png"),
         "model_raw": str(run_dir / "model_raw.png"),
         "model_completed": str(run_dir / "model_completed.png"),
+        "original_data": str(run_dir / "original.npy"),
+        "corrupted_data": str(run_dir / "corrupted.npy"),
+        "interpolated_data": str(run_dir / "interpolated.npy"),
+        "selection_completed_data": str(run_dir / "selection_completed.npy"),
+        "model_raw_data": str(run_dir / "model_raw.npy"),
+        "model_completed_data": str(run_dir / "model_completed.npy"),
+        "original_mat": str(run_dir / "original.mat"),
+        "corrupted_mat": str(run_dir / "corrupted.mat"),
+        "interpolated_mat": str(run_dir / "interpolated.mat"),
+        "selection_completed_mat": str(run_dir / "selection_completed.mat"),
+        "model_raw_mat": str(run_dir / "model_raw.mat"),
+        "model_completed_mat": str(run_dir / "model_completed.mat"),
         "selection_history": str(run_dir / "selection_history.json"),
         "final_fit_history": str(run_dir / "final_fit_history.json"),
         "checkpoint": str(run_dir / "best_model.pt"),
@@ -127,6 +147,26 @@ def run_day2_experiment(config: Day2ExperimentConfig) -> Dict[str, Any]:
     save_image(artifact_paths["selection_completed"], selection_reconstruction)
     save_image(artifact_paths["model_raw"], raw_reconstruction)
     save_image(artifact_paths["model_completed"], completed_reconstruction)
+    save_tensor_data(artifact_paths["original_data"], ground_truth)
+    save_tensor_data(artifact_paths["corrupted_data"], corrupted)
+    save_tensor_data(artifact_paths["interpolated_data"], interpolation)
+    save_tensor_data(
+        artifact_paths["selection_completed_data"], selection_reconstruction
+    )
+    save_tensor_data(artifact_paths["model_raw_data"], raw_reconstruction)
+    save_tensor_data(
+        artifact_paths["model_completed_data"], completed_reconstruction
+    )
+    for artifact_name, data in (
+        ("original_mat", ground_truth),
+        ("corrupted_mat", corrupted),
+        ("interpolated_mat", interpolation),
+        ("selection_completed_mat", selection_reconstruction),
+        ("model_raw_mat", raw_reconstruction),
+        ("model_completed_mat", completed_reconstruction),
+    ):
+        if save_mat_companion(artifact_paths[artifact_name], data) is None:
+            artifact_paths.pop(artifact_name)
     torch.save(
         {
             "model_name": config.model_name,
@@ -140,13 +180,27 @@ def run_day2_experiment(config: Day2ExperimentConfig) -> Dict[str, Any]:
         artifact_paths["checkpoint"],
     )
 
-    interpolation_metrics = _evaluate(interpolation, ground_truth, observed_mask)
+    interpolation_metrics = _evaluate(
+        interpolation,
+        ground_truth,
+        observed_mask,
+        config.training.device,
+        config.learned_metrics,
+    )
     selection_metrics = _evaluate(
         selection_reconstruction,
         ground_truth,
         observed_mask,
+        config.training.device,
+        config.learned_metrics,
     )
-    model_metrics = _evaluate(completed_reconstruction, ground_truth, observed_mask)
+    model_metrics = _evaluate(
+        completed_reconstruction,
+        ground_truth,
+        observed_mask,
+        config.training.device,
+        config.learned_metrics,
+    )
     psnr_delta = None
     if (
         interpolation_metrics["missing_psnr"] is not None
@@ -205,7 +259,11 @@ def run_day2_experiment(config: Day2ExperimentConfig) -> Dict[str, Any]:
             "ground_truth_usage": "final_evaluation_only",
             "tuning_signal": "held_out_observed_pixels_only",
             "final_fit": "Selected steps are refit from scratch on 100% of observed pixels.",
-            "model_output": "Known pixels in model_completed.png are copied from observations.",
+            "model_output": "Known samples in model_completed.npy are copied from observations.",
+            "learned_iqa": (
+                "LPIPS/MANIQA/CLIP-IQA/MUSIQ are evaluation-only diagnostics "
+                "and never participate in tuning; they are skipped for MSI/video."
+            ),
         },
     }
 

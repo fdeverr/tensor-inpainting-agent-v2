@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from research_agent.candidate.generator import deterministic_candidate
-from research_agent.candidate.validator import CandidateValidator
+from research_agent.candidate.validator import CandidateValidator, _static_checks
 
 
 def _validate(tmp_path: Path, source: str):
@@ -17,6 +17,25 @@ def test_deterministic_tv_candidate_passes_all_checks(tmp_path):
     assert result["static_validation"]["passed"] is True
     assert result["smoke_test"]["passed"] is True
     assert "tv_regularization" in result["smoke_test"]["loss_terms"]
+
+
+def test_deterministic_candidate_supports_new_tensor_network_bases():
+    for method, base_class in (
+        ("mode3", "Mode3Factorization"),
+        ("nonnegative_cp", "NonnegativeCPDecomposition"),
+        ("btd", "BlockTermDecomposition"),
+        ("tsvd", "TSVDDecomposition"),
+        ("nonnegative_tucker", "NonnegativeTuckerDecomposition"),
+        ("hierarchical_tucker", "HierarchicalTuckerDecomposition"),
+        ("tt", "TensorTrainDecomposition"),
+        ("tensor_ring", "TensorRingDecomposition"),
+    ):
+        proposal = deterministic_candidate(method)
+        assert proposal.base_method == method
+        assert "class CandidateTensorInpaintingModel(%s)" % base_class in (
+            proposal.model_code
+        )
+        assert _static_checks(proposal.model_code)["passed"] is True
 
 
 def test_forbidden_import_is_rejected_before_execution(tmp_path):
@@ -130,7 +149,7 @@ class CandidateTensorInpaintingModel(BaseTensorInpaintingModel):
         num_frequencies=4,
     ):
         super().__init__(image_shape, initial_channel_mean)
-        height, width, _ = self.image_shape
+        height, width = self.image_shape[:2]
         y = torch.linspace(-1.0, 1.0, height)
         x = torch.linspace(-1.0, 1.0, width)
         yy, xx = torch.meshgrid(y, x, indexing="ij")
@@ -150,13 +169,15 @@ class CandidateTensorInpaintingModel(BaseTensorInpaintingModel):
             torch.nn.GELU(),
             torch.nn.Linear(int(hidden_dim), int(hidden_dim)),
             torch.nn.GELU(),
-            torch.nn.Linear(int(hidden_dim), 3),
+            torch.nn.Linear(int(hidden_dim), self.feature_count),
         )
 
     def forward(self):
-        height, width, channels = self.image_shape
-        residual = self.network(self.coordinates).reshape(height, width, channels)
-        return residual + self.channel_bias
+        height, width = self.image_shape[:2]
+        residual = self.network(self.coordinates).reshape(
+            height, width, self.feature_count
+        )
+        return self._restore_shape(residual + self.channel_bias)
 
     @classmethod
     def search_space(cls, image_shape):
@@ -167,4 +188,5 @@ class CandidateTensorInpaintingModel(BaseTensorInpaintingModel):
 
     assert result["passed"] is True
     assert result["smoke_test"]["forward_shape"] == [17, 23, 3]
+    assert result["smoke_test"]["tested_shapes"] == [[17, 23, 3], [17, 23, 2, 3]]
     assert result["smoke_test"]["parameter_count"] > 0

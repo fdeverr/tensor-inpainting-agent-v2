@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 from ..schemas import ExperimentConfig, ExperimentResult
-from .data import apply_observation_mask, load_rgb_image, save_image, save_mask
+from .data import (
+    apply_observation_mask,
+    load_tensor_data,
+    save_image,
+    save_mat_companion,
+    save_mask,
+    save_tensor_data,
+)
 from .interpolation import nearest_neighbor_fill
 from .masks import generate_observation_mask
-from .metrics import composite_ssim, missing_region_mse, missing_region_psnr
+from .metrics import evaluate_reconstruction_metrics
 
 
 def _make_run_id() -> str:
@@ -41,8 +47,12 @@ def run_day1_baseline(config: ExperimentConfig) -> ExperimentResult:
     run_dir = Path(config.output_dir) / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    ground_truth = load_rgb_image(config.image_path, max_size=config.image_size)
-    height, width, _ = ground_truth.shape
+    ground_truth = load_tensor_data(
+        config.image_path,
+        max_size=config.image_size,
+        mat_key=config.mat_key,
+    )
+    height, width = ground_truth.shape[:2]
     observed_mask = generate_observation_mask(
         height=height,
         width=width,
@@ -59,9 +69,12 @@ def run_day1_baseline(config: ExperimentConfig) -> ExperimentResult:
     # The baseline has no access to ground_truth after the mask is applied.
     reconstruction = nearest_neighbor_fill(corrupted, observed_mask)
 
-    mse = missing_region_mse(reconstruction, ground_truth, observed_mask)
-    psnr = missing_region_psnr(reconstruction, ground_truth, observed_mask)
-    ssim = composite_ssim(reconstruction, ground_truth, observed_mask)
+    metrics = evaluate_reconstruction_metrics(
+        reconstruction,
+        ground_truth,
+        observed_mask,
+        include_learned_metrics=config.learned_metrics,
+    )
 
     artifact_paths = {
         "config": str(run_dir / "config.json"),
@@ -69,12 +82,28 @@ def run_day1_baseline(config: ExperimentConfig) -> ExperimentResult:
         "corrupted": str(run_dir / "corrupted.png"),
         "mask": str(run_dir / "mask.png"),
         "interpolated": str(run_dir / "interpolated.png"),
+        "original_data": str(run_dir / "original.npy"),
+        "corrupted_data": str(run_dir / "corrupted.npy"),
+        "interpolated_data": str(run_dir / "interpolated.npy"),
+        "original_mat": str(run_dir / "original.mat"),
+        "corrupted_mat": str(run_dir / "corrupted.mat"),
+        "interpolated_mat": str(run_dir / "interpolated.mat"),
         "metrics": str(run_dir / "metrics.json"),
     }
     save_image(artifact_paths["original"], ground_truth)
     save_image(artifact_paths["corrupted"], corrupted)
     save_mask(artifact_paths["mask"], observed_mask)
     save_image(artifact_paths["interpolated"], reconstruction)
+    save_tensor_data(artifact_paths["original_data"], ground_truth)
+    save_tensor_data(artifact_paths["corrupted_data"], corrupted)
+    save_tensor_data(artifact_paths["interpolated_data"], reconstruction)
+    for artifact_name, data in (
+        ("original_mat", ground_truth),
+        ("corrupted_mat", corrupted),
+        ("interpolated_mat", reconstruction),
+    ):
+        if save_mat_companion(artifact_paths[artifact_name], data) is None:
+            artifact_paths.pop(artifact_name)
 
     result = ExperimentResult(
         run_id=run_id,
@@ -83,10 +112,15 @@ def run_day1_baseline(config: ExperimentConfig) -> ExperimentResult:
         seed=config.seed,
         requested_missing_rate=config.missing_rate,
         actual_missing_rate=float((~observed_mask).mean()),
-        missing_mse=mse,
-        missing_psnr=psnr if math.isfinite(psnr) else None,
-        perfect_reconstruction=not math.isfinite(psnr),
-        composite_ssim=ssim,
+        missing_mse=metrics["missing_mse"],
+        missing_psnr=metrics["missing_psnr"],
+        perfect_reconstruction=metrics["perfect_reconstruction"],
+        composite_ssim=metrics["composite_ssim"],
+        lpips=metrics["lpips"],
+        maniqa=metrics["maniqa"],
+        clip_iqa=metrics["clip_iqa"],
+        musiq=metrics["musiq"],
+        learned_metric_status=metrics["learned_metric_status"],
         runtime_seconds=float(time.perf_counter() - started_at),
         image_shape=list(ground_truth.shape),
         artifacts=artifact_paths,
@@ -94,8 +128,15 @@ def run_day1_baseline(config: ExperimentConfig) -> ExperimentResult:
             "mask_convention": "1/white=observed, 0/black=missing",
             "ground_truth_usage": "evaluation_only",
             "ssim_definition": (
-                "Known pixels are replaced by ground truth before standard RGB SSIM; "
+                "Known pixels are replaced by ground truth before SSIM averaged over "
+                "all feature planes; "
                 "this is composite SSIM, not a standardized masked SSIM."
+            ),
+            "learned_iqa_definition": (
+                "LPIPS is full-reference; MANIQA, CLIP-IQA, and MUSIQ are "
+                "no-reference. All receive the composite full image with known "
+                "pixels restored before evaluation. These learned metrics are skipped "
+                "for MSI/video because their pretrained inputs are RGB-only."
             ),
         },
     )
@@ -106,4 +147,3 @@ def run_day1_baseline(config: ExperimentConfig) -> ExperimentResult:
     _write_json(Path(artifact_paths["config"]), config_payload)
     _write_json(Path(artifact_paths["metrics"]), result.to_dict())
     return result
-

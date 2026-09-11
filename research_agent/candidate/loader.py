@@ -10,8 +10,16 @@ from typing import Any, Dict, Tuple
 import torch
 
 from ..core.models.base import BaseTensorInpaintingModel
+from ..core.models.block_term import BlockTermDecomposition
 from ..core.models.cp import CPDecomposition
+from ..core.models.hierarchical_tucker import HierarchicalTuckerDecomposition
 from ..core.models.matrix_factorization import MatrixFactorization
+from ..core.models.mode3_factorization import Mode3Factorization
+from ..core.models.nonnegative_cp import NonnegativeCPDecomposition
+from ..core.models.nonnegative_tucker import NonnegativeTuckerDecomposition
+from ..core.models.t_svd import TSVDDecomposition
+from ..core.models.tensor_ring import TensorRingDecomposition
+from ..core.models.tensor_train import TensorTrainDecomposition
 from ..core.models.tucker import TuckerDecomposition
 
 
@@ -43,8 +51,16 @@ def load_validated_candidate(candidate_dir: str) -> Tuple[type, Dict[str, Any]]:
         "torch": torch,
         "BaseTensorInpaintingModel": BaseTensorInpaintingModel,
         "MatrixFactorization": MatrixFactorization,
+        "Mode3Factorization": Mode3Factorization,
         "CPDecomposition": CPDecomposition,
+        "NonnegativeCPDecomposition": NonnegativeCPDecomposition,
         "TuckerDecomposition": TuckerDecomposition,
+        "BlockTermDecomposition": BlockTermDecomposition,
+        "TSVDDecomposition": TSVDDecomposition,
+        "NonnegativeTuckerDecomposition": NonnegativeTuckerDecomposition,
+        "HierarchicalTuckerDecomposition": HierarchicalTuckerDecomposition,
+        "TensorTrainDecomposition": TensorTrainDecomposition,
+        "TensorRingDecomposition": TensorRingDecomposition,
     }
     exec(compile(source, str(model_path), "exec"), namespace, namespace)
     candidate_class = namespace.get("CandidateTensorInpaintingModel")

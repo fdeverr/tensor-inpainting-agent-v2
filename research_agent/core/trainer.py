@@ -19,7 +19,7 @@ from .models import create_model
 
 
 ModelBuilder = Callable[
-    [Tuple[int, int, int], Sequence[float], Dict[str, Any]],
+    [Tuple[int, ...], Sequence[float], Dict[str, Any]],
     torch.nn.Module,
 ]
 
@@ -124,7 +124,7 @@ class _ConsoleProgress:
 
 def _build_model(
     model_name: str,
-    image_shape: Tuple[int, int, int],
+    image_shape: Tuple[int, ...],
     initial_channel_mean: Sequence[float],
     model_hyperparameters: Dict[str, Any],
     model_builder: Optional[ModelBuilder],
@@ -202,8 +202,8 @@ def _validate_training_arrays(
     observed_image: np.ndarray,
     observed_mask: np.ndarray,
 ) -> None:
-    if observed_image.ndim != 3 or observed_image.shape[2] != 3:
-        raise ValueError("observed_image must have shape [H, W, 3]")
+    if observed_image.ndim not in (3, 4):
+        raise ValueError("observed_image must have shape [H,W,C] or [H,W,T,C]")
     if not np.issubdtype(observed_image.dtype, np.floating):
         raise ValueError("observed_image must be floating point")
     if observed_mask.shape != observed_image.shape[:2] or observed_mask.dtype != np.bool_:
@@ -219,7 +219,9 @@ def _validation_mse(
     observed: torch.Tensor,
     validation_mask: torch.Tensor,
 ) -> torch.Tensor:
-    expanded_mask = validation_mask.unsqueeze(-1).expand_as(prediction)
+    expanded_mask = validation_mask[
+        (...,) + (None,) * (prediction.ndim - 2)
+    ].expand_as(prediction)
     return torch.square(prediction - observed)[expanded_mask].mean()
 
 

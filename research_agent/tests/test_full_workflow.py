@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from research_agent.benchmark import aggregate_cases
@@ -40,6 +41,7 @@ def test_one_command_workflow_writes_report_and_best_image(tmp_path):
             validation_interval=1,
             patience=5,
             device="cpu",
+            learned_metrics=False,
             llm_mode="off",
         )
     )
@@ -51,6 +53,8 @@ def test_one_command_workflow_writes_report_and_best_image(tmp_path):
     assert report_path.is_file()
     report = report_path.read_text(encoding="utf-8")
     assert "最终指标" in report
+    assert "LPIPS ↓" in report
+    assert "CLIP-IQA ↑" in report
     assert "效果图对比" in report
     assert "证据边界" in report
     assert len(state["method_results"]) == 3
@@ -107,6 +111,35 @@ def test_comparison_images_use_predictable_names_and_relative_report_links(tmp_p
     assert "张量基线" in report
     assert "候选（未接受）" in report
     assert "comparison_images/02_tensor_baseline.png" in report
+    assert '<table width="100%" style="table-layout: fixed; width: 100%;">' in report
+    assert report.count('width="25.000000%"') == 8
+    assert report.count('width="100%" />') == 4
+
+
+def test_full_workflow_config_accepts_new_manual_base_models(tmp_path):
+    image_path = tmp_path / "input.png"
+    _write_image(image_path)
+
+    FullWorkflowConfig(image_path=str(image_path), base_model="tt").validate()
+    FullWorkflowConfig(image_path=str(image_path), base_model="mode3").validate()
+    FullWorkflowConfig(
+        image_path=str(image_path), base_model="tensor_ring"
+    ).validate()
+    for model_name in (
+        "nonnegative_cp",
+        "btd",
+        "tsvd",
+        "nonnegative_tucker",
+        "hierarchical_tucker",
+    ):
+        FullWorkflowConfig(
+            image_path=str(image_path), base_model=model_name
+        ).validate()
+
+    with pytest.raises(ValueError, match="base_model"):
+        FullWorkflowConfig(
+            image_path=str(image_path), base_model="unsupported"
+        ).validate()
 
 
 def test_benchmark_aggregation_reports_mean_std_and_failures():
@@ -140,3 +173,4 @@ def test_benchmark_aggregation_reports_mean_std_and_failures():
     assert result["candidate_acceptance_count"] == 1
     assert tensor["mean_missing_psnr"] == 11.0
     assert tensor["std_missing_psnr"] == 1.0
+    assert tensor["mean_lpips"] is None

@@ -1,6 +1,6 @@
 # Tensor Inpainting Agent
 
-一个基于 Tensor Inpainting Agent Framework 的图像补全研究 Agent：它分析缺失图像、检索方法经验、选择 Matrix/CP/Tucker 基线，再由 LLM 设计连续因子 MLP、卷积解码器、高效 Transformer、残差结构或混合 PyTorch 候选，并通过无 Ground Truth 泄漏的公平实验决定接受、拒绝或继续修改候选。
+一个基于 Tensor Inpainting Agent Framework 的多维张量补全研究 Agent：它支持彩图、MSI 与视频，分析缺失数据、检索方法经验、从 11 种张量分解基线中自动或手动选择，再由 LLM 设计连续因子 MLP、卷积解码器、高效 Transformer、残差结构或混合 PyTorch 候选，并通过无 Ground Truth 泄漏的公平实验决定接受、拒绝或继续修改候选。
 
 项目目标不是宣称 SOTA，而是展示一条**可验证、可证伪、可复现、可审计**的自主算法研究闭环。
 
@@ -12,7 +12,7 @@
           ▼
 Tensor Inpainting Agent Framework 编排层
   ├─ Image Profiler ────────────── 只看 corrupted image + mask
-  ├─ Knowledge Retriever ───────── 检索本地 Matrix / CP / Tucker 经验
+  ├─ Knowledge Retriever ───────── 检索本地 11 种分解的经验与限制
   ├─ Method Selector ───────────── LLM 或确定性 fallback
   ├─ Model Improver ────────────── 输出结构化 idea + 候选模型代码
   └─ Experiment Controller ─────── 最多两轮，记录完整 Trace
@@ -22,7 +22,7 @@ Tensor Inpainting Agent Framework 编排层
   ├─ AST + 独立进程 smoke validation
   ├─ 同预算 paired tuning：M_train 训练，M_val 选优
   ├─ 全部观测像素 final refit
-  ├─ 最终 missing PSNR / SSIM
+  ├─ 最终 PSNR / SSIM / LPIPS / MANIQA / CLIP-IQA / MUSIQ
   └─ 固定 Judge + approved algorithm registry
 ```
 
@@ -48,12 +48,44 @@ chmod +x research_agent/scripts/run_ai.sh
 # 使用标准实验预设
 ./research_agent/scripts/run_ai.sh full
 
+# 跳过自动方法排名，手动指定 TT 基线
+./research_agent/scripts/run_ai.sh full --base-model tt
+
+# 手动指定 X = A×₃E 通道模分解
+./research_agent/scripts/run_ai.sh full --base-model mode3
+
 # 使用标准实验预算并保留原始分辨率
 ./research_agent/scripts/run_ai.sh original \
   --image path/to/image.png
 ```
 
 `smoke` 将图像最长边限制为 64 像素，并减少训练、调参和改进轮数，只用于快速检查系统是否跑通。`full` 默认将最长边限制为 128 像素，方法选择最多训练 1000 步，Day 6 允许 LLM 在 2000 步硬上限内提议训练步数、验证间隔和早停耐心值。`original` 使用与 `full` 相同的实验预算，但不缩放输入图像。三种模式都保留原始宽高比，不会强制图像变为正方形。
+
+### 多维数据与 MAT 输入
+
+支持的内部形状如下：
+
+- 彩图和 MSI：`[H,W,C]`
+- 视频：`[H,W,T,C]`
+- 空间观测 mask：`[H,W]`，自动广播到所有波段、帧和通道
+
+普通图片会转为 RGB。MATLAB `.mat` 文件应包含实数数值三维或四维数组，可显式指定变量：
+
+```bash
+./research_agent/scripts/run_ai.sh original \
+  --image /data/msi.mat \
+  --mat-key cube
+
+./research_agent/scripts/run_ai.sh original \
+  --image /data/video.mat \
+  --mat-key video
+```
+
+省略 `--mat-key` 时，系统依次尝试 `data`、`tensor`、`image`、`msi`、`video`、`X`、`x`，再确定性选择元素最多的合法变量。整数及超出 `[0,1]` 的浮点数据会按全局最小值/最大值归一化，原始类型、范围、变量名和归一化方式写入 `image_profile.json`。MATLAB v7.3 文件通过 `h5py` 读取。
+
+所有 11 种现有三阶分解将尾部维度展平为联合特征模：MSI 为 `C`，视频为 `T×C`；训练后再恢复原始形状。这样同一算法接口可以处理两种数据，而空间掩码语义保持不变。完整重建同时保存为 `.npy` 和 `.mat`（MAT 变量名统一为 `data`），PNG 仅用于预览：视频取中间帧，MSI 超过 3 个波段时使用 `[末波段, 中间波段, 首波段]` 假彩色映射。
+
+基础分解默认为 `--base-model auto`，由检索增强选择器在 Matrix、A×₃E、CP、Nonnegative CP、Tucker、BTD、t-SVD、Nonnegative Tucker、Hierarchical Tucker、TT 和 Tensor Ring 中决定。要做可控对比实验，可显式传入对应名称：`matrix|mode3|cp|nonnegative_cp|tucker|btd|tsvd|nonnegative_tucker|hierarchical_tucker|tt|tensor_ring`；仍会执行该方法的有界调参，只跳过方法排名。
 
 可以针对不同图像显式设置最长边：
 
@@ -81,6 +113,21 @@ chmod +x research_agent/scripts/run_ai.sh
 
 统一脚本默认使用 `--llm-mode required --device cuda`，并从 `research_agent/.env` 加载 LLM 配置。传入 `--llm-mode off` 时不再依赖 `.env`，并使用确定性选择器和 TV 候选模板；`auto` 会在环境变量完整时创建 LLM 客户端，否则回退到确定性规则。
 
+默认同时计算 LPIPS、MANIQA、CLIP-IQA 和 MUSIQ。这些指标通过 PyIQA 在已知像素恢复后的完整复合图像上计算：LPIPS 是全参考感知距离（越低越好），MANIQA、CLIP-IQA、MUSIQ 是无参考质量分数（越高越好）。它们的预训练输入仅支持 RGB，因此 MSI/视频会在 `learned_metric_status.skipped_reason` 中明确说明跳过；PSNR 与 SSIM 仍在全部波段/帧/通道上计算。首次 RGB 运行会下载预训练权重；无网络或单个权重不可用时，该项记为 `N/A`、错误写入 `learned_metric_status.errors`。可用 `--learned-metrics off` 显式跳过这些较重的指标。
+
+### 指标协议
+
+| 指标 | 类型 | 范围 | 方向 | 作用 |
+|---|---|---|---|---|
+| Missing PSNR | 全参考 | 仅缺失区域 | ↑ | 像素级保真度与主排序 |
+| Composite SSIM | 全参考 | 复合整图 | ↑ | 局部结构一致性 |
+| LPIPS | 全参考 | 复合整图 | ↓ | 深度特征感知距离 |
+| MANIQA | 无参考 | 复合整图 | ↑ | Transformer 感知质量 |
+| CLIP-IQA | 无参考 | 复合整图 | ↑ | 视觉-语言特征质量 |
+| MUSIQ | 无参考 | 复合整图 | ↑ | 多尺度感知质量 |
+
+新增的四项指标只用于最终诊断和 benchmark 汇总，不进入训练、调参、Judge 或冠军选择；Ground Truth 仍只在训练和超参选择结束后进入评估函数。
+
 运行时会显示当前工作流阶段、LLM 候选生成/修复轮次、自动调参 trial 以及最终重训状态。交互式终端中的训练进度条会在同一行刷新，包含 `当前步/总步数`、百分比、train/validation loss 和 ETA；输出被重定向到日志时则每 10% 保留一条记录。
 
 ```text
@@ -94,8 +141,16 @@ chmod +x research_agent/scripts/run_ai.sh
 |---|---|---|
 | 无训练基线 | Manhattan 最近邻插值 | 无 |
 | 张量基线 | Matrix Factorization | 两个矩阵因子与通道偏置 |
+| 张量基线 | A×₃E (Mode-3) | 空间系数张量 A、通道因子 E 与通道偏置 |
 | 张量基线 | CP Decomposition | 三个模态因子与通道偏置 |
+| 张量基线 | Nonnegative CP | Softplus 约束的三个非负模态因子 |
 | 张量基线 | Tucker Decomposition | 核张量、三个因子与通道偏置 |
+| 张量基线 | Block-Term Decomposition (BTD) | 多个 Tucker 块的核、因子与通道偏置 |
+| 张量基线 | t-SVD | Fourier 域左右因子、奇异管与通道偏置 |
+| 张量基线 | Nonnegative Tucker | Softplus 约束的非负核与因子 |
+| 张量基线 | Hierarchical Tucker | 叶因子、空间转移核和根转移核 |
+| 张量基线 | Tensor Train (TT) | 三个链式核、两个内部 TT rank 与通道偏置 |
+| 张量基线 | Tensor Ring (TR) | 三个环式核、环秩与通道偏置 |
 | LLM 候选 | 连续因子 / 坐标 MLP | MLP 根据坐标生成矩阵或张量因子 |
 | LLM 候选 | Convolutional decoder / refiner | 从头训练的卷积解码或残差精修分支 |
 | LLM 候选 | Efficient Transformer | 轴向、窗口、patch 或 latent-token 注意力，禁止全像素二次方注意力 |
@@ -103,6 +158,19 @@ chmod +x research_agent/scripts/run_ai.sh
 | 当前 fallback 候选 | Selected decomposition + Total Variation | 保留已选择分解的参数，增加固定形式的 TV 损失 |
 
 候选可继承已选分解并添加深度分支，也可直接继承 `BaseTensorInpaintingModel` 实现全新的每图像 PyTorch 参数化。它们不能生成或替换训练流程，不能使用预训练权重或外部数据。
+
+单独运行 Day 2 时可直接选择新模型：
+
+```bash
+python -m research_agent.run_day2 --image path/to/image.png --model mode3 --rank 2
+python -m research_agent.run_day2 --image path/to/image.png --model nonnegative_cp --rank 12
+python -m research_agent.run_day2 --image path/to/image.png --model btd --num-blocks 2 --rank-h 8 --rank-w 8 --rank-c 2
+python -m research_agent.run_day2 --image path/to/image.png --model tsvd --rank 8
+python -m research_agent.run_day2 --image path/to/image.png --model nonnegative_tucker --rank-h 8 --rank-w 8 --rank-c 2
+python -m research_agent.run_day2 --image path/to/image.png --model hierarchical_tucker --rank-h 8 --rank-w 8 --rank-c 3 --rank-spatial 2
+python -m research_agent.run_day2 --image path/to/image.png --model tt --rank-1 8 --rank-2 3
+python -m research_agent.run_day2 --image path/to/image.png --model tensor_ring --rank 4
+```
 
 ## 无 Ground Truth 泄漏协议
 
@@ -203,6 +271,8 @@ outputs/research-agent-<run-id>/
 ├── state.json
 ├── report.md
 ├── best_completion.png
+├── best_completion.npy           # 完整 HWC/HWTC 张量
+├── best_completion.mat           # 同形状 MAT，变量名 data
 ├── comparison_images/
 │   ├── 00_corrupted_input.png
 │   ├── 01_manhattan_interpolation.png
@@ -221,7 +291,7 @@ Day 4/5/6 子流程分别保存自己的状态、图片、配置、训练曲线�
 pytest -q
 ```
 
-当前共收集 58 个测试用例（含参数化用例），覆盖 mask、指标、三种张量模型、两阶段训练、终端进度显示、Tensor Inpainting Agent Framework Tools、方法选择、深度候选接口、LLM 训练预算限幅、hybrid 同名 rank 独立调参、Day 5/6 候选代码验证、反馈修复与安全回退、最终重训发散诊断、效果图对比导出、公平配对、Judge、停止条件、统一入口和 benchmark 聚合。
+测试集覆盖 mask、PSNR/SSIM 与学习式 IQA 指标、11 种张量模型、两阶段训练、终端进度显示、Tensor Inpainting Agent Framework Tools、方法选择、深度候选接口、LLM 训练预算限幅、hybrid 同名 rank 独立调参、Day 5/6 候选代码验证、反馈修复与安全回退、最终重训发散诊断、效果图对比导出、公平配对、Judge、停止条件、统一入口和 benchmark 聚合。
 
 ## 已知限制
 
@@ -236,7 +306,7 @@ pytest -q
 ## Future Work
 
 - 接入 vLLM 或 DepictQA，但继续隔离完整图像 Ground Truth；
-- 增加 TT、TR、t-SVD 等张量模型和更丰富的受限生命周期 hook；
+- 增加 tensor completion 专用优化器、可证明秩自适应策略和更丰富的受限生命周期 hook；
 - 在多数据集、多 mask、多随机种子上建立稳定 benchmark；
 - 将完整训练放入带 CPU/GPU、内存和时间限制的容器沙箱；
 - 对候选做多案例晋升，避免单图过拟合；

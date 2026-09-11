@@ -18,7 +18,7 @@ from .candidate import (
     promote_candidate,
 )
 from .candidate.generator import load_improver_context
-from .core.data import load_observation_mask, load_rgb_image
+from .core.data import load_observation_mask, load_tensor_data
 from .core.experiment_judge import judge_candidate
 from .core.fair_experiment import (
     final_fit_and_evaluate,
@@ -49,6 +49,7 @@ class Day6WorkflowConfig:
     minimum_psnr_delta: float = 0.2
     ssim_tolerance: float = 0.002
     smoke_timeout_seconds: float = 10.0
+    learned_metrics: bool = True
 
     def validate(self) -> None:
         if not (Path(self.base_run_dir) / "state.json").is_file():
@@ -69,6 +70,8 @@ class Day6WorkflowConfig:
             raise ValueError("validation_interval and patience must be positive")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be auto, cpu, or cuda")
+        if not isinstance(self.learned_metrics, bool):
+            raise ValueError("learned_metrics must be a bool")
         if self.minimum_psnr_delta < 0.0 or self.ssim_tolerance < 0.0:
             raise ValueError("judge thresholds must be non-negative")
 
@@ -387,12 +390,12 @@ class Day6Workflow:
         )
         try:
             artifacts = self.base_state["artifacts"]
-            observed = load_rgb_image(artifacts["corrupted"], max_size=None)
+            observed = load_tensor_data(artifacts["corrupted"], max_size=None)
             observed_mask = load_observation_mask(artifacts["mask"])
-            ground_truth_path = Path(self.config.base_run_dir) / "evaluation_ground_truth.png"
-            ground_truth = load_rgb_image(str(ground_truth_path), max_size=None)
+            ground_truth_path = Path(self.config.base_run_dir) / "evaluation_ground_truth.npy"
+            ground_truth = load_tensor_data(str(ground_truth_path), max_size=None)
             if observed.shape != ground_truth.shape or observed_mask.shape != observed.shape[:2]:
-                raise ValueError("base-run image artifacts have inconsistent shapes")
+                raise ValueError("base-run tensor artifacts have inconsistent shapes")
 
             base_method = self.base_state["selected_model"]
             base_class = MODEL_CLASSES[base_method]
@@ -503,6 +506,7 @@ class Day6Workflow:
                     training,
                     seed,
                     str(round_dir / "baseline_final"),
+                    self.config.learned_metrics,
                 )
                 candidate_final = final_fit_and_evaluate(
                     candidate_manifest["candidate_id"],
@@ -514,6 +518,7 @@ class Day6Workflow:
                     training,
                     seed,
                     str(round_dir / "candidate_final"),
+                    self.config.learned_metrics,
                 )
                 print("\n4/4 Judge 正在比较 PSNR、SSIM 和训练行为…", flush=True)
                 judgment = judge_candidate(

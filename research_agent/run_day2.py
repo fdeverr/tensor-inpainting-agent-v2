@@ -14,13 +14,31 @@ def build_parser() -> argparse.ArgumentParser:
         description="Train and evaluate a basic learnable tensor decomposition."
     )
     parser.add_argument("--image", required=True)
-    parser.add_argument("--model", choices=("matrix", "cp", "tucker"), required=True)
+    parser.add_argument("--mat-key", help="MAT variable name; auto-detected when omitted")
+    parser.add_argument(
+        "--model",
+        choices=(
+            "matrix",
+            "mode3",
+            "cp",
+            "nonnegative_cp",
+            "tucker",
+            "btd",
+            "tsvd",
+            "nonnegative_tucker",
+            "hierarchical_tucker",
+            "tt",
+            "tensor_ring",
+        ),
+        required=True,
+    )
     parser.add_argument("--output-dir", default="research_agent/outputs")
     parser.add_argument("--mask-type", choices=("random", "block"), default="block")
     parser.add_argument("--missing-rate", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--skip-learned-metrics", action="store_true")
     parser.add_argument("--learning-rate", type=float, default=0.03)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--validation-ratio", type=float, default=0.1)
@@ -30,21 +48,46 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rank-h", type=int)
     parser.add_argument("--rank-w", type=int)
     parser.add_argument("--rank-c", type=int)
+    parser.add_argument("--rank-1", type=int)
+    parser.add_argument("--rank-2", type=int)
+    parser.add_argument("--num-blocks", type=int)
+    parser.add_argument("--rank-spatial", type=int)
     parser.add_argument("--init-scale", type=float)
     return parser
 
 
 def _model_hyperparameters(args: argparse.Namespace):
     hyperparameters = get_default_hyperparameters(args.model)
-    if args.model in {"matrix", "cp"} and args.rank is not None:
+    if args.model in {
+        "matrix",
+        "mode3",
+        "cp",
+        "nonnegative_cp",
+        "tsvd",
+        "tensor_ring",
+    } and args.rank is not None:
         hyperparameters["rank"] = args.rank
-    if args.model == "tucker":
+    if args.model in {
+        "tucker",
+        "btd",
+        "nonnegative_tucker",
+        "hierarchical_tucker",
+    }:
         if args.rank_h is not None:
             hyperparameters["rank_h"] = args.rank_h
         if args.rank_w is not None:
             hyperparameters["rank_w"] = args.rank_w
         if args.rank_c is not None:
             hyperparameters["rank_c"] = args.rank_c
+    if args.model == "btd" and args.num_blocks is not None:
+        hyperparameters["num_blocks"] = args.num_blocks
+    if args.model == "hierarchical_tucker" and args.rank_spatial is not None:
+        hyperparameters["rank_spatial"] = args.rank_spatial
+    if args.model == "tt":
+        if args.rank_1 is not None:
+            hyperparameters["rank_1"] = args.rank_1
+        if args.rank_2 is not None:
+            hyperparameters["rank_2"] = args.rank_2
     if args.init_scale is not None:
         hyperparameters["init_scale"] = args.init_scale
     return hyperparameters
@@ -70,6 +113,8 @@ def main() -> None:
         missing_rate=args.missing_rate,
         seed=args.seed,
         image_size=args.image_size or None,
+        mat_key=args.mat_key,
+        learned_metrics=not args.skip_learned_metrics,
     )
     result = run_day2_experiment(config)
     interpolation = result["interpolation"]
@@ -94,6 +139,9 @@ def main() -> None:
     print("  interpolation_psnr: %s" % interpolation_psnr_text)
     print("  tensor_model_psnr: %s" % tensor_psnr_text)
     print("  tensor_model_ssim: %.6f" % tensor_model["composite_ssim"])
+    for key in ("lpips", "maniqa", "clip_iqa", "musiq"):
+        value = tensor_model.get(key)
+        print("  tensor_model_%s: %s" % (key, "N/A" if value is None else "%.6f" % value))
     print("  metrics: %s" % result["artifacts"]["metrics"])
 
 

@@ -3,7 +3,7 @@ import json
 import pytest
 
 from research_agent.knowledge import LocalKnowledgeRetriever
-from research_agent.method_selector import MethodSelector
+from research_agent.method_selector import MethodSelector, manual_method_plan
 
 
 def _profile():
@@ -84,6 +84,18 @@ def test_local_retrieval_returns_rules_and_sourced_chunks():
     assert retrieval["evidence"]
     assert all("#" in item["source"] for item in retrieval["evidence"])
     assert any(rule["prefer"] == "tucker" for rule in retrieval["active_rules"])
+    assert any(rule["prefer"] == "mode3" for rule in retrieval["active_rules"])
+    assert any(
+        rule["prefer"] == "hierarchical_tucker"
+        for rule in retrieval["active_rules"]
+    )
+
+    expanded = LocalKnowledgeRetriever().retrieve(
+        profile=_profile(),
+        query="A mode-3 E channel subspace factorization",
+        top_k=30,
+    )
+    assert any(item["method"] == "mode3" for item in expanded["evidence"])
 
 
 def test_valid_llm_method_plan_is_accepted_stably():
@@ -95,6 +107,112 @@ def test_valid_llm_method_plan_is_accepted_stably():
     assert result["plan"].selection_mode == "llm"
     assert result["attempts"] == 1
     assert llm.calls[0]["kwargs"]["temperature"] == 0.0
+
+
+def test_valid_tt_method_plan_is_accepted():
+    retrieval = LocalKnowledgeRetriever().retrieve(
+        profile=_profile(),
+        query="Tensor Train TT rank anisotropic mode ordering",
+        top_k=20,
+    )
+    source = next(
+        item["source"] for item in retrieval["evidence"] if item["method"] == "tt"
+    )
+    output = json.dumps(
+        {
+            "method": "tt",
+            "reason": (
+                "The anisotropic image motivates a parameter-efficient Tensor Train "
+                "whose two unfolding ranks remain explicitly bounded."
+            ),
+            "evidence": [
+                {
+                    "source": source,
+                    "claim": "The retrieved evidence supports TT for anisotropic modes.",
+                }
+            ],
+            "confidence": 0.72,
+            "suggested_hyperparameters": {
+                "rank_1_candidates": [4, 8, 16],
+                "rank_2_candidates": [2, 3],
+                "init_scale": 0.1,
+            },
+            "risks": ["The chain mode ordering can introduce directional bias."],
+            "selection_mode": "llm",
+        }
+    )
+
+    result = MethodSelector(FakeLLM([output])).select(_profile(), retrieval)
+
+    assert result["plan"].method == "tt"
+    assert result["plan"].suggested_hyperparameters["rank_2_candidates"] == [2, 3]
+
+
+def test_manual_tensor_ring_plan_uses_bounded_defaults():
+    plan = manual_method_plan("tensor_ring", _profile())
+
+    assert plan.method == "tensor_ring"
+    assert plan.selection_mode == "manual"
+    assert plan.confidence == 1.0
+    assert plan.evidence[0].source == "user_cli:--base-model"
+    assert max(plan.suggested_hyperparameters["rank_candidates"]) <= 16
+
+
+def test_manual_mode3_plan_uses_rgb_channel_rank_candidates():
+    plan = manual_method_plan("mode3", _profile())
+
+    assert plan.method == "mode3"
+    assert plan.selection_mode == "manual"
+    assert plan.suggested_hyperparameters == {
+        "rank_candidates": [1, 2, 3],
+        "init_scale": 0.1,
+    }
+
+
+@pytest.mark.parametrize(
+    "method,required_keys",
+    (
+        (
+            "nonnegative_cp",
+            {"rank_candidates", "init_scale"},
+        ),
+        (
+            "btd",
+            {
+                "num_blocks_candidates",
+                "rank_h_candidates",
+                "rank_w_candidates",
+                "rank_c_candidates",
+                "init_scale",
+            },
+        ),
+        ("tsvd", {"rank_candidates", "init_scale"}),
+        (
+            "nonnegative_tucker",
+            {
+                "rank_h_candidates",
+                "rank_w_candidates",
+                "rank_c_candidates",
+                "init_scale",
+            },
+        ),
+        (
+            "hierarchical_tucker",
+            {
+                "rank_h_candidates",
+                "rank_w_candidates",
+                "rank_c_candidates",
+                "rank_spatial_candidates",
+                "init_scale",
+            },
+        ),
+    ),
+)
+def test_manual_new_method_plans_use_method_specific_defaults(method, required_keys):
+    plan = manual_method_plan(method, _profile())
+
+    assert plan.method == method
+    assert set(plan.suggested_hyperparameters) == required_keys
 
 
 def test_invalid_json_is_repaired_once():
@@ -133,13 +251,55 @@ def test_prompt_exposes_method_specific_hyperparameter_contract():
         "rank_w_candidates",
         "rank_c_candidates",
     ]
+    assert payload["hyperparameter_contract"]["tt"]["required"] == [
+        "rank_1_candidates",
+        "rank_2_candidates",
+    ]
+    assert payload["hyperparameter_contract"]["tensor_ring"]["required"] == [
+        "rank_candidates"
+    ]
+    assert payload["hyperparameter_contract"]["mode3"]["required"] == [
+        "rank_candidates"
+    ]
+    assert payload["hyperparameter_contract"]["nonnegative_cp"]["required"] == [
+        "rank_candidates"
+    ]
+    assert payload["hyperparameter_contract"]["btd"]["required"] == [
+        "num_blocks_candidates",
+        "rank_h_candidates",
+        "rank_w_candidates",
+        "rank_c_candidates",
+    ]
+    assert payload["hyperparameter_contract"]["tsvd"]["required"] == [
+        "rank_candidates"
+    ]
+    assert payload["hyperparameter_contract"]["hierarchical_tucker"][
+        "required"
+    ] == [
+        "rank_h_candidates",
+        "rank_w_candidates",
+        "rank_c_candidates",
+        "rank_spatial_candidates",
+    ]
 
 
 def test_two_invalid_outputs_use_deterministic_fallback():
     retrieval = _retrieval()
     llm = FakeLLM(["bad", '{"method": "not-supported"}'])
     result = MethodSelector(llm).select(_profile(), retrieval)
-    assert result["plan"].method in {"matrix", "cp", "tucker"}
+    assert result["plan"].method in {
+        "matrix",
+        "mode3",
+        "cp",
+        "nonnegative_cp",
+        "tucker",
+        "btd",
+        "tsvd",
+        "nonnegative_tucker",
+        "hierarchical_tucker",
+        "tt",
+        "tensor_ring",
+    }
     assert result["plan"].selection_mode == "deterministic_fallback"
     assert result["fallback_reason"] is not None
     assert result["attempts"] == 2

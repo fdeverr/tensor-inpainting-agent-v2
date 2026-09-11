@@ -42,6 +42,7 @@ def test_day2_pipeline_writes_model_and_interpolation_results(tmp_path):
         missing_rate=0.3,
         seed=23,
         image_size=None,
+        learned_metrics=False,
     )
 
     result = run_day2_experiment(config)

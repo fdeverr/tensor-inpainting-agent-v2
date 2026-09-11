@@ -7,6 +7,7 @@ from PIL import Image
 
 from research_agent.agent_tools import build_research_tool_registry
 from research_agent.agent_tools.framework import ToolStatus
+from research_agent.agent_tools.research_tools import _default_candidates
 from research_agent.workflow import (
     Day3Workflow,
     Day3WorkflowConfig,
@@ -59,6 +60,38 @@ def test_registry_exposes_six_structured_tools():
         assert schema["function"]["name"] == tool.name
 
 
+@pytest.mark.parametrize(
+    "model_name,required_names",
+    (
+        ("mode3", {"rank", "init_scale"}),
+        ("nonnegative_cp", {"rank", "init_scale"}),
+        ("btd", {"num_blocks", "rank_h", "rank_w", "rank_c", "init_scale"}),
+        ("tsvd", {"rank", "init_scale"}),
+        (
+            "nonnegative_tucker",
+            {"rank_h", "rank_w", "rank_c", "init_scale"},
+        ),
+        (
+            "hierarchical_tucker",
+            {"rank_h", "rank_w", "rank_c", "rank_spatial", "init_scale"},
+        ),
+        ("tt", {"rank_1", "rank_2", "init_scale"}),
+        ("tensor_ring", {"rank", "init_scale"}),
+    ),
+)
+def test_default_candidates_follow_each_model_search_space(
+    model_name,
+    required_names,
+):
+    candidates = _default_candidates(model_name, (8, 7, 3))
+
+    assert len(candidates) == 2
+    assert all(
+        set(candidate["hyperparameters"]) == required_names
+        for candidate in candidates
+    )
+
+
 def test_tool_registry_returns_structured_error_with_timing(tmp_path):
     registry = build_research_tool_registry()
     response = registry.execute_tool(
@@ -92,6 +125,7 @@ def test_day3_workflow_runs_all_tools_and_preserves_gt_boundary(tmp_path):
             validation_interval=5,
             patience=10,
             device="cpu",
+            learned_metrics=False,
             candidates=_candidate(),
         )
     )
@@ -154,6 +188,7 @@ def test_failure_keeps_last_successful_stage(tmp_path):
             max_steps=5,
             validation_interval=1,
             device="cpu",
+            learned_metrics=False,
             candidates=[
                 {
                     "hyperparameters": {"unknown_argument": 1},

@@ -1,10 +1,31 @@
-"""Evaluation-only image reconstruction metrics."""
+"""Evaluation-only tensor reconstruction metrics.
+
+The learned metrics are loaded lazily because PyIQA and its pretrained weights
+are considerably heavier than the deterministic PSNR/SSIM implementation.
+Metric failures are isolated per model so one unavailable checkpoint does not
+discard the rest of an experiment.
+"""
 
 from __future__ import annotations
 
 import math
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
+
+
+LEARNED_IQA_SPECS = {
+    "lpips": {"model_name": "lpips", "reference": True, "lower_better": True},
+    "maniqa": {"model_name": "maniqa", "reference": False, "lower_better": False},
+    "clip_iqa": {
+        "model_name": "clipiqa",
+        "reference": False,
+        "lower_better": False,
+    },
+    "musiq": {"model_name": "musiq", "reference": False, "lower_better": False},
+}
+
+_LEARNED_MODEL_CACHE: Dict[Tuple[str, str], Any] = {}
 
 
 def _validate_metric_inputs(
@@ -14,8 +35,10 @@ def _validate_metric_inputs(
 ) -> None:
     if prediction.shape != ground_truth.shape:
         raise ValueError("prediction and ground_truth must have identical shapes")
-    if prediction.ndim != 3 or prediction.shape[2] != 3:
-        raise ValueError("images must have shape [H, W, 3]")
+    if prediction.ndim not in (3, 4):
+        raise ValueError("inputs must have shape [H,W,C] or [H,W,T,C]")
+    if any(int(size) <= 0 for size in prediction.shape):
+        raise ValueError("all tensor dimensions must be positive")
     if observed_mask.shape != prediction.shape[:2] or observed_mask.dtype != np.bool_:
         raise ValueError("observed_mask must be bool and match image height and width")
     if observed_mask.all():
@@ -29,7 +52,7 @@ def missing_region_mse(
     ground_truth: np.ndarray,
     observed_mask: np.ndarray,
 ) -> float:
-    """Mean squared error over missing pixels and RGB channels only."""
+    """Mean squared error over missing locations and every trailing feature."""
 
     _validate_metric_inputs(prediction, ground_truth, observed_mask)
     difference = prediction[~observed_mask] - ground_truth[~observed_mask]
@@ -88,25 +111,30 @@ def structural_similarity(
     window_size: int = 11,
     sigma: float = 1.5,
 ) -> float:
-    """Compute mean RGB SSIM using a Gaussian local window."""
+    """Compute mean SSIM over all channel/frame feature planes."""
 
-    if image_x.shape != image_y.shape or image_x.ndim != 3 or image_x.shape[2] != 3:
-        raise ValueError("SSIM inputs must both have shape [H, W, 3]")
+    if image_x.shape != image_y.shape or image_x.ndim not in (3, 4):
+        raise ValueError("SSIM inputs must both be matching HWC or HWTC tensors")
     if data_range <= 0 or sigma <= 0:
         raise ValueError("data_range and sigma must be positive")
     if not np.isfinite(image_x).all() or not np.isfinite(image_y).all():
         raise ValueError("SSIM inputs contain NaN or Inf")
 
-    height, width, channels = image_x.shape
+    height, width = image_x.shape[:2]
+    flattened_x = image_x.reshape(height, width, -1)
+    flattened_y = image_y.reshape(height, width, -1)
+    features = flattened_x.shape[-1]
     effective_window = min(window_size, height, width)
     if effective_window % 2 == 0:
         effective_window -= 1
 
     channel_scores = []
     if effective_window < 3:
-        for channel in range(channels):
+        for channel in range(features):
             channel_scores.append(
-                _global_ssim(image_x[..., channel], image_y[..., channel], data_range)
+                _global_ssim(
+                    flattened_x[..., channel], flattened_y[..., channel], data_range
+                )
             )
         return float(np.mean(channel_scores))
 
@@ -114,9 +142,9 @@ def structural_similarity(
     c1 = (0.01 * data_range) ** 2
     c2 = (0.03 * data_range) ** 2
 
-    for channel in range(channels):
-        x = image_x[..., channel].astype(np.float64, copy=False)
-        y = image_y[..., channel].astype(np.float64, copy=False)
+    for channel in range(features):
+        x = flattened_x[..., channel].astype(np.float64, copy=False)
+        y = flattened_y[..., channel].astype(np.float64, copy=False)
         mean_x = _filter2d(x, kernel)
         mean_y = _filter2d(y, kernel)
         variance_x = np.maximum(0.0, _filter2d(x * x, kernel) - mean_x * mean_x)
@@ -149,3 +177,151 @@ def composite_ssim(
     composite[observed_mask] = ground_truth[observed_mask]
     return structural_similarity(composite, ground_truth)
 
+
+def _resolve_learned_metric_device(device: str) -> str:
+    if device not in {"auto", "cpu", "cuda"}:
+        raise ValueError("device must be 'auto', 'cpu', or 'cuda'")
+    if device != "auto":
+        return device
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _image_tensor(image: np.ndarray, device: str):
+    """Convert an HWC RGB image in [0, 1] to PyIQA's NCHW convention."""
+
+    import torch
+
+    clipped = np.clip(image, 0.0, 1.0).astype(np.float32, copy=False)
+    contiguous = np.ascontiguousarray(clipped.transpose(2, 0, 1)[None, ...])
+    return torch.from_numpy(contiguous).to(device=device)
+
+
+def _learned_metric_model(model_name: str, device: str):
+    cache_key = (model_name, device)
+    if cache_key not in _LEARNED_MODEL_CACHE:
+        import pyiqa
+
+        _LEARNED_MODEL_CACHE[cache_key] = pyiqa.create_metric(
+            model_name,
+            device=device,
+        )
+    return _LEARNED_MODEL_CACHE[cache_key]
+
+
+def _error_text(error: Exception) -> str:
+    message = "%s: %s" % (type(error).__name__, error)
+    return message[:500]
+
+
+def learned_image_quality_metrics(
+    prediction: np.ndarray,
+    ground_truth: np.ndarray,
+    observed_mask: np.ndarray,
+    device: str = "auto",
+) -> Tuple[Dict[str, Optional[float]], Dict[str, Any]]:
+    """Evaluate LPIPS, MANIQA, CLIP-IQA, and MUSIQ on the completed image.
+
+    Known pixels are restored from ``ground_truth`` before inference. LPIPS is
+    full-reference; the remaining models are no-reference quality estimators.
+    This is deliberately an evaluation-only function and must never be used as
+    a tuning or training signal.
+    """
+
+    _validate_metric_inputs(prediction, ground_truth, observed_mask)
+    scores: Dict[str, Optional[float]] = {
+        metric_name: None for metric_name in LEARNED_IQA_SPECS
+    }
+    if prediction.ndim != 3 or prediction.shape[-1] != 3:
+        return scores, {
+            "enabled": False,
+            "requested": True,
+            "device": None,
+            "scope": "unsupported_non_rgb_tensor",
+            "errors": {},
+            "skipped_reason": (
+                "LPIPS/MANIQA/CLIP-IQA/MUSIQ only support RGB [H,W,3]; "
+                "PSNR and SSIM were computed over all tensor features"
+            ),
+        }
+    status: Dict[str, Any] = {
+        "enabled": True,
+        "requested": True,
+        "device": None,
+        "scope": "composite_full_image",
+        "errors": {},
+    }
+    try:
+        resolved_device = _resolve_learned_metric_device(device)
+        status["device"] = resolved_device
+        import pyiqa  # noqa: F401  # fail all learned metrics once if unavailable
+
+        composite = prediction.copy()
+        composite[observed_mask] = ground_truth[observed_mask]
+        prediction_tensor = _image_tensor(composite, resolved_device)
+        reference_tensor = _image_tensor(ground_truth, resolved_device)
+        import torch
+    except Exception as error:
+        message = _error_text(error)
+        status["errors"] = {
+            metric_name: message for metric_name in LEARNED_IQA_SPECS
+        }
+        return scores, status
+
+    for metric_name, spec in LEARNED_IQA_SPECS.items():
+        try:
+            model = _learned_metric_model(str(spec["model_name"]), resolved_device)
+            with torch.inference_mode():
+                if spec["reference"]:
+                    output = model(prediction_tensor, reference_tensor)
+                else:
+                    output = model(prediction_tensor)
+            value = float(torch.as_tensor(output).detach().cpu().reshape(-1)[0])
+            if not math.isfinite(value):
+                raise ValueError("metric returned NaN or Inf")
+            scores[metric_name] = value
+        except Exception as error:
+            status["errors"][metric_name] = _error_text(error)
+    return scores, status
+
+
+def evaluate_reconstruction_metrics(
+    prediction: np.ndarray,
+    ground_truth: np.ndarray,
+    observed_mask: np.ndarray,
+    *,
+    device: str = "auto",
+    include_learned_metrics: bool = True,
+) -> Dict[str, Any]:
+    """Return the complete metric payload used by every experiment path."""
+
+    psnr = missing_region_psnr(prediction, ground_truth, observed_mask)
+    result: Dict[str, Any] = {
+        "missing_mse": missing_region_mse(prediction, ground_truth, observed_mask),
+        "missing_psnr": psnr if math.isfinite(psnr) else None,
+        "perfect_reconstruction": not math.isfinite(psnr),
+        "composite_ssim": composite_ssim(prediction, ground_truth, observed_mask),
+    }
+    if include_learned_metrics:
+        learned_scores, learned_status = learned_image_quality_metrics(
+            prediction,
+            ground_truth,
+            observed_mask,
+            device=device,
+        )
+    else:
+        learned_scores = {
+            metric_name: None for metric_name in LEARNED_IQA_SPECS
+        }
+        learned_status = {
+            "enabled": False,
+            "requested": False,
+            "device": None,
+            "scope": "composite_full_image",
+            "errors": {},
+            "skipped_reason": "learned metrics disabled by configuration",
+        }
+    result.update(learned_scores)
+    result["learned_metric_status"] = learned_status
+    return result
