@@ -9,12 +9,16 @@ from .workflow_day6 import Day6WorkflowConfig, run_day6_workflow
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fairly evaluate a candidate and run at most two improvement rounds."
+        description="Fairly evaluate candidates in a configurable iterative evolution loop."
     )
     parser.add_argument("--base-run-dir", required=True)
     parser.add_argument("--candidate-dir", required=True)
     parser.add_argument("--candidate-root", default="research_agent/algorithms/candidates")
     parser.add_argument("--approved-root", default="research_agent/algorithms/approved")
+    parser.add_argument(
+        "--knowledge-root",
+        help="cross-run reusable experience root; defaults beside candidate-root",
+    )
     parser.add_argument("--output-dir", default="research_agent/outputs")
     parser.add_argument("--llm-mode", choices=("auto", "off", "required"), default="auto")
     parser.add_argument("--tuning-trials", type=int, default=4)
@@ -24,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=2000,
         help="hard ceiling for the LLM-requested shared training steps",
     )
-    parser.add_argument("--max-improvement-rounds", type=int, default=2)
+    parser.add_argument("--max-improvement-rounds", type=int, default=5)
     parser.add_argument("--validation-ratio", type=float, default=0.1)
     parser.add_argument("--validation-interval", type=int, default=10)
     parser.add_argument("--patience", type=int, default=40)
@@ -44,6 +48,7 @@ def main() -> None:
             initial_candidate_dir=args.candidate_dir,
             candidate_root=args.candidate_root,
             approved_root=args.approved_root,
+            knowledge_root=args.knowledge_root,
             output_dir=args.output_dir,
             llm_mode=args.llm_mode,
             tuning_trials=args.tuning_trials,
@@ -66,6 +71,14 @@ def main() -> None:
     print("  stop_reason: %s" % state["stop_reason"])
     print("  best_algorithm: %s" % state["best_available"]["algorithm"])
     print("  reconstruction: %s" % state["best_available"]["reconstruction"])
+    print(
+        "  run_practice: %s"
+        % state["artifacts"]["run_practice"]["practice_markdown"]
+    )
+    print(
+        "  global_experience: %s"
+        % state["artifacts"]["global_experience"]["experience_markdown"]
+    )
 
 
 if __name__ == "__main__":

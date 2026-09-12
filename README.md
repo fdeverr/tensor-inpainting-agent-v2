@@ -67,4 +67,6 @@ MAT 数据可直接输入；MSI/彩图形状为 `[H,W,C]`，视频形状为 `[H,
 
 每次完整运行都会同时保存无损多维 `.npy` 和 `.mat` 补全数据（MAT 变量名为 `data`），并在 `comparison_images/` 中导出 RGB 预览。`report.md` 汇总 PSNR、SSIM、LPIPS、MANIQA、CLIP-IQA 和 MUSIQ；后四项仅适用于 RGB，MSI/视频会明确标记为跳过。
 
+算法进化默认执行 5 轮，可用 `--max-improvement-rounds N` 调整。每轮只改变算法或 loss 中的一个点；通过 Judge 后会更新当前最优并继续下一轮。当前运行的实践轨迹保存在 `research_agent/outputs/<day6-run>/knowledge/`，不会被其他运行读取；跨运行可复用经验累积在 `research_agent/algorithms/evolution_knowledge/<基础分解>/reusable_experience.*`。候选与最终晋升算法也会按 Matrix、CP、Tucker 等基础分解分别建目录。可用 `--knowledge-root PATH` 指定全局经验库位置。
+
 更多设计、实验协议与测试说明见 [research_agent/README.md](research_agent/README.md)。

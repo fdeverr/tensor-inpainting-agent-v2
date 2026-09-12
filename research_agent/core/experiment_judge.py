@@ -86,7 +86,11 @@ def judge_candidate(
                     "judge thresholds; any revised LLM-requested training budget must "
                     "still be shared by baseline and candidate and stay under the user ceiling."
                 ),
-                "Do not use missing-region ground truth in generation, tuning, or checkpoint selection.",
+                (
+                    "Do not expose ground-truth tensor contents to generation, tuning, or "
+                    "checkpoint selection; later evolution rounds may use only persisted "
+                    "aggregate evaluation results."
+                ),
             ]
         )
     if not accepted and selected_weight == 0.0:

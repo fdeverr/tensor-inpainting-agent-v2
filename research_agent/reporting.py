@@ -55,9 +55,12 @@ def build_method_results(
         return results
 
     last_round = day6["rounds"][-1]
-    baseline = last_round["baseline_final"]
-    candidate = last_round["candidate_final"]
-    accepted = last_round["judgment"]["accepted"]
+    baseline = day6["rounds"][0]["baseline_final"]
+    evolved = day6.get("best_evolved")
+    candidate = (
+        evolved["final"] if evolved is not None else last_round["candidate_final"]
+    )
+    accepted = evolved is not None
     results.extend(
         [
             {
@@ -77,7 +80,7 @@ def build_method_results(
             },
             {
                 "algorithm": (
-                    day6["promotion"]["algorithm_name"]
+                    evolved["algorithm"]
                     if accepted
                     else last_round["candidate_id"]
                 ),
@@ -172,8 +175,9 @@ def render_research_report(
         "- 输入任务：%s" % final_state["prompt"],
         "- 选择的张量分解：`%s`" % day4["selected_model"],
         "- 候选代码验证：`%s`" % day5["validation"]["status"],
-        "- 候选实验结论：`%s`"
-        % (day6["rounds"][-1]["judgment"]["decision"] if day6 else "not_evaluated"),
+        "- 进化轮数：`%s`" % (len(day6["rounds"]) if day6 else 0),
+        "- 接受并替换当前最优的轮次：`%s`"
+        % (day6.get("accepted_rounds", []) if day6 else []),
         "- 最终输出算法：`%s`" % final_state["best_available"]["algorithm"],
         "- 最终补全数据：`%s`"
         % final_state["artifacts"].get(
@@ -261,8 +265,17 @@ def render_research_report(
         lines.extend(
             [
                 "",
-                "## 公平实验与 Judge",
+                "## 多轮算法进化与 Judge",
                 "",
+                "- 实际轮数 / 请求轮数：`%d / %d`"
+                % (len(day6["rounds"]), day6["config"]["max_improvement_rounds"]),
+                "- 接受轮次：`%s`" % day6.get("accepted_rounds", []),
+                "- 最终进化算法：`%s`"
+                % (
+                    day6.get("promotion", {}).get("algorithm_name", "未产生")
+                    if day6.get("promotion")
+                    else "未产生"
+                ),
                 "- 基础模型 trials：%d" % judgment["budget_audit"]["baseline_trial_count"],
                 "- 候选模型 trials：%d" % judgment["budget_audit"]["candidate_trial_count"],
                 "- 本轮共享训练配置：`%s`"
@@ -279,6 +292,7 @@ def render_research_report(
                 "- 停止原因：`%s`" % day6["stop_reason"],
                 "",
                 "调参函数不接收缺失区域 Ground Truth。超参数和训练步数确定后，模型才在全部观测像素上重新拟合并执行最终隐藏区域评估。",
+                "每轮只允许一个算法或 loss 变异点；接受后更新当前最优并继续，而不是提前终止。",
             ]
         )
     lines.extend(
@@ -290,6 +304,22 @@ def render_research_report(
             "- 候选生成状态：`%s`" % final_state["artifacts"]["day5_state"],
             "- 公平实验状态：`%s`"
             % final_state["artifacts"].get("day6_state", "not generated"),
+            "- 当前运行实践文档：`%s`"
+            % (
+                day6.get("artifacts", {}).get("run_practice", {}).get(
+                    "practice_markdown", "not generated"
+                )
+                if day6
+                else "not generated"
+            ),
+            "- 跨运行可复用经验文档：`%s`"
+            % (
+                day6.get("artifacts", {}).get("global_experience", {}).get(
+                    "experience_markdown", "not generated"
+                )
+                if day6
+                else "not generated"
+            ),
             "- 顶层 Trace：`%s`" % final_state["artifacts"]["trace_jsonl"],
             "",
             "## 证据边界",

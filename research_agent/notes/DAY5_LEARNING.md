@@ -267,7 +267,7 @@ Day 5 的目标是理解验证层级，不是假装 AST 等于安全执行环境
 每个候选目录：
 
 ```text
-algorithms/candidates/<candidate-id>/
+algorithms/candidates/<base-method>/<candidate-id>/
 ├── idea.json
 ├── model.py
 ├── manifest.json

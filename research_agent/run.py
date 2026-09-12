@@ -21,6 +21,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default="research_agent/outputs")
     parser.add_argument("--candidate-root", default="research_agent/algorithms/candidates")
     parser.add_argument("--approved-root", default="research_agent/algorithms/approved")
+    parser.add_argument(
+        "--knowledge-root",
+        help="cross-run reusable experience root; defaults beside candidate-root",
+    )
     parser.add_argument("--mask-type", choices=("random", "block"), default="block")
     parser.add_argument("--missing-rate", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=42)
@@ -52,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="hard ceiling for the LLM-requested shared Day 6 training steps",
     )
     parser.add_argument("--tuning-trials", type=int, default=4)
-    parser.add_argument("--max-improvement-rounds", type=int, default=2)
+    parser.add_argument("--max-improvement-rounds", type=int, default=5)
     parser.add_argument("--validation-ratio", type=float, default=0.1)
     parser.add_argument("--validation-interval", type=int, default=10)
     parser.add_argument("--patience", type=int, default=40)
@@ -79,6 +83,7 @@ def main() -> None:
             output_dir=args.output_dir,
             candidate_root=args.candidate_root,
             approved_root=args.approved_root,
+            knowledge_root=args.knowledge_root,
             mask_type=args.mask_type,
             missing_rate=args.missing_rate,
             seed=args.seed,
@@ -129,6 +134,16 @@ def main() -> None:
         print("    %s: %s" % (role, path))
     print("  report: %s" % state["artifacts"]["report"])
     print("  state: %s" % state["artifacts"]["state"])
+    if "run_practice" in state["artifacts"]:
+        print(
+            "  run_practice: %s"
+            % state["artifacts"]["run_practice"]["practice_markdown"]
+        )
+    if "global_experience" in state["artifacts"]:
+        print(
+            "  global_experience: %s"
+            % state["artifacts"]["global_experience"]["experience_markdown"]
+        )
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ class FullWorkflowConfig:
     output_dir: str = "research_agent/outputs"
     candidate_root: str = "research_agent/algorithms/candidates"
     approved_root: str = "research_agent/algorithms/approved"
+    knowledge_root: Optional[str] = None
     mask_type: str = "block"
     missing_rate: float = 0.4
     seed: int = 42
@@ -36,7 +37,7 @@ class FullWorkflowConfig:
     method_max_steps: int = 1000
     fair_max_steps: int = 2000
     tuning_trials: int = 4
-    max_improvement_rounds: int = 2
+    max_improvement_rounds: int = 5
     validation_ratio: float = 0.1
     validation_interval: int = 10
     patience: int = 40
@@ -70,8 +71,8 @@ class FullWorkflowConfig:
             raise ValueError("training steps must be positive")
         if not 1 <= self.tuning_trials <= 5:
             raise ValueError("tuning_trials must be in [1, 5]")
-        if not 1 <= self.max_improvement_rounds <= 2:
-            raise ValueError("max_improvement_rounds must be in [1, 2]")
+        if not 1 <= self.max_improvement_rounds <= 100:
+            raise ValueError("max_improvement_rounds must be in [1, 100]")
         if not isinstance(self.learned_metrics, bool):
             raise ValueError("learned_metrics must be a bool")
 
@@ -226,6 +227,7 @@ class FullResearchWorkflow:
                     base_run_dir=day4["artifacts"]["run_dir"],
                     candidate_root=self.config.candidate_root,
                     output_dir=self.config.output_dir,
+                    knowledge_root=self.config.knowledge_root,
                     llm_mode=self.config.llm_mode,
                     smoke_timeout_seconds=self.config.smoke_timeout_seconds,
                 )
@@ -249,6 +251,7 @@ class FullResearchWorkflow:
                         candidate_root=self.config.candidate_root,
                         approved_root=self.config.approved_root,
                         output_dir=self.config.output_dir,
+                        knowledge_root=self.config.knowledge_root,
                         llm_mode=self.config.llm_mode,
                         tuning_trials=self.config.tuning_trials,
                         max_steps=self.config.fair_max_steps,
@@ -264,6 +267,12 @@ class FullResearchWorkflow:
                     )
                 )
                 self._child_completed("day6", day6)
+                self.state["artifacts"]["run_practice"] = day6["artifacts"][
+                    "run_practice"
+                ]
+                self.state["artifacts"]["global_experience"] = day6["artifacts"][
+                    "global_experience"
+                ]
             else:
                 print(
                     "\n⚠️  阶段 3/4 已跳过：Day 5 候选未通过代码验证。",

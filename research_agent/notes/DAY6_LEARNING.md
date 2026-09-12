@@ -31,7 +31,7 @@ Day 5 只回答了“候选代码能不能安全地进入训练”。Day 6 要�
 | `candidate/loader.py` | 检查验证状态和代码哈希后加载候选 |
 | `candidate/approved_registry.py` | 将通过 Judge 的候选保存为版本化算法 |
 | `agent_tools/algorithm_runner.py` | 通用的已晋升算法运行 Tool |
-| `workflow_day6.py` | 最多两轮的完整研究状态机 |
+| `workflow_day6.py` | 默认五轮、逐轮更新 incumbent 的完整研究状态机 |
 | `run_day6.py` | Linux 命令行入口 |
 
 ## 2. 为什么不能直接比较两次随便训练的结果
@@ -210,19 +210,19 @@ Judge 输出的不只是 `accept/reject`，还包括：
 停止条件是确定的：
 
 ```text
-候选通过 → 立即停止
-候选未通过且还有轮次 → 生成下一候选
-达到 max_improvement_rounds → 停止并返回最佳基线
+候选通过 → 更新当前最优并继续下一轮
+候选未通过 → 保留当前最优并继续下一轮
+达到 max_improvement_rounds → 保存最终当前最优
 ```
 
-配置强制 `max_improvement_rounds <= 2`，因此不会出现无限自我修改。
+配置强制 `max_improvement_rounds <= 100`，默认值为 5，因此不会出现无限自我修改。
 
 ## 9. 算法晋升不是复制一个名字
 
 通过 Judge 后，`promote_candidate()` 创建：
 
 ```text
-algorithms/approved/<algorithm_name>/<version>/
+algorithms/approved/<base_method>/<algorithm_name>/<version>/
 ├── model.py
 ├── idea.json
 ├── manifest.json
@@ -290,11 +290,11 @@ selected tv_weight = 0.0005
 ```bash
 python -m research_agent.run_day6 \
   --base-run-dir research_agent/outputs/<day4-run-id> \
-  --candidate-dir research_agent/algorithms/candidates/<candidate-id> \
+  --candidate-dir research_agent/algorithms/candidates/<base-method>/<candidate-id> \
   --llm-mode off \
   --tuning-trials 4 \
   --max-steps 200 \
-  --max-improvement-rounds 2 \
+  --max-improvement-rounds 5 \
   --device cuda
 ```
 
@@ -323,7 +323,7 @@ python -m research_agent.run_day6 \
 --minimum-psnr-delta 5.0
 ```
 
-观察第一轮如何产生反馈、第二轮如何生成更小 TV 权重的新候选，以及两轮后如何停止。这个练习不要改默认门槛。
+观察每轮如何产生反馈、下一轮如何读取实践与经验并生成新的单点变异，以及达到指定轮数后如何停止。这个练习不要改默认门槛。
 
 ### 练习 3：解释“晋升但不是冠军”
 
@@ -340,7 +340,7 @@ python -m research_agent.run_day6 \
 - [x] 候选只能通过受限 `model_builder` 接入固定 Trainer。
 - [x] Judge 使用固定 PSNR/SSIM 门槛。
 - [x] 失败反馈能进入下一轮生成输入。
-- [x] 改进循环最多执行两轮。
+- [x] 改进循环执行用户指定轮数，默认五轮、上限 100。
 - [x] 通过候选被保存到版本化 approved registry。
 - [x] 一个通用 Tool 可以重新加载并运行 approved algorithm。
 - [x] 最终报告同时展示插值、基础张量和候选结果。

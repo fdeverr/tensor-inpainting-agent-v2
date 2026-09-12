@@ -15,7 +15,7 @@ Tensor Inpainting Agent Framework 编排层
   ├─ Knowledge Retriever ───────── 检索本地 11 种分解的经验与限制
   ├─ Method Selector ───────────── LLM 或确定性 fallback
   ├─ Model Improver ────────────── 输出结构化 idea + 候选模型代码
-  └─ Experiment Controller ─────── 最多两轮，记录完整 Trace
+  └─ Experiment Controller ─────── 默认五轮单点变异，记录完整 Trace
           │
           ▼
 固定实验内核
@@ -209,7 +209,14 @@ trial 数相同，训练过程无 NaN / Inf / 异常
 最终全观测像素重训未发生明显数值发散
 ```
 
-通过后，候选及 idea、验证报告、最佳配置、指标、适用条件、来源 run 和代码哈希会进入 `algorithms/approved/<name>/<version>/`。所有已晋升算法共用一个 `AlgorithmRunnerTool`，不会为每个候选复制训练代码。
+完成指定轮数后，最终 incumbent 及 idea、验证报告、最佳配置、指标、适用条件、来源 run 和代码哈希会进入 `algorithms/approved/<base-method>/<name>/<version>/`。所有已晋升算法共用一个 `AlgorithmRunnerTool`，不会为每个候选复制训练代码。
+
+## 进化记忆的生命周期
+
+- 当前运行实践：`outputs/<day6-run-id>/knowledge/practice.md` 和 `practice.jsonl`。只供同一次运行中的后续轮次使用。
+- 全局可复用经验：`algorithms/evolution_knowledge/<base-method>/reusable_experience.md` 和 `reusable_experience.jsonl`。跨运行持续追加，新的独立运行会读取它。
+- 全局经验每条只保存从“目标—方法—结果”中提炼的一般性 `experience` 和 `confidence`；不保存运行号、轮次、候选 ID、证据分段或下一轮指令。完全重复的经验不会再次追加。
+- 旧版可能产生的全局 `practice.*`/`experience.*` 不再读取或追加，避免把历史运行轨迹混入新运行上下文。
 
 ## 一次真实研究轨迹
 

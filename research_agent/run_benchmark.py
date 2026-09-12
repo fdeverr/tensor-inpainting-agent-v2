@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--method-max-steps", type=int, default=50)
     parser.add_argument("--fair-max-steps", type=int, default=50)
     parser.add_argument("--tuning-trials", type=int, default=2)
-    parser.add_argument("--max-improvement-rounds", type=int, default=1)
+    parser.add_argument("--max-improvement-rounds", type=int, default=5)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument(
         "--skip-learned-metrics",

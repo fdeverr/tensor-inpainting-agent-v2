@@ -28,7 +28,7 @@ python -m research_agent.run \
   --image research_agent/assets/example.png \
   --mask-type block \
   --missing-rate 0.4 \
-  --max-improvement-rounds 2
+  --max-improvement-rounds 5
 ```
 
 一次运行至少完成：
@@ -222,7 +222,7 @@ max_steps: 1000
 early_stopping_patience: 100
 tuning_trials: 5
 validation_observed_ratio: 0.1
-max_improvement_rounds: 2
+max_improvement_rounds: 5
 candidate_timeout_seconds: 300
 ```
 
@@ -939,7 +939,7 @@ Model Improver 的输入应包含：
 每个候选保存为：
 
 ```text
-algorithms/candidates/<candidate_id>/
+algorithms/candidates/<base_method>/<candidate_id>/
 ├── idea.json
 ├── model.py
 ├── manifest.json
@@ -1003,7 +1003,7 @@ algorithms/candidates/<candidate_id>/
 
 ##### 反馈循环
 
-实现最多两轮的研究循环：
+实现用户指定轮数（默认五轮）的研究循环：
 
 ```python
 for round_index in range(max_improvement_rounds):
@@ -1016,13 +1016,14 @@ for round_index in range(max_improvement_rounds):
 
     best_config = tuner.tune(proposal)
     candidate_result = evaluator.run(proposal, best_config)
-    judgment = judge.compare(state.base_result, candidate_result)
+    judgment = judge.compare(state.incumbent_result, candidate_result)
 
     if judgment.accepted:
-        registry.promote(proposal, candidate_result, judgment)
-        break
+        state.incumbent = proposal
 
     state.feedback_history.append(judgment.feedback)
+
+registry.promote(state.incumbent, state.incumbent_result, judgment)
 ```
 
 结构化反馈至少包含：
@@ -1050,7 +1051,7 @@ for round_index in range(max_improvement_rounds):
 通过准入后，将候选复制或登记到：
 
 ```text
-algorithms/approved/<algorithm_name>/<version>/
+algorithms/approved/<base_method>/<algorithm_name>/<version>/
 ```
 
 保存：

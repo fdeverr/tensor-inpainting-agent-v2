@@ -16,6 +16,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--candidate-root",
         default="research_agent/algorithms/candidates",
     )
+    parser.add_argument(
+        "--knowledge-root",
+        help="cross-run reusable experience root; defaults beside candidate-root",
+    )
     parser.add_argument("--output-dir", default="research_agent/outputs")
     parser.add_argument(
         "--llm-mode",
@@ -32,6 +36,7 @@ def main() -> None:
         Day5WorkflowConfig(
             base_run_dir=args.base_run_dir,
             candidate_root=args.candidate_root,
+            knowledge_root=args.knowledge_root,
             output_dir=args.output_dir,
             llm_mode=args.llm_mode,
             smoke_timeout_seconds=args.smoke_timeout,
@@ -46,6 +51,10 @@ def main() -> None:
     print("  eligible_for_training: %s" % state["validation"]["eligible_for_training"])
     print("  candidate_dir: %s" % state["artifacts"]["candidate_dir"])
     print("  validation: %s" % state["artifacts"]["validation"])
+    print(
+        "  global_experience: %s"
+        % state["artifacts"]["global_experience"]["experience_markdown"]
+    )
 
 
 if __name__ == "__main__":

@@ -213,7 +213,7 @@ python -m research_agent.run \
   --image research_agent/assets/example.png \
   --mask-type block \
   --missing-rate 0.4 \
-  --max-improvement-rounds 2 \
+  --max-improvement-rounds 5 \
   --method-max-steps 200 \
   --fair-max-steps 200 \
   --tuning-trials 4 \
@@ -339,7 +339,7 @@ python -m research_agent.run_benchmark \
 - [x] 候选经过静态与动态验证。
 - [x] 基础与候选经过无泄漏、同预算公平实验。
 - [x] Judge 能接受、拒绝并产生下一轮反馈。
-- [x] 循环最多两轮并保证停止。
+- [x] 循环轮数由用户指定（默认五轮、上限 100）并保证停止。
 - [x] 成功候选进入带版本的 approved registry。
 - [x] 失败候选保留但不能成为最终输出。
 - [x] 最终输出图片、指标、配置、代码、报告和 Trace。

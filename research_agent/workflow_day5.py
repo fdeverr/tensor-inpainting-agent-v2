@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 from .agent_tools.framework import TraceLogger
 from .candidate import CandidateGenerator, CandidateValidator
 from .candidate.generator import load_improver_context
+from .evolution_knowledge import GlobalExperienceStore, resolve_knowledge_root
 from .method_selector import llm_from_environment
 
 
@@ -37,6 +38,7 @@ class Day5WorkflowConfig:
     base_run_dir: str
     candidate_root: str = "research_agent/algorithms/candidates"
     output_dir: str = "research_agent/outputs"
+    knowledge_root: Optional[str] = None
     llm_mode: str = "auto"
     smoke_timeout_seconds: float = 10.0
 
@@ -107,6 +109,19 @@ class Day5Workflow:
         try:
             print("\n🧠 正在整理基线模型、图像特征和训练曲线供 LLM 分析…", flush=True)
             context = load_improver_context(self.config.base_run_dir)
+            global_experience = GlobalExperienceStore(
+                resolve_knowledge_root(
+                    self.config.candidate_root, self.config.knowledge_root
+                ),
+                context["base_method"],
+            )
+            context["evolution_memory"] = {
+                "global_reusable_experience": global_experience.context(),
+                "current_run_practice": [],
+            }
+            self.state["artifacts"]["global_experience"] = (
+                global_experience.context()["documents"]
+            )
             self.state["base_run_id"] = context["base_run_id"]
             self.trace.log_event(
                 "model_improver_input",
@@ -173,7 +188,11 @@ class Day5Workflow:
                     proposal.generation_mode = "llm_repaired"
 
                 candidate_id = _identifier("candidate")
-                candidate_dir = Path(self.config.candidate_root) / candidate_id
+                candidate_dir = (
+                    Path(self.config.candidate_root)
+                    / context["base_method"]
+                    / candidate_id
+                )
                 candidate_dir.mkdir(parents=True, exist_ok=False)
                 idea_path = candidate_dir / "idea.json"
                 model_path = candidate_dir / "model.py"
@@ -202,6 +221,12 @@ class Day5Workflow:
                     "base_run_id": context["base_run_id"],
                     "base_method": proposal.base_method,
                     "architecture_family": proposal.architecture_family,
+                    "evolution_round": 1,
+                    "mutation_goal": proposal.mutation_goal,
+                    "mutation_target": proposal.mutation_target,
+                    "idea": proposal.idea,
+                    "single_change": proposal.single_change,
+                    "parent_candidate_id": None,
                     "created_at": datetime.now().isoformat(),
                     "generation_mode": proposal.generation_mode,
                     "llm_model": llm_model,
@@ -226,6 +251,10 @@ class Day5Workflow:
                             "repair_attempted": validation_round > 1,
                             "fallback_reason": generation.fallback_reason,
                             "hypothesis": proposal.hypothesis,
+                            "mutation_goal": proposal.mutation_goal,
+                            "mutation_target": proposal.mutation_target,
+                            "idea": proposal.idea,
+                            "single_change": proposal.single_change,
                             "architecture_family": proposal.architecture_family,
                             "training_budget": proposal.training_budget.model_dump(),
                         },
@@ -250,6 +279,10 @@ class Day5Workflow:
                         "hypothesis": proposal.hypothesis,
                         "proposed_changes": proposal.proposed_changes,
                         "architecture_family": proposal.architecture_family,
+                        "mutation_goal": proposal.mutation_goal,
+                        "mutation_target": proposal.mutation_target,
+                        "idea": proposal.idea,
+                        "single_change": proposal.single_change,
                         "training_budget": proposal.training_budget.model_dump(),
                         "search_space": proposal.search_space,
                         "generation_mode": proposal.generation_mode,

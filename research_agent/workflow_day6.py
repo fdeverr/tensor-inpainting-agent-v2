@@ -26,6 +26,12 @@ from .core.fair_experiment import (
     tune_model_on_observed_pixels,
 )
 from .core.models.registry import MODEL_CLASSES
+from .evolution_knowledge import (
+    GlobalExperienceStore,
+    RunPracticeStore,
+    describe_metrics,
+    resolve_knowledge_root,
+)
 from .method_selector import llm_from_environment
 from .schemas import TrainingConfig
 from .workflow_day5 import _identifier, _write_json
@@ -38,10 +44,11 @@ class Day6WorkflowConfig:
     candidate_root: str = "research_agent/algorithms/candidates"
     approved_root: str = "research_agent/algorithms/approved"
     output_dir: str = "research_agent/outputs"
+    knowledge_root: Optional[str] = None
     llm_mode: str = "auto"
     tuning_trials: int = 4
     max_steps: int = 2000
-    max_improvement_rounds: int = 2
+    max_improvement_rounds: int = 5
     validation_ratio: float = 0.1
     validation_interval: int = 10
     patience: int = 40
@@ -62,8 +69,8 @@ class Day6WorkflowConfig:
             raise ValueError("tuning_trials must be in [1, 5]")
         if self.max_steps < 1:
             raise ValueError("max_steps must be positive")
-        if not 1 <= self.max_improvement_rounds <= 2:
-            raise ValueError("max_improvement_rounds must be in [1, 2]")
+        if not 1 <= self.max_improvement_rounds <= 100:
+            raise ValueError("max_improvement_rounds must be in [1, 100]")
         if not 0.0 < self.validation_ratio < 1.0:
             raise ValueError("validation_ratio must be in (0, 1)")
         if self.validation_interval < 1 or self.patience < 1:
@@ -111,6 +118,7 @@ class Day6Workflow:
             "feedback_history": [],
             "candidate_generation_attempts": [],
             "accepted": False,
+            "accepted_rounds": [],
             "stop_reason": None,
             "best_available": None,
             "promotion": None,
@@ -286,7 +294,11 @@ class Day6Workflow:
             )
 
             candidate_id = _identifier("candidate")
-            directory = Path(self.config.candidate_root) / candidate_id
+            directory = (
+                Path(self.config.candidate_root)
+                / context["base_method"]
+                / candidate_id
+            )
             directory.mkdir(parents=True, exist_ok=False)
             model_path = directory / "model.py"
             idea_path = directory / "idea.json"
@@ -316,6 +328,15 @@ class Day6Workflow:
                 "base_run_id": context["base_run_id"],
                 "base_method": proposal.base_method,
                 "architecture_family": proposal.architecture_family,
+                "mutation_goal": proposal.mutation_goal,
+                "mutation_target": proposal.mutation_target,
+                "idea": proposal.idea,
+                "single_change": proposal.single_change,
+                "parent_candidate_id": (
+                    (context.get("incumbent_candidate") or {}).get("idea", {}).get(
+                        "candidate_id"
+                    )
+                ),
                 "created_at": datetime.now().isoformat(),
                 "improvement_round": round_index,
                 "validation_round": validation_round,
@@ -398,85 +419,85 @@ class Day6Workflow:
                 raise ValueError("base-run tensor artifacts have inconsistent shapes")
 
             base_method = self.base_state["selected_model"]
-            base_class = MODEL_CLASSES[base_method]
-            anchor = self.base_state["results"]["selected_trial"]["hyperparameters"]
             learning_rate = float(self.base_state["results"]["training"]["learning_rate"])
             seed = int(self.base_state["config"]["seed"])
             improver_context = load_improver_context(self.config.base_run_dir)
+            global_experience = GlobalExperienceStore(
+                resolve_knowledge_root(
+                    self.config.candidate_root, self.config.knowledge_root
+                ),
+                base_method,
+            )
+            run_practice = RunPracticeStore(
+                self.run_dir,
+                base_method,
+                self.workflow_id,
+            )
+            self.state["artifacts"]["global_experience"] = (
+                global_experience.context()["documents"]
+            )
+            self.state["artifacts"]["run_practice"] = (
+                run_practice.context()["documents"]
+            )
             candidate_dir = self.config.initial_candidate_dir
+            incumbent: Dict[str, Any] = {
+                "name": base_method,
+                "class": MODEL_CLASSES[base_method],
+                "builder": None,
+                "candidate_dir": None,
+                "anchor": self.base_state["results"]["selected_trial"]["hyperparameters"],
+                "final": None,
+                "tuning": None,
+                "acceptance_judgment": None,
+                "training_budget": None,
+            }
+            original_final: Optional[Dict[str, Any]] = None
 
             for round_index in range(1, self.config.max_improvement_rounds + 1):
                 candidate_class, candidate_manifest = load_validated_candidate(candidate_dir)
+                idea_path = Path(candidate_dir) / "idea.json"
+                idea = json.loads(idea_path.read_text(encoding="utf-8"))
                 print("\n" + "-" * 72, flush=True)
                 print(
-                    "🔄 Day 6 改进轮次 %d/%d | 候选: %s | 架构: %s"
+                    "🔄 进化轮次 %d/%d | 当前最优: %s | 候选: %s"
                     % (
                         round_index,
                         self.config.max_improvement_rounds,
+                        incumbent["name"],
                         candidate_manifest["candidate_id"],
-                        candidate_manifest.get(
-                            "architecture_family", "tensor_decomposition"
-                        ),
                     ),
                     flush=True,
                 )
                 print("-" * 72, flush=True)
                 training, training_budget_audit = self._resolve_training_budget(
-                    candidate_manifest,
-                    learning_rate,
+                    candidate_manifest, learning_rate
                 )
-                print(
-                    "🧠 Day 6 训练预算: LLM 请求 %d 步，实际基线/候选共享 %d 步（用户上限 %d）"
-                    % (
-                        training_budget_audit["requested_by_llm"]["max_steps"],
-                        training.max_steps,
-                        self.config.max_steps,
-                    )
-                )
-                self.trace.log_event(
-                    "training_budget_resolved",
-                    {
-                        "round": round_index,
-                        **training_budget_audit,
-                    },
-                    step=round_index,
-                )
-                base_search_space = base_class.search_space(tuple(observed.shape))
-                candidate_search_space = candidate_class.search_space(
+                incumbent_search_space = incumbent["class"].search_space(
                     tuple(observed.shape)
                 )
+                candidate_search_space = candidate_class.search_space(tuple(observed.shape))
                 self._validate_candidate_search_contract(
-                    base_search_space,
+                    MODEL_CLASSES[base_method].search_space(tuple(observed.shape)),
                     candidate_search_space,
                     candidate_manifest,
                 )
                 paired = paired_trial_configurations(
-                    base_search_space=base_search_space,
+                    base_search_space=incumbent_search_space,
                     candidate_search_space=candidate_search_space,
                     trial_count=self.config.tuning_trials,
                     seed=seed,
-                    anchor_base_config=anchor,
-                )
-                print(
-                    "🔗 调参配对: 直接共享=%s | 候选独立调参=%s"
-                    % (
-                        paired["shared_parameter_names"] or "无",
-                        paired["independently_tuned_parameter_names"] or "无",
-                    ),
-                    flush=True,
+                    anchor_base_config=incumbent["anchor"],
                 )
                 round_dir = self.run_dir / ("round_%d" % round_index)
-                print("\n1/4 基线模型自动调参…", flush=True)
                 baseline_tuning = tune_model_on_observed_pixels(
-                    model_name=base_method,
-                    model_builder=None,
+                    model_name=incumbent["name"],
+                    model_builder=incumbent["builder"],
                     configurations=paired["baseline"],
                     observed_image=observed,
                     observed_mask=observed_mask,
                     training_config=training,
                     seed=seed,
                 )
-                print("\n2/4 候选模型自动调参…", flush=True)
                 candidate_tuning = tune_model_on_observed_pixels(
                     model_name=candidate_manifest["candidate_id"],
                     model_builder=candidate_builder(candidate_class),
@@ -487,61 +508,27 @@ class Day6Workflow:
                     seed=seed,
                 )
                 _write_json(round_dir / "paired_configurations.json", paired)
-                _write_json(
-                    round_dir / "training_budget.json",
-                    training_budget_audit,
-                )
+                _write_json(round_dir / "training_budget.json", training_budget_audit)
                 _write_json(round_dir / "baseline_tuning.json", baseline_tuning)
                 _write_json(round_dir / "candidate_tuning.json", candidate_tuning)
 
-                # Hidden-region ground truth first enters the workflow here, after tuning.
-                print("\n3/4 使用各自选中的步数进行最终重训…", flush=True)
+                # Ground truth first enters after both models have selected hyperparameters.
                 baseline_final = final_fit_and_evaluate(
-                    base_method,
-                    None,
-                    baseline_tuning["best"],
-                    observed,
-                    observed_mask,
-                    ground_truth,
-                    training,
-                    seed,
-                    str(round_dir / "baseline_final"),
-                    self.config.learned_metrics,
+                    incumbent["name"], incumbent["builder"], baseline_tuning["best"],
+                    observed, observed_mask, ground_truth, training, seed,
+                    str(round_dir / "incumbent_final"), self.config.learned_metrics,
                 )
                 candidate_final = final_fit_and_evaluate(
-                    candidate_manifest["candidate_id"],
-                    candidate_builder(candidate_class),
-                    candidate_tuning["best"],
-                    observed,
-                    observed_mask,
-                    ground_truth,
-                    training,
-                    seed,
-                    str(round_dir / "candidate_final"),
+                    candidate_manifest["candidate_id"], candidate_builder(candidate_class),
+                    candidate_tuning["best"], observed, observed_mask, ground_truth,
+                    training, seed, str(round_dir / "candidate_final"),
                     self.config.learned_metrics,
                 )
-                print("\n4/4 Judge 正在比较 PSNR、SSIM 和训练行为…", flush=True)
+                if original_final is None:
+                    original_final = baseline_final
                 judgment = judge_candidate(
-                    baseline_tuning,
-                    baseline_final,
-                    candidate_tuning,
-                    candidate_final,
-                    self.config.minimum_psnr_delta,
-                    self.config.ssim_tolerance,
-                )
-                print(
-                    "%s Judge 结果: %s | PSNR Δ=%s dB | SSIM Δ=%.6f"
-                    % (
-                        "✅" if judgment["accepted"] else "❌",
-                        judgment["decision"],
-                        (
-                            "N/A"
-                            if judgment["psnr_delta"] is None
-                            else "%.4f" % judgment["psnr_delta"]
-                        ),
-                        judgment["ssim_delta"],
-                    ),
-                    flush=True,
+                    baseline_tuning, baseline_final, candidate_tuning, candidate_final,
+                    self.config.minimum_psnr_delta, self.config.ssim_tolerance,
                 )
                 judgment["budget_audit"].update(
                     {
@@ -556,10 +543,95 @@ class Day6Workflow:
                     }
                 )
                 _write_json(round_dir / "judgment.json", judgment)
+                incumbent_name_before = incumbent["name"]
+                incumbent["final"] = baseline_final
+                incumbent["tuning"] = baseline_tuning
+                if incumbent["candidate_dir"]:
+                    incumbent["training_budget"] = training_budget_audit
+                if judgment["accepted"]:
+                    incumbent = {
+                        "name": candidate_manifest["candidate_id"],
+                        "class": candidate_class,
+                        "builder": candidate_builder(candidate_class),
+                        "candidate_dir": candidate_dir,
+                        "anchor": candidate_tuning["best"]["hyperparameters"],
+                        "final": candidate_final,
+                        "tuning": candidate_tuning,
+                        "acceptance_judgment": judgment,
+                        "training_budget": training_budget_audit,
+                    }
+                    self.state["accepted"] = True
+                    self.state["accepted_rounds"].append(round_index)
+
+                result_summary = {
+                    "incumbent_metrics": describe_metrics(baseline_final["metrics"]),
+                    "candidate_metrics": describe_metrics(candidate_final["metrics"]),
+                    "deltas": {
+                        "missing_psnr_db": judgment["psnr_delta"],
+                        "composite_ssim": judgment["ssim_delta"],
+                    },
+                    "training_behavior": judgment["training_behavior"],
+                    "visual_assessment": {
+                        "status": "not_configured",
+                        "design": "reserved_for_future_multimodal_llm_evaluation",
+                        "incumbent_preview": baseline_final["artifacts"].get("preview"),
+                        "candidate_preview": candidate_final["artifacts"].get("preview"),
+                    },
+                }
+                practice = {
+                    "workflow_id": self.workflow_id,
+                    "round": round_index,
+                    "base_method": base_method,
+                    "incumbent_before": incumbent_name_before,
+                    "candidate_id": candidate_manifest["candidate_id"],
+                    "mutation_goal": idea["mutation_goal"],
+                    "idea": idea["idea"],
+                    "mutation_target": idea["mutation_target"],
+                    "single_change": idea["single_change"],
+                    "result": result_summary,
+                    "judgment": judgment,
+                    "incumbent_updated": bool(judgment["accepted"]),
+                    "incumbent_after": incumbent["name"],
+                    "conditions": {
+                        "image_shape": list(observed.shape),
+                        "mask_type": self.base_state["config"]["mask_type"],
+                        "actual_missing_rate": self.base_state["results"]["image_profile"][
+                            "actual_missing_rate"
+                        ],
+                        "seed": seed,
+                        "training_budget": training_budget_audit["effective_shared_budget"],
+                    },
+                }
+                evidence_for_experience = {
+                    "base_method": base_method,
+                    "mutation_goal": practice["mutation_goal"],
+                    "idea": practice["idea"],
+                    "mutation_target": practice["mutation_target"],
+                    "single_change": practice["single_change"],
+                    "result": result_summary,
+                    "judgment": judgment,
+                    "conditions": practice["conditions"],
+                }
+                extractor = getattr(self.generator, "extract_experience", None)
+                experience = (
+                    extractor(evidence_for_experience)
+                    if extractor is not None
+                    else CandidateGenerator(None).extract_experience(evidence_for_experience)
+                )
+                _write_json(round_dir / "practice_record.json", practice)
+                _write_json(round_dir / "experience_record.json", experience)
+                practice_artifacts = run_practice.record(practice)
+                experience_artifacts = global_experience.record(experience)
                 round_record = {
                     "round": round_index,
+                    "incumbent_before": incumbent_name_before,
+                    "incumbent_after": incumbent["name"],
                     "candidate_id": candidate_manifest["candidate_id"],
                     "candidate_dir": candidate_dir,
+                    "mutation_goal": practice["mutation_goal"],
+                    "idea": practice["idea"],
+                    "mutation_target": practice["mutation_target"],
+                    "single_change": practice["single_change"],
                     "architecture_family": candidate_manifest.get(
                         "architecture_family", "tensor_decomposition"
                     ),
@@ -569,117 +641,120 @@ class Day6Workflow:
                     "candidate_tuning": candidate_tuning,
                     "baseline_final": baseline_final,
                     "candidate_final": candidate_final,
+                    "result_summary": result_summary,
+                    "experience": experience,
                     "judgment": judgment,
                     "artifacts": {
                         "round_dir": str(round_dir),
                         "judgment": str(round_dir / "judgment.json"),
+                        "practice": str(round_dir / "practice_record.json"),
+                        "experience": str(round_dir / "experience_record.json"),
                     },
                 }
                 self.state["rounds"].append(round_record)
                 self.state["feedback_history"].append(
                     {
                         "round": round_index,
+                        "goal": practice["mutation_goal"],
+                        "idea": practice["idea"],
                         "decision": judgment["decision"],
                         "psnr_delta": judgment["psnr_delta"],
                         "ssim_delta": judgment["ssim_delta"],
-                        "runtime_ratio": judgment["runtime_ratio"],
-                        "training_behavior": judgment["training_behavior"],
-                        "training_budget": training_budget_audit,
+                        "experience": experience,
                         "suspected_causes": judgment["suspected_causes"],
                         "next_round_constraints": judgment["next_round_constraints"],
                     }
                 )
+                self.state["artifacts"]["run_practice"].update(practice_artifacts)
+                self.state["artifacts"]["global_experience"].update(
+                    experience_artifacts
+                )
                 self.trace.log_event(
-                    "experiment_judgment",
+                    "evolution_round_completed",
                     {
                         "round": round_index,
                         "candidate_id": candidate_manifest["candidate_id"],
                         "decision": judgment["decision"],
-                        "psnr_delta": judgment["psnr_delta"],
-                        "ssim_delta": judgment["ssim_delta"],
-                        "equal_trial_counts": (
-                            baseline_tuning["trial_count"] == candidate_tuning["trial_count"]
-                        ),
-                        "tuning_ground_truth_used": False,
-                        "effective_max_steps": training.max_steps,
-                        "max_steps_was_clamped": training_budget_audit[
-                            "max_steps_was_clamped"
-                        ],
+                        "incumbent_after": incumbent["name"],
                     },
                     step=round_index,
                 )
                 self._save()
 
-                if judgment["accepted"]:
-                    architecture_family = candidate_manifest.get(
-                        "architecture_family", "tensor_decomposition"
-                    )
-                    algorithm_name = "%s_%s" % (base_method, architecture_family)
-                    self.state["promotion"] = promote_candidate(
-                        candidate_dir=candidate_dir,
-                        approved_root=self.config.approved_root,
-                        algorithm_name=algorithm_name,
-                        source_run_id=self.workflow_id,
-                        best_config={
-                            "hyperparameters": candidate_tuning["best"]["hyperparameters"],
-                            "learning_rate": learning_rate,
-                            "selected_steps": candidate_tuning["best"]["best_step"],
-                            "training_budget": training_budget_audit[
-                                "effective_shared_budget"
-                            ],
-                        },
-                        comparison=judgment,
-                        conditions={
-                            "image_shape": list(observed.shape),
-                            "mask_type": self.base_state["config"]["mask_type"],
-                            "actual_missing_rate": self.base_state["results"]["image_profile"][
-                                "actual_missing_rate"
-                            ],
-                            "seed": seed,
-                        },
-                    )
-                    self.state["accepted"] = True
-                    self.state["stop_reason"] = "candidate_accepted"
-                    break
-
                 if round_index < self.config.max_improvement_rounds:
-                    print(
-                        "\n🧠 候选未通过，正在将 Judge 反馈交给 LLM 生成下一轮架构…",
-                        flush=True,
-                    )
+                    print("\n🧠 正在用最新实践与经验生成下一轮单点变异…", flush=True)
+                    improver_context["evolution_memory"] = {
+                        "global_reusable_experience": global_experience.context(),
+                        "current_run_practice": run_practice.context(),
+                    }
+                    improver_context["previous_round_result"] = practice
                     improver_context["previous_failure_feedback"] = list(
                         self.state["feedback_history"]
                     )
-                    previous_idea_path = Path(candidate_dir) / "idea.json"
-                    if previous_idea_path.is_file():
-                        improver_context["previous_experiment_candidate"] = json.loads(
-                            previous_idea_path.read_text(encoding="utf-8")
-                        )
+                    if incumbent["candidate_dir"]:
+                        incumbent_dir = Path(incumbent["candidate_dir"])
+                        improver_context["incumbent_candidate"] = {
+                            "idea": json.loads(
+                                (incumbent_dir / "idea.json").read_text(encoding="utf-8")
+                            ),
+                            "model_code": (incumbent_dir / "model.py").read_text(
+                                encoding="utf-8"
+                            ),
+                        }
+                    else:
+                        improver_context["incumbent_candidate"] = None
                     next_candidate_dir = self._make_next_candidate(
                         improver_context, round_index + 1
                     )
                     if next_candidate_dir is None:
                         self.state["stop_reason"] = "next_candidate_validation_failed"
-                        self.trace.log_event(
-                            "improvement_loop_stopped",
-                            {
-                                "round": round_index,
-                                "reason": self.state["stop_reason"],
-                            },
-                            step=round_index,
-                        )
                         self._save()
-                        print(
-                            "\n⚠️  LLM 修复和安全 fallback 均未通过验证，"
-                            "已保留本轮结果并正常结束。",
-                            flush=True,
-                        )
                         break
                     candidate_dir = next_candidate_dir
 
-            final_round = self.state["rounds"][-1]
-            if not self.state["accepted"] and self.state["stop_reason"] is None:
+            if self.state["stop_reason"] is None:
                 self.state["stop_reason"] = "maximum_improvement_rounds_reached"
+            if original_final is None:
+                raise RuntimeError("no evolution round completed")
+
+            evolved_result = None
+            if incumbent["candidate_dir"]:
+                algorithm_name = "%s_evolved" % base_method
+                self.state["promotion"] = promote_candidate(
+                    candidate_dir=incumbent["candidate_dir"],
+                    approved_root=self.config.approved_root,
+                    algorithm_name=algorithm_name,
+                    source_run_id=self.workflow_id,
+                    best_config={
+                        "hyperparameters": incumbent["tuning"]["best"]["hyperparameters"],
+                        "learning_rate": learning_rate,
+                        "selected_steps": incumbent["tuning"]["best"]["best_step"],
+                        "training_budget": incumbent["training_budget"][
+                            "effective_shared_budget"
+                        ],
+                    },
+                    comparison=incumbent["acceptance_judgment"],
+                    conditions={
+                        "base_method": base_method,
+                        "evolution_rounds": len(self.state["rounds"]),
+                        "accepted_rounds": self.state["accepted_rounds"],
+                        "image_shape": list(observed.shape),
+                        "mask_type": self.base_state["config"]["mask_type"],
+                        "actual_missing_rate": self.base_state["results"]["image_profile"][
+                            "actual_missing_rate"
+                        ],
+                        "seed": seed,
+                    },
+                )
+                evolved_result = {
+                    "algorithm": algorithm_name,
+                    "role": "accepted_candidate",
+                    "reconstruction": incumbent["final"]["artifacts"]["reconstruction"],
+                    "metrics": incumbent["final"]["metrics"],
+                    "final": incumbent["final"],
+                }
+                self.state["best_evolved"] = evolved_result
+
             eligible_results = [
                 {
                     "algorithm": "nearest_neighbor_manhattan",
@@ -690,23 +765,13 @@ class Day6Workflow:
                 {
                     "algorithm": base_method,
                     "role": "tensor_baseline",
-                    "reconstruction": final_round["baseline_final"]["artifacts"][
-                        "reconstruction"
-                    ],
-                    "metrics": final_round["baseline_final"]["metrics"],
+                    "reconstruction": original_final["artifacts"]["reconstruction"],
+                    "metrics": original_final["metrics"],
+                    "final": original_final,
                 },
             ]
-            if self.state["accepted"]:
-                eligible_results.append(
-                    {
-                        "algorithm": self.state["promotion"]["algorithm_name"],
-                        "role": "accepted_candidate",
-                        "reconstruction": final_round["candidate_final"]["artifacts"][
-                            "reconstruction"
-                        ],
-                        "metrics": final_round["candidate_final"]["metrics"],
-                    }
-                )
+            if evolved_result:
+                eligible_results.append(evolved_result)
             winner = max(
                 eligible_results,
                 key=lambda item: (
@@ -717,8 +782,8 @@ class Day6Workflow:
             )
             self.state["overall_comparison"] = {
                 "selection_rule": (
-                    "highest missing-region PSNR among baselines and accepted candidates; "
-                    "SSIM is reported but the fixed promotion gate remains separate"
+                    "highest missing-region PSNR among interpolation, original tensor "
+                    "baseline, and the final accepted evolved incumbent"
                 ),
                 "eligible_results": eligible_results,
                 "winner": winner["algorithm"],

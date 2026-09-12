@@ -7,7 +7,7 @@ missing_fill_value: 0.0
 method_max_steps: 1000
 fair_max_steps: 2000
 tuning_trials: 4
-max_improvement_rounds: 2
+max_improvement_rounds: 5
 validation_ratio: 0.1
 validation_interval: 10
 patience: 40

@@ -43,8 +43,12 @@ class CandidateProposal(BaseModel):
         "transformer",
         "hybrid",
     ]
+    mutation_goal: str = Field(min_length=20, max_length=800)
+    mutation_target: Literal["algorithm", "loss"]
+    idea: str = Field(min_length=20, max_length=1200)
+    single_change: str = Field(min_length=10, max_length=800)
     hypothesis: str = Field(min_length=30, max_length=1500)
-    proposed_changes: List[str] = Field(min_length=1, max_length=8)
+    proposed_changes: List[str] = Field(min_length=1, max_length=1)
     expected_effect: str = Field(min_length=20, max_length=1000)
     risks: List[str] = Field(min_length=1, max_length=8)
     training_budget: TrainingBudgetProposal
@@ -67,3 +71,12 @@ class CandidateProposal(BaseModel):
         if any(not isinstance(options, list) or not options for options in value.values()):
             raise ValueError("every search_space entry must be a non-empty list")
         return value
+
+
+class ExperienceExtraction(BaseModel):
+    """One compact, cross-run reusable lesson extracted from a round."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    experience: str = Field(min_length=10, max_length=800)
+    confidence: Literal["low", "medium", "high"]

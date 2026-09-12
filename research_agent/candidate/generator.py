@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,10 +11,10 @@ from typing import Any, Dict, List, Optional
 from pydantic import ValidationError
 
 from ..method_selector import _json_from_text
-from .schemas import CandidateProposal
+from .schemas import CandidateProposal, ExperienceExtraction
 
 
-PROMPT_VERSION = "day5-multidimensional-candidate-v8"
+PROMPT_VERSION = "iterative-single-change-v9"
 ALLOWED_CHANGES = [
     "coordinate MLPs or Fourier-feature MLPs that continuously generate factors for any supported tensor baseline",
     "replace one or more learned factor tables with MLP-generated continuous factors",
@@ -123,15 +124,23 @@ def deterministic_candidate(
     return CandidateProposal(
         base_method=base_method,
         architecture_family="tensor_decomposition",
+        mutation_goal=(
+            "Improve spatial continuity inside the missing region without changing "
+            "the selected tensor-decomposition framework."
+        ),
+        mutation_target="loss",
+        idea=(
+            "Add one bounded image-space total-variation term to the existing masked "
+            "reconstruction objective."
+        ),
+        single_change="Add a tunable total-variation regularization term to loss_terms().",
         hypothesis=(
             "Adding a small differentiable total-variation penalty to the selected "
             "tensor decomposition may reduce the banding and abrupt spatial changes "
             "observed inside a contiguous missing region."
         ),
         proposed_changes=[
-            "Keep every factor and core parameter from the selected baseline.",
-            "Add horizontal and vertical image-space total variation to loss_terms().",
-            "Expose tv_weight as a bounded tunable hyperparameter.",
+            "Add horizontal and vertical image-space total variation to loss_terms()."
         ],
         expected_effect=(
             "The candidate should favour spatially coherent reconstructions while "
@@ -260,6 +269,30 @@ class CandidateGenerator:
                 else None
             ),
             "experiment_feedback": previous_feedback if experiment_revision else None,
+            "evolution_protocol": {
+                "required_reasoning_order": [
+                    "state one mutation_goal",
+                    "state one corresponding idea",
+                    "choose exactly one mutation_target: algorithm or loss",
+                    "implement exactly one controlled change",
+                ],
+                "single_variable_rule": (
+                    "Change exactly one algorithmic mechanism or one loss mechanism. "
+                    "proposed_changes must contain exactly one item and single_change "
+                    "must describe the same change. Do not bundle architecture and loss changes."
+                ),
+                "incumbent_rule": (
+                    "When incumbent_candidate is supplied, return a complete replacement "
+                    "implementation that preserves all incumbent behavior except the one "
+                    "declared change."
+                ),
+                "knowledge_rule": (
+                    "Use global reusable experience from previous runs together with only "
+                    "the current run's practice trajectory. Never treat another run's raw "
+                    "practice log as context. Do not repeat a failed idea unless the new "
+                    "idea explicitly addresses its documented applicability or failure condition."
+                ),
+            },
             "allowed_changes": ALLOWED_CHANGES,
             "forbidden_changes": FORBIDDEN_CHANGES,
             "architecture_guidance": {
@@ -362,9 +395,9 @@ class CandidateGenerator:
                 },
                 "inheritance_rules": [
                     (
-                        "The candidate may inherit the selected decomposition class for "
-                        "a hybrid, or inherit BaseTensorInpaintingModel directly for a "
-                        "new MLP/CNN/Transformer parameterization."
+                        "The candidate must remain based on the selected decomposition "
+                        "framework. Inherit the selected decomposition class and preserve "
+                        "its factorization/contraction; deep modules may only augment it."
                     ),
                     (
                         "Every base class owns channel_bias and image_shape. Never "
@@ -450,6 +483,29 @@ class CandidateGenerator:
             raise ValueError("LLM response content is empty")
         return content
 
+    @staticmethod
+    def _validate_framework_lock(proposal: CandidateProposal) -> None:
+        """Require every mutation to retain the selected decomposition superclass."""
+
+        expected_base = BASE_CLASS_NAMES[proposal.base_method]
+        tree = ast.parse(proposal.model_code)
+        candidates = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "CandidateTensorInpaintingModel"
+        ]
+        if len(candidates) != 1:
+            raise ValueError("model_code must define exactly one candidate class")
+        base_names = {
+            base.id for base in candidates[0].bases if isinstance(base, ast.Name)
+        }
+        if expected_base not in base_names:
+            raise ValueError(
+                "candidate must inherit %s to preserve the selected tensor framework"
+                % expected_base
+            )
+
     def generate(self, context: Dict[str, Any]) -> CandidateGenerationResult:
         messages = self._messages(context)
         raw_outputs = []
@@ -482,6 +538,7 @@ class CandidateGenerator:
                     proposal = CandidateProposal.model_validate(_json_from_text(raw))
                     if proposal.base_method != context["base_method"]:
                         raise ValueError("proposal base_method differs from selected model")
+                    self._validate_framework_lock(proposal)
                     proposal.generation_mode = (
                         "llm" if attempt == 0 else "llm_repaired"
                     )
@@ -507,14 +564,108 @@ class CandidateGenerator:
             if self.llm is None
             else "LLM proposal remained invalid after one repair attempt"
         )
+        fallback = deterministic_candidate(
+            context["base_method"],
+            previous_feedback=context.get("previous_failure_feedback"),
+        )
+        self._validate_framework_lock(fallback)
         return CandidateGenerationResult(
-            proposal=deterministic_candidate(
-                context["base_method"],
-                previous_feedback=context.get("previous_failure_feedback"),
-            ),
+            proposal=fallback,
             attempts=attempt_count,
             raw_outputs=raw_outputs,
             validation_errors=errors,
             fallback_reason=fallback_reason,
             prompt_version=PROMPT_VERSION,
         )
+
+    def extract_experience(self, round_evidence: Dict[str, Any]) -> Dict[str, Any]:
+        """Distill one cross-run reusable lesson with a stable offline fallback."""
+
+        judgment = round_evidence["judgment"]
+        compact_evidence = {
+            "goal": round_evidence.get("mutation_goal"),
+            "method": {
+                "idea": round_evidence.get("idea"),
+                "single_change": round_evidence.get("single_change"),
+                "target": round_evidence.get("mutation_target"),
+            },
+            "result": {
+                "accepted": bool(judgment["accepted"]),
+                "decision": judgment.get("decision"),
+                "missing_psnr_delta_db": judgment.get("psnr_delta"),
+                "composite_ssim_delta": judgment.get("ssim_delta"),
+            },
+        }
+        if self.llm is not None:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You distill one compact, cross-run algorithm-design principle from "
+                        "a mutation goal, method, and measured result. Return one JSON object "
+                        "with exactly two fields: experience and confidence. The experience "
+                        "must abstract the method's directional effect on PSNR and image quality "
+                        "into one or two generally reusable sentences. Do not include workflow "
+                        "IDs, round numbers, candidate IDs, file paths, condition lists, evidence "
+                        "sections, or a next-round task. Write the experience in concise Chinese."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "task": (
+                                "Infer a concise general lesson from (goal, method, result). "
+                                "Describe what the mechanism tends to do to reconstruction PSNR "
+                                "and visual/structural quality without copying run metadata."
+                            ),
+                            "goal_method_result": compact_evidence,
+                            "output_schema": ExperienceExtraction.model_json_schema(),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                },
+            ]
+            try:
+                raw = self._content(self.llm.invoke(messages, temperature=0.0))
+                return ExperienceExtraction.model_validate(
+                    _json_from_text(raw)
+                ).model_dump() | {"extraction_mode": "llm"}
+            except Exception:
+                pass
+
+        accepted = bool(judgment["accepted"])
+        psnr_delta = judgment.get("psnr_delta")
+        ssim_delta = judgment.get("ssim_delta")
+
+        def directional_effect(value: Any, metric: str) -> str:
+            if value is None:
+                return "%s影响尚不明确" % metric
+            numeric = float(value)
+            tolerance = 0.05 if metric == "PSNR" else 0.001
+            if numeric > tolerance:
+                return "有助于提高%s" % metric
+            if numeric < -tolerance:
+                return "可能降低%s" % metric
+            return "对%s影响较小" % metric
+
+        method = round_evidence.get("idea") or round_evidence["single_change"]
+        psnr_effect = directional_effect(psnr_delta, "PSNR")
+        structure_effect = directional_effect(ssim_delta, "图像结构相似度")
+        conclusion = (
+            "该机制可作为同类任务的有效优化方向，同时需关注它对图像结构的影响"
+            if accepted
+            else "该机制暂未形成可靠收益，不宜在类似任务中直接假定它能改善补全质量"
+        )
+        magnitude = max(
+            abs(float(psnr_delta)) if psnr_delta is not None else 0.0,
+            abs(float(ssim_delta)) if ssim_delta is not None else 0.0,
+        )
+        return ExperienceExtraction(
+            experience=(
+                "在张量补全中，%s；实验表明这种方法%s，且%s。%s。"
+                % (method.rstrip("。."), psnr_effect, structure_effect, conclusion)
+            ),
+            confidence="medium" if accepted and magnitude >= 0.2 else "low",
+        ).model_dump() | {"extraction_mode": "deterministic_fallback"}

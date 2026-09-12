@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -54,6 +55,38 @@ ALLOWED_BASE_NAMES = {
 }
 REQUIRED_CLASS_NAME = "CandidateTensorInpaintingModel"
 PROTECTED_BASE_ATTRIBUTES = {"channel_bias", "image_shape"}
+
+
+def _isolated_runner_command(runner: Path, model_path: Path) -> List[str]:
+    """Keep ``-I`` while explicitly allowing the resolved PyTorch package root.
+
+    Virtual environments expose their site-packages under ``-I``. Some system-Python
+    installations keep PyTorch in the user site instead; in that case the isolated
+    interpreter needs one trusted dependency root without inheriting PYTHONPATH or
+    importing the candidate in the controller process.
+    """
+
+    spec = importlib.util.find_spec("torch")
+    if spec is None or not spec.origin:
+        return [sys.executable, "-I", str(runner), str(model_path)]
+    dependency_root = str(Path(spec.origin).resolve().parent.parent)
+    bootstrap = (
+        "import runpy,sys;"
+        "dependency_root=sys.argv.pop(1);"
+        "runner=sys.argv[1];"
+        "sys.path.insert(0,dependency_root);"
+        "sys.argv=sys.argv[1:];"
+        "runpy.run_path(runner,run_name='__main__')"
+    )
+    return [
+        sys.executable,
+        "-I",
+        "-c",
+        bootstrap,
+        dependency_root,
+        str(runner),
+        str(model_path),
+    ]
 
 
 def _root_name(node: ast.AST) -> Optional[str]:
@@ -269,7 +302,7 @@ class CandidateValidator:
             environment["PYTHONNOUSERSITE"] = "1"
             try:
                 completed = subprocess.run(
-                    [sys.executable, "-I", str(runner), str(path)],
+                    _isolated_runner_command(runner, path),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,

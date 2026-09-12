@@ -29,7 +29,7 @@ class BenchmarkConfig:
     method_max_steps: int = 50
     fair_max_steps: int = 50
     tuning_trials: int = 2
-    max_improvement_rounds: int = 1
+    max_improvement_rounds: int = 5
     device: str = "auto"
     llm_mode: str = "off"
     learned_metrics: bool = True

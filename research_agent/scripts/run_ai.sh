@@ -25,7 +25,7 @@ usage() {
   --method-max-steps N            方法选择阶段最大训练步数
   --fair-max-steps N              LLM 可请求的公平比较训练步数硬上限
   --tuning-trials N               调参次数，范围 1–5
-  --max-improvement-rounds N      候选改进轮数，范围 1–2
+  --max-improvement-rounds N      单点变异轮数，范围 1–100，默认 5
   --device auto|cpu|cuda          运行设备
   --learned-metrics on|off        是否计算 LPIPS/MANIQA/CLIP-IQA/MUSIQ
   --llm-mode auto|off|required    LLM 使用方式
@@ -44,6 +44,7 @@ usage() {
   --output-dir PATH
   --candidate-root PATH
   --approved-root PATH
+  --knowledge-root PATH           跨运行可复用经验库目录
 
 示例：
   # 使用 smoke 预设
@@ -123,6 +124,7 @@ PROMPT=""
 OUTPUT_DIR="research_agent/outputs"
 CANDIDATE_ROOT="research_agent/algorithms/candidates"
 APPROVED_ROOT="research_agent/algorithms/approved"
+KNOWLEDGE_ROOT=""
 
 case "$1" in
     -h|--help)
@@ -143,7 +145,7 @@ case "$1" in
         METHOD_MAX_STEPS="1000"
         FAIR_MAX_STEPS="2000"
         TUNING_TRIALS="4"
-        MAX_IMPROVEMENT_ROUNDS="2"
+        MAX_IMPROVEMENT_ROUNDS="5"
         ;;
     original)
         MODE="original"
@@ -151,7 +153,7 @@ case "$1" in
         METHOD_MAX_STEPS="1000"
         FAIR_MAX_STEPS="2000"
         TUNING_TRIALS="4"
-        MAX_IMPROVEMENT_ROUNDS="2"
+        MAX_IMPROVEMENT_ROUNDS="5"
         ;;
     *)
         die "第一个参数必须是 smoke、full 或 original（使用 --help 查看帮助）。"
@@ -204,6 +206,7 @@ while [[ $# -gt 0 ]]; do
         --output-dir) OUTPUT_DIR="$VALUE" ;;
         --candidate-root) CANDIDATE_ROOT="$VALUE" ;;
         --approved-root) APPROVED_ROOT="$VALUE" ;;
+        --knowledge-root) KNOWLEDGE_ROOT="$VALUE" ;;
         *) die "未知选项: ${OPTION}（使用 --help 查看支持的选项）。" ;;
     esac
 done
@@ -311,6 +314,9 @@ if [[ -n "$PROMPT" ]]; then
 fi
 if [[ -n "$MAT_KEY" ]]; then
     RUN_ARGS+=(--mat-key "$MAT_KEY")
+fi
+if [[ -n "$KNOWLEDGE_ROOT" ]]; then
+    RUN_ARGS+=(--knowledge-root "$KNOWLEDGE_ROOT")
 fi
 if [[ "$LEARNED_METRICS" == "off" ]]; then
     RUN_ARGS+=(--skip-learned-metrics)

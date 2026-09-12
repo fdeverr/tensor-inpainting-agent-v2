@@ -13,7 +13,7 @@ python -m research_agent.run \
   --image research_agent/assets/example.png \
   --mask-type block \
   --missing-rate 0.4 \
-  --max-improvement-rounds 2 \
+  --max-improvement-rounds 5 \
   --llm-mode off \
   --device auto
 ```

@@ -40,7 +40,8 @@ def promote_candidate(
     if code_hash != manifest.get("code_sha256"):
         raise ValueError("candidate code changed after validation")
 
-    algorithm_root = Path(approved_root) / algorithm_name
+    base_method = manifest["base_method"]
+    algorithm_root = Path(approved_root) / base_method / algorithm_name
     algorithm_root.mkdir(parents=True, exist_ok=True)
     existing_versions = [
         int(path.name[1:])
