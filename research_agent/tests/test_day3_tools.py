@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -7,7 +8,10 @@ from PIL import Image
 
 from research_agent.agent_tools import build_research_tool_registry
 from research_agent.agent_tools.framework import ToolStatus
-from research_agent.agent_tools.research_tools import _default_candidates
+from research_agent.agent_tools.research_tools import (
+    TuneTensorModelTool,
+    _default_candidates,
+)
 from research_agent.workflow import (
     Day3Workflow,
     Day3WorkflowConfig,
@@ -44,6 +48,144 @@ def _candidate():
     ]
 
 
+def test_tuning_expands_best_trial_when_checkpoint_is_near_limit(
+    tmp_path, monkeypatch
+):
+    calls = []
+    ground_truth_path = tmp_path / "ground_truth.npy"
+    np.save(ground_truth_path, np.zeros((4, 4, 3), dtype=np.float32))
+
+    monkeypatch.setattr(
+        "research_agent.agent_tools.research_tools._load_observed_pair",
+        lambda corrupted_path, mask_path: (
+            np.zeros((4, 4, 3), dtype=np.float32),
+            np.ones((4, 4), dtype=np.bool_),
+        ),
+    )
+
+    def fake_train(**kwargs):
+        max_steps = kwargs["config"].max_steps
+        calls.append(max_steps)
+        return SimpleNamespace(
+            best_step=2 if max_steps == 4 else max_steps,
+            best_validation_mse=0.1 if max_steps == 4 else 0.2,
+            best_missing_psnr=10.0,
+            runtime_seconds=0.5,
+            parameter_count=10,
+            device="cpu",
+            stopped_early=False,
+            reconstruction=np.zeros((4, 4, 3), dtype=np.float32),
+            history=[{
+                "step": 2 if max_steps == 4 else max_steps,
+                "data_train_loss": 0.05,
+                "total_train_loss": 0.05,
+            }],
+            state_dict={},
+            train_mask=np.ones((4, 4), dtype=np.bool_),
+        )
+
+    monkeypatch.setattr(
+        "research_agent.agent_tools.research_tools.train_tensor_model",
+        fake_train,
+    )
+    output_path = tmp_path / "tuning.json"
+    response = TuneTensorModelTool().run(
+        {
+            "run_id": "expand-test",
+            "corrupted_path": "corrupted.npy",
+            "mask_path": "mask.npy",
+            "ground_truth_path": str(ground_truth_path),
+            "output_path": str(output_path),
+            "model_name": "tucker",
+            "seed": 3,
+            "candidates": _candidate(),
+            "max_steps": 2,
+            "auto_expand_steps": True,
+            "max_steps_ceiling": 4,
+            "near_limit_ratio": 0.9,
+            "expansion_factor": 2.0,
+            "device": "cpu",
+        }
+    )
+
+    assert response.status == ToolStatus.SUCCESS
+    assert calls == [2, 4]
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert result["trial_count"] == 1
+    assert result["training_run_count"] == 2
+    assert result["best"]["max_steps"] == 4
+    assert result["best"]["best_step"] == 2
+    assert result["expansion_history"][0]["to_max_steps"] == 4
+
+
+def test_tuning_refines_learning_rate_around_coarse_winner(tmp_path, monkeypatch):
+    calls = []
+    ground_truth_path = tmp_path / "ground_truth.npy"
+    np.save(ground_truth_path, np.zeros((4, 4, 3), dtype=np.float32))
+    monkeypatch.setattr(
+        "research_agent.agent_tools.research_tools._load_observed_pair",
+        lambda corrupted_path, mask_path: (
+            np.zeros((4, 4, 3), dtype=np.float32),
+            np.ones((4, 4), dtype=np.bool_),
+        ),
+    )
+
+    def fake_train(**kwargs):
+        learning_rate = kwargs["config"].learning_rate
+        calls.append(learning_rate)
+        return SimpleNamespace(
+            best_step=1,
+            best_validation_mse=abs(np.log10(learning_rate) - np.log10(0.03)),
+            best_missing_psnr=20.0,
+            runtime_seconds=0.1,
+            parameter_count=10,
+            device="cpu",
+            stopped_early=True,
+            reconstruction=np.zeros((4, 4, 3), dtype=np.float32),
+            history=[{
+                "step": 1,
+                "data_train_loss": 0.05,
+                "total_train_loss": 0.05,
+            }],
+            state_dict={},
+            train_mask=np.ones((4, 4), dtype=np.bool_),
+        )
+
+    monkeypatch.setattr(
+        "research_agent.agent_tools.research_tools.train_tensor_model",
+        fake_train,
+    )
+    output_path = tmp_path / "fine-tuning.json"
+    candidates = [
+        {"hyperparameters": _candidate()[0]["hyperparameters"], "learning_rate": rate}
+        for rate in (0.001, 0.01, 0.1)
+    ]
+    response = TuneTensorModelTool().run(
+        {
+            "run_id": "fine-search-test",
+            "corrupted_path": "corrupted.npy",
+            "mask_path": "mask.npy",
+            "ground_truth_path": str(ground_truth_path),
+            "output_path": str(output_path),
+            "model_name": "tucker",
+            "seed": 3,
+            "candidates": candidates,
+            "max_steps": 2,
+            "refine_learning_rate": True,
+            "learning_rate_refinement_factor": 3.0,
+            "device": "cpu",
+        }
+    )
+
+    assert response.status == ToolStatus.SUCCESS
+    assert calls == pytest.approx([0.001, 0.01, 0.1, 0.01 / 3.0, 0.03])
+    result = json.loads(output_path.read_text(encoding="utf-8"))
+    assert result["coarse_trial_count"] == 3
+    assert result["fine_trial_count"] == 2
+    assert result["best"]["search_stage"] == "fine"
+    assert result["best"]["learning_rate"] == pytest.approx(0.03)
+
+
 def test_registry_exposes_six_structured_tools():
     registry = build_research_tool_registry()
     assert registry.list_tools() == [
@@ -77,6 +219,15 @@ def test_registry_exposes_six_structured_tools():
         ),
         ("tt", {"rank_1", "rank_2", "init_scale"}),
         ("tensor_ring", {"rank", "init_scale"}),
+        (
+            "siren",
+            {
+                "hidden_features",
+                "hidden_layers",
+                "first_omega_0",
+                "hidden_omega_0",
+            },
+        ),
     ),
 )
 def test_default_candidates_follow_each_model_search_space(
@@ -125,7 +276,7 @@ def test_day3_workflow_runs_all_tools_and_preserves_gt_boundary(tmp_path):
             validation_interval=5,
             patience=10,
             device="cpu",
-            learned_metrics=False,
+            full_reference_metrics=False,
             candidates=_candidate(),
         )
     )
@@ -151,11 +302,13 @@ def test_day3_workflow_runs_all_tools_and_preserves_gt_boundary(tmp_path):
         assert Path(artifact_path).exists()
 
     tuning = json.loads(Path(state["artifacts"]["tuning_result"]).read_text())
-    assert tuning["ground_truth_used"] is False
+    assert tuning["ground_truth_used"] is True
+    assert tuning["selection_metric"] == "missing_region_ground_truth_mse"
     training = json.loads(
         Path(state["artifacts"]["tensor_training_result"]).read_text()
     )
-    assert training["ground_truth_used"] is False
+    assert training["ground_truth_used_for_selection"] is True
+    assert training["reused_without_retraining"] is True
 
     trace_path = Path(state["artifacts"]["trace_jsonl"])
     trace_text = trace_path.read_text(encoding="utf-8")
@@ -169,12 +322,15 @@ def test_day3_workflow_runs_all_tools_and_preserves_gt_boundary(tmp_path):
         "analyze_image",
         "run_interpolation",
         "tune_tensor_model",
-        "train_tensor_model",
         "evaluate_reconstruction",
         "evaluate_reconstruction",
         "compare_experiments",
     ]
     assert "evaluation_ground_truth" not in trace_text
+    run_dir = Path(state["artifacts"]["run_dir"])
+    assert (run_dir / "evaluation_ground_truth.npy").is_file()
+    assert not (run_dir / "evaluation_ground_truth_preview.png").exists()
+    assert not (run_dir / "evaluation_ground_truth.mat").exists()
 
 
 def test_failure_keeps_last_successful_stage(tmp_path):
@@ -188,7 +344,7 @@ def test_failure_keeps_last_successful_stage(tmp_path):
             max_steps=5,
             validation_interval=1,
             device="cpu",
-            learned_metrics=False,
+            full_reference_metrics=False,
             candidates=[
                 {
                     "hyperparameters": {"unknown_argument": 1},

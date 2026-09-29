@@ -3,7 +3,11 @@ import json
 import pytest
 
 from research_agent.knowledge import LocalKnowledgeRetriever
-from research_agent.method_selector import MethodSelector, manual_method_plan
+from research_agent.method_selector import (
+    METHOD_SELECTION_VISUAL_SOURCE,
+    MethodSelector,
+    manual_method_plan,
+)
 
 
 def _profile():
@@ -76,6 +80,55 @@ def _retrieval():
         query="block channel correlation spatial rank failure modes",
         top_k=6,
     )
+
+
+def _visual_assessment():
+    return {
+        "status": "completed",
+        "assessment": {
+            "visible_structure_summary": "存在明显的横向重复纹理。",
+            "spatial_complexity": "medium",
+            "spatial_anisotropy": "width_dominant",
+            "texture_complexity": "high",
+            "repetition_or_periodicity": "high",
+            "channel_coupling": "strong",
+            "interpolation_artifacts": ["局部过度平滑"],
+            "preferred_methods": ["tucker", "btd"],
+            "rank_regime": {
+                "height": "medium",
+                "width": "high",
+                "feature": "low",
+                "overall": "medium",
+            },
+            "rationale": ["方向性明显"],
+            "confidence": "medium",
+            "limitations": ["插值可能低估高频结构"],
+        },
+    }
+
+
+def test_visual_structure_prior_is_exposed_and_may_be_cited():
+    retrieval = _retrieval()
+    output = json.loads(_valid_output(retrieval["evidence"][0]["source"]))
+    output["evidence"] = [
+        {
+            "source": METHOD_SELECTION_VISUAL_SOURCE,
+            "claim": "The interpolation preview suggests anisotropic spatial rank needs.",
+        }
+    ]
+    llm = FakeLLM([json.dumps(output)])
+
+    result = MethodSelector(llm).select(
+        _profile(), retrieval, visual_assessment=_visual_assessment()
+    )
+
+    assert result["plan"].method == "tucker"
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert payload["interpolation"]["visual_description_available"] is True
+    assert payload["interpolation_visual_structure_assessment"][
+        "rank_regime"
+    ]["width"] == "high"
+    assert METHOD_SELECTION_VISUAL_SOURCE in payload["allowed_evidence_sources"]
 
 
 def test_local_retrieval_returns_rules_and_sourced_chunks():
@@ -281,6 +334,30 @@ def test_prompt_exposes_method_specific_hyperparameter_contract():
         "rank_c_candidates",
         "rank_spatial_candidates",
     ]
+
+
+def test_prompt_filters_full_input_metadata_from_llm_context():
+    profile = {
+        **_profile(),
+        "source_metadata": {
+            "source_path": "/private/data/complete_ground_truth.png",
+            "source_format": ".png",
+            "original_dtype": "uint8",
+            "original_min": 0.0,
+            "original_max": 255.0,
+            "original_shape": [64, 128, 3],
+            "loaded_shape": [64, 128, 3],
+        },
+    }
+
+    payload = json.loads(MethodSelector._prompt(profile, _retrieval())[1]["content"])
+    llm_metadata = payload["image_profile"]["source_metadata"]
+
+    assert llm_metadata["source_format"] == ".png"
+    assert llm_metadata["original_shape"] == [64, 128, 3]
+    assert "source_path" not in llm_metadata
+    assert "original_min" not in llm_metadata
+    assert "original_max" not in llm_metadata
 
 
 def test_two_invalid_outputs_use_deterministic_fallback():

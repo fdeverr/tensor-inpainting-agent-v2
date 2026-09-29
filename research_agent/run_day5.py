@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 
+from .cli_options import add_optional_evaluation
+
 from .workflow_day5 import Day5WorkflowConfig, run_day5_workflow
 
 
@@ -27,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument("--smoke-timeout", type=float, default=10.0)
+    add_optional_evaluation(parser, "mutation-visual-assessment")
     return parser
 
 
@@ -40,6 +43,7 @@ def main() -> None:
             output_dir=args.output_dir,
             llm_mode=args.llm_mode,
             smoke_timeout_seconds=args.smoke_timeout,
+            visual_assessment=args.mutation_visual_assessment,
         )
     )
     print("Day 5 candidate workflow completed")

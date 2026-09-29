@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from .schemas import SUPPORTED_MODEL_NAMES
+from .schemas import SUPPORTED_TENSOR_MODEL_NAMES
 from .workflow import _make_run_id, _write_json
 from .workflow_full import FullWorkflowConfig, run_full_workflow
 
@@ -27,12 +27,28 @@ class BenchmarkConfig:
     mat_key: Optional[str] = None
     base_model: str = "auto"
     method_max_steps: int = 50
+    method_max_steps_ceiling: int = 50
+    tuning_near_limit_ratio: float = 0.9
+    tuning_expansion_factor: float = 2.0
     fair_max_steps: int = 50
     tuning_trials: int = 2
+    fair_learning_rate_candidates: tuple[float, ...] = (0.01,)
+    fair_refine_learning_rate: bool = False
+    fair_learning_rate_refinement_factor: float = 3.0
     max_improvement_rounds: int = 5
+    screening_max_steps: int = 50
+    screening_patience: int = 5
+    siren_max_steps: int = 50
+    siren_tuning_trials: int = 2
+    siren_validation_interval: int = 10
+    siren_patience: int = 5
     device: str = "auto"
     llm_mode: str = "off"
-    learned_metrics: bool = True
+    full_reference_metrics: bool = True
+    no_reference_metrics: bool = False
+    selection_visual_assessment: bool = False
+    mutation_visual_assessment: bool = False
+    siren_comparison: bool = True
 
     def validate(self) -> None:
         if not self.image_paths:
@@ -44,13 +60,66 @@ class BenchmarkConfig:
             raise ValueError("mask_types may contain only random and block")
         if not self.missing_rates or any(not 0.0 < rate < 1.0 for rate in self.missing_rates):
             raise ValueError("missing_rates must be in (0, 1)")
-        if self.base_model not in {"auto", *SUPPORTED_MODEL_NAMES}:
+        if self.base_model not in {"auto", *SUPPORTED_TENSOR_MODEL_NAMES}:
             raise ValueError(
                 "base_model must be auto or one of %s"
-                % sorted(SUPPORTED_MODEL_NAMES)
+                % sorted(SUPPORTED_TENSOR_MODEL_NAMES)
             )
-        if not isinstance(self.learned_metrics, bool):
-            raise ValueError("learned_metrics must be a bool")
+        if not isinstance(self.full_reference_metrics, bool):
+            raise ValueError("full_reference_metrics must be a bool")
+        if not isinstance(self.no_reference_metrics, bool):
+            raise ValueError("no_reference_metrics must be a bool")
+        if not isinstance(self.selection_visual_assessment, bool):
+            raise ValueError("selection_visual_assessment must be a bool")
+        if not isinstance(self.mutation_visual_assessment, bool):
+            raise ValueError("mutation_visual_assessment must be a bool")
+        if not isinstance(self.siren_comparison, bool):
+            raise ValueError("siren_comparison must be a bool")
+        if min(
+            self.method_max_steps,
+            self.method_max_steps_ceiling,
+            self.fair_max_steps,
+            self.screening_max_steps,
+            self.screening_patience,
+            self.siren_max_steps,
+            self.siren_validation_interval,
+            self.siren_patience,
+        ) < 1:
+            raise ValueError("benchmark training budgets must be positive")
+        if self.method_max_steps_ceiling < self.method_max_steps:
+            raise ValueError(
+                "method_max_steps_ceiling must be at least method_max_steps"
+            )
+        if not 0.0 < self.tuning_near_limit_ratio <= 1.0:
+            raise ValueError("tuning_near_limit_ratio must be in (0, 1]")
+        if self.tuning_expansion_factor <= 1.0:
+            raise ValueError("tuning_expansion_factor must be greater than 1")
+        if not self.fair_learning_rate_candidates or any(
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not 1e-5 <= float(rate) <= 1.0
+            for rate in self.fair_learning_rate_candidates
+        ):
+            raise ValueError(
+                "fair_learning_rate_candidates must contain numbers in [1e-5, 1.0]"
+            )
+        if not isinstance(self.fair_refine_learning_rate, bool):
+            raise ValueError("fair_refine_learning_rate must be a bool")
+        if self.fair_learning_rate_refinement_factor <= 1.0:
+            raise ValueError(
+                "fair_learning_rate_refinement_factor must be greater than 1"
+            )
+        if self.fair_refine_learning_rate and any(
+            float(rate) / self.fair_learning_rate_refinement_factor < 1e-5
+            or float(rate) * self.fair_learning_rate_refinement_factor > 1.0
+            for rate in self.fair_learning_rate_candidates
+        ):
+            raise ValueError(
+                "fair_learning_rate_candidates must remain in [1e-5, 1.0] "
+                "after local refinement"
+            )
+        if not 1 <= self.siren_tuning_trials <= 4:
+            raise ValueError("siren_tuning_trials must be in [1, 4]")
         if self.mat_key is not None and not self.mat_key.strip():
             raise ValueError("mat_key must be a non-empty string or None")
 
@@ -82,13 +151,15 @@ def aggregate_cases(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
                 else 0.0,
             )
 
-        psnr = values("missing_psnr")
+        full_psnr = values("full_psnr")
+        missing_psnr = values("missing_psnr")
         ssim = values("composite_ssim")
         lpips = values("lpips")
         maniqa = values("maniqa")
         clip_iqa = values("clip_iqa")
         musiq = values("musiq")
-        mean_psnr, std_psnr = summary(psnr)
+        mean_full_psnr, std_full_psnr = summary(full_psnr)
+        mean_missing_psnr, std_missing_psnr = summary(missing_psnr)
         mean_ssim, std_ssim = summary(ssim)
         mean_lpips, std_lpips = summary(lpips)
         mean_maniqa, std_maniqa = summary(maniqa)
@@ -103,10 +174,13 @@ def aggregate_cases(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
         methods[role] = {
             "evaluated_cases": len(rows),
             "unavailable_or_failed_cases": len(cases) - len(rows),
-            "mean_missing_psnr": mean_psnr,
-            "std_missing_psnr": std_psnr,
+            "mean_full_psnr": mean_full_psnr,
+            "std_full_psnr": std_full_psnr,
+            "mean_missing_psnr": mean_missing_psnr,
+            "std_missing_psnr": std_missing_psnr,
             "perfect_reconstruction_cases": sum(
-                row["metrics"]["missing_psnr"] is None for row in rows
+                bool(row["metrics"].get("perfect_reconstruction", False))
+                for row in rows
             ),
             "mean_composite_ssim": mean_ssim,
             "std_composite_ssim": std_ssim,
@@ -138,6 +212,24 @@ def _benchmark_markdown(state: Dict[str, Any]) -> str:
         std = item.get("std_%s" % name)
         return "N/A" if mean is None else "%.4f ± %.4f" % (mean, std)
 
+    metric_columns = [
+        ("missing_psnr", "Missing-region PSNR ↑"),
+        ("full_psnr", "Full-image PSNR ↑"),
+        ("composite_ssim", "SSIM ↑"),
+    ]
+    if state["config"].get("full_reference_metrics", True):
+        metric_columns.append(("lpips", "LPIPS ↓"))
+    if state["config"].get("no_reference_metrics", False):
+        metric_columns.extend(
+            [
+                ("maniqa", "MANIQA ↑"),
+                ("clip_iqa", "CLIP-IQA ↑"),
+                ("musiq", "MUSIQ ↑"),
+            ]
+        )
+    headers = ["角色", "完成", "未评估/失败"] + [
+        label for _, label in metric_columns
+    ] + ["平均训练时间", "平均参数量"]
     lines = [
         "# Tensor Inpainting Agent Benchmark",
         "",
@@ -150,8 +242,8 @@ def _benchmark_markdown(state: Dict[str, Any]) -> str:
         "",
         "## 聚合结果",
         "",
-        "| 角色 | 完成 | 未评估/失败 | PSNR ↑ | SSIM ↑ | LPIPS ↓ | MANIQA ↑ | CLIP-IQA ↑ | MUSIQ ↑ | 平均训练时间 | 平均参数量 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| " + " | ".join(headers) + " |",
+        "|" + "|".join(["---"] + ["---:"] * (len(headers) - 1)) + "|",
     ]
     for role, item in state["aggregate"]["methods_by_role"].items():
         runtime = (
@@ -159,28 +251,36 @@ def _benchmark_markdown(state: Dict[str, Any]) -> str:
             if item["mean_runtime_seconds"] is None
             else "%.4f s" % item["mean_runtime_seconds"]
         )
-        psnr_text = (
+        full_psnr_text = (
+            "perfect"
+            if item["mean_full_psnr"] is None
+            else "%.4f ± %.4f"
+            % (item["mean_full_psnr"], item["std_full_psnr"])
+        )
+        missing_psnr_text = (
             "perfect"
             if item["mean_missing_psnr"] is None
             else "%.4f ± %.4f"
             % (item["mean_missing_psnr"], item["std_missing_psnr"])
         )
-        lines.append(
-            "| %s | %d | %d | %s | %s | %s | %s | %s | %s | %s | %.1f |"
-            % (
-                role,
-                item["evaluated_cases"],
-                item["unavailable_or_failed_cases"],
-                psnr_text,
-                mean_std(item, "composite_ssim"),
-                mean_std(item, "lpips"),
-                mean_std(item, "maniqa"),
-                mean_std(item, "clip_iqa"),
-                mean_std(item, "musiq"),
-                runtime,
-                item["mean_parameter_count"],
-            )
-        )
+        metric_values = {
+            "missing_psnr": missing_psnr_text,
+            "full_psnr": full_psnr_text,
+            "composite_ssim": mean_std(item, "composite_ssim"),
+            "lpips": mean_std(item, "lpips"),
+            "maniqa": mean_std(item, "maniqa"),
+            "clip_iqa": mean_std(item, "clip_iqa"),
+            "musiq": mean_std(item, "musiq"),
+        }
+        cells = [
+            role,
+            str(item["evaluated_cases"]),
+            str(item["unavailable_or_failed_cases"]),
+        ] + [metric_values[name] for name, _ in metric_columns] + [
+            runtime,
+            "%.1f" % item["mean_parameter_count"],
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
     lines.extend(
         [
             "",
@@ -206,7 +306,7 @@ def _benchmark_markdown(state: Dict[str, Any]) -> str:
         [
             "",
             "> 注意：少量图片上的 quick benchmark 只用于端到端回归，不足以支持泛化结论。",
-            "> LPIPS 为全参考指标；MANIQA、CLIP-IQA、MUSIQ 为无参考指标。N/A 表示该运行未启用指标或依赖/权重不可用。",
+            "> 默认全参考组包含 PSNR、SSIM、LPIPS；MANIQA、CLIP-IQA、MUSIQ 属于默认关闭的无参考组。N/A 表示指标不可用或对应权重加载失败。",
             "",
         ]
     )
@@ -240,11 +340,45 @@ def run_benchmark(config: BenchmarkConfig) -> Dict[str, Any]:
                             mat_key=config.mat_key,
                             base_model=config.base_model,
                             method_max_steps=config.method_max_steps,
+                            method_max_steps_ceiling=(
+                                config.method_max_steps_ceiling
+                            ),
+                            tuning_near_limit_ratio=(
+                                config.tuning_near_limit_ratio
+                            ),
+                            tuning_expansion_factor=(
+                                config.tuning_expansion_factor
+                            ),
                             fair_max_steps=config.fair_max_steps,
                             tuning_trials=config.tuning_trials,
+                            fair_learning_rate_candidates=(
+                                config.fair_learning_rate_candidates
+                            ),
+                            fair_refine_learning_rate=(
+                                config.fair_refine_learning_rate
+                            ),
+                            fair_learning_rate_refinement_factor=(
+                                config.fair_learning_rate_refinement_factor
+                            ),
                             max_improvement_rounds=config.max_improvement_rounds,
+                            screening_max_steps=config.screening_max_steps,
+                            screening_patience=config.screening_patience,
+                            siren_max_steps=config.siren_max_steps,
+                            siren_tuning_trials=config.siren_tuning_trials,
+                            siren_validation_interval=(
+                                config.siren_validation_interval
+                            ),
+                            siren_patience=config.siren_patience,
                             device=config.device,
-                            learned_metrics=config.learned_metrics,
+                            full_reference_metrics=config.full_reference_metrics,
+                            no_reference_metrics=config.no_reference_metrics,
+                            selection_visual_assessment=(
+                                config.selection_visual_assessment
+                            ),
+                            mutation_visual_assessment=(
+                                config.mutation_visual_assessment
+                            ),
+                            siren_comparison=config.siren_comparison,
                             llm_mode=config.llm_mode,
                         )
                     )

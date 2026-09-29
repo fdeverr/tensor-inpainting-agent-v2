@@ -151,6 +151,9 @@ class TrainingOutput:
     history: List[Dict[str, Any]]
     best_step: int
     best_validation_mse: float
+    best_missing_psnr: Optional[float]
+    selection_metric: str
+    ground_truth_used_for_selection: bool
     runtime_seconds: float
     parameter_count: int
     device: str
@@ -201,6 +204,7 @@ def set_reproducibility(seed: int, deterministic: bool) -> None:
 def _validate_training_arrays(
     observed_image: np.ndarray,
     observed_mask: np.ndarray,
+    ground_truth: Optional[np.ndarray] = None,
 ) -> None:
     if observed_image.ndim not in (3, 4):
         raise ValueError("observed_image must have shape [H,W,C] or [H,W,T,C]")
@@ -212,6 +216,15 @@ def _validate_training_arrays(
         raise ValueError("at least one observed pixel is required")
     if not np.isfinite(observed_image).all():
         raise ValueError("observed_image contains NaN or Inf")
+    if ground_truth is not None:
+        if ground_truth.shape != observed_image.shape:
+            raise ValueError("ground_truth must match observed_image shape")
+        if not np.issubdtype(ground_truth.dtype, np.floating):
+            raise ValueError("ground_truth must be floating point")
+        if not np.isfinite(ground_truth).all():
+            raise ValueError("ground_truth contains NaN or Inf")
+        if observed_mask.all():
+            raise ValueError("ground-truth selection requires at least one missing pixel")
 
 
 def _validation_mse(
@@ -234,18 +247,34 @@ def train_tensor_model(
     seed: int,
     model_builder: Optional[ModelBuilder] = None,
     progress_label: Optional[str] = None,
+    ground_truth: Optional[np.ndarray] = None,
 ) -> TrainingOutput:
-    """Fit one tensor model without access to artificially hidden ground truth."""
+    """Fit one model and select its checkpoint.
+
+    When ``ground_truth`` is provided, every observed pixel is used for gradient
+    training and the missing-region GT MSE selects checkpoints.  The GT tensor is
+    never included in the optimization loss.  Omitting it preserves the legacy
+    held-out-observed diagnostic path for low-level callers.
+    """
 
     config.validate()
-    _validate_training_arrays(observed_image, observed_mask)
+    _validate_training_arrays(observed_image, observed_mask, ground_truth)
     set_reproducibility(seed, config.deterministic)
     device = resolve_device(config.device)
-    train_mask_np, validation_mask_np = split_observed_mask(
-        observed_mask,
-        validation_ratio=config.validation_observed_ratio,
-        seed=seed + 10_003,
-    )
+    if ground_truth is not None:
+        train_mask_np = observed_mask.copy()
+        validation_mask_np = ~observed_mask
+        selection_reference_np = ground_truth
+        selection_metric = "missing_region_ground_truth_mse"
+    else:
+        train_mask_np, validation_mask_np = split_observed_mask(
+            observed_mask,
+            validation_ratio=config.validation_observed_ratio,
+            seed=seed + 10_003,
+            strategy=config.validation_strategy,
+        )
+        selection_reference_np = observed_image
+        selection_metric = "%s_held_out_observed_mse" % config.validation_strategy
 
     # Initialization statistics use training pixels only, not validation pixels.
     initial_channel_mean = observed_image[train_mask_np].mean(axis=0)
@@ -258,6 +287,9 @@ def train_tensor_model(
     ).to(device)
 
     observed = torch.as_tensor(observed_image, dtype=torch.float32, device=device)
+    selection_reference = torch.as_tensor(
+        selection_reference_np, dtype=torch.float32, device=device
+    )
     train_mask = torch.as_tensor(train_mask_np, dtype=torch.bool, device=device)
     validation_mask = torch.as_tensor(
         validation_mask_np,
@@ -311,14 +343,24 @@ def train_tensor_model(
         with torch.no_grad():
             current_prediction = model()
             validation_mse = float(
-                _validation_mse(current_prediction, observed, validation_mask).item()
+                _validation_mse(
+                    current_prediction, selection_reference, validation_mask
+                ).item()
             )
+        missing_psnr = (
+            None
+            if ground_truth is None or validation_mse <= 0.0
+            else float(10.0 * math.log10(1.0 / validation_mse))
+        )
         history.append(
             {
                 "step": step,
                 "total_train_loss": float(total_loss.detach().item()),
                 "data_train_loss": float(loss_terms["data_loss"].detach().item()),
                 "validation_mse": validation_mse,
+                "selection_metric": selection_metric,
+                "missing_gt_mse": validation_mse if ground_truth is not None else None,
+                "missing_gt_psnr": missing_psnr,
             }
         )
 
@@ -363,6 +405,13 @@ def train_tensor_model(
         history=history,
         best_step=best_step,
         best_validation_mse=best_validation_mse,
+        best_missing_psnr=(
+            None
+            if ground_truth is None or best_validation_mse <= 0.0
+            else float(10.0 * math.log10(1.0 / best_validation_mse))
+        ),
+        selection_metric=selection_metric,
+        ground_truth_used_for_selection=ground_truth is not None,
         runtime_seconds=float(time.perf_counter() - started_at),
         parameter_count=sum(parameter.numel() for parameter in model.parameters()),
         device=str(device),

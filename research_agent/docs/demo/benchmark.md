@@ -16,7 +16,7 @@
 
 ## 聚合结果
 
-| 角色 | Cases | Missing PSNR mean ± std | Composite SSIM mean ± std | 平均最终拟合时间 | 平均参数量 |
+| 角色 | Cases | Missing-region PSNR mean ± std | Composite SSIM mean ± std | 平均最终拟合时间 | 平均参数量 |
 |---|---:|---:|---:|---:|---:|
 | interpolation baseline | 2 | 17.4134 ± 2.6063 | 0.7864 ± 0.0741 | N/A | 0.0 |
 | tensor baseline | 2 | 14.9794 ± 2.0983 | 0.6003 ± 0.0201 | 0.0155 s | 3,591.5 |

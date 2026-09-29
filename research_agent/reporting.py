@@ -34,6 +34,27 @@ def build_method_results(
             ),
         }
     ]
+    siren = day4.get("results", {}).get("siren_comparison", {})
+    if siren.get("status") == "completed":
+        training = siren["training"]
+        results.append(
+            {
+                "algorithm": "siren",
+                "role": "implicit_neural_baseline",
+                "metrics": siren["metrics"],
+                "runtime_seconds": training["runtime_seconds"],
+                "parameter_count": training["parameter_count"],
+                "eligible_for_final_output": True,
+                "reconstruction": day4["artifacts"]["siren_reconstruction"],
+                "reconstruction_mat": day4["artifacts"].get(
+                    "siren_reconstruction_mat"
+                ),
+                "preview": day4["artifacts"].get(
+                    "siren_preview",
+                    day4["artifacts"]["siren_reconstruction"],
+                ),
+            }
+        )
     if day6 is None:
         results.append(
             {
@@ -112,6 +133,7 @@ def _comparison_image_lines(final_state: Dict[str, Any]) -> List[str]:
     ordered = [
         ("corrupted_input", "破损输入"),
         ("interpolation_baseline", "Manhattan 插值"),
+        ("implicit_neural_baseline", "SIREN"),
         ("tensor_baseline", "张量基线"),
         (
             "candidate",
@@ -156,6 +178,64 @@ def _comparison_image_lines(final_state: Dict[str, Any]) -> List[str]:
     ]
 
 
+def _visual_assessment_lines(
+    day5: Dict[str, Any],
+    day6: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Render optional incumbent-versus-candidate visual evidence."""
+
+    if (day5.get("config", {}).get("visual_assessment") is False
+            and (not day6 or day6.get("config", {}).get("visual_assessment") is False)):
+        return []
+
+    rounds = day6.get("rounds", []) if day6 else []
+    visual_rounds = [
+        round_record
+        for round_record in rounds
+        if round_record.get("result_summary", {}).get("visual_assessment")
+    ]
+    if not visual_rounds:
+        return []
+
+    lines = [
+        "## 多模态恢复质量观察",
+        "",
+        "首轮只使用张量基线的数值信息，不进行插值视觉对比。产生候选结果后，视觉模型"
+        "仅比较当前最优与候选，并把局部模糊、边界和纹理观察用于下一轮变异；候选是否"
+        "晋级仍由固定数值 Judge 决定。",
+        "",
+    ]
+    for round_record in visual_rounds:
+        visual = round_record.get("result_summary", {}).get("visual_assessment") or {}
+        status = visual.get("status", "not_recorded")
+        lines.extend(["### 第 %s 轮" % round_record["round"], "", "- 状态：`%s`" % status])
+        if status != "completed":
+            lines.extend(["- 原因：%s" % visual.get("reason", "未提供"), ""])
+            continue
+        assessment = visual["assessment"]
+        candidate = assessment["candidate"]
+        lines.extend(
+            [
+                "- 可见图像内容：%s" % assessment["visible_image_content"],
+                "- 候选锐度：%s" % candidate["overall_sharpness"],
+                "- 模糊/过度平滑：%s" % candidate["blur_and_over_smoothing"],
+                "- 物体细节：%s" % candidate["object_detail_clarity"],
+                "- 边缘与结构：%s" % candidate["edge_and_structure_continuity"],
+                "- 候选对比结论：%s" % assessment["comparison"],
+                "- 恢复不佳区域：%s"
+                % (
+                    "；".join(candidate.get("poorly_recovered_regions", []))
+                    or "未观察到"
+                ),
+                "- 下轮单点变异启示：%s"
+                % "；".join(assessment.get("mutation_guidance", [])),
+                "- 置信度：`%s`" % assessment["confidence"],
+                "",
+            ]
+        )
+    return lines
+
+
 def render_research_report(
     final_state: Dict[str, Any],
     day4: Dict[str, Any],
@@ -166,6 +246,11 @@ def render_research_report(
 
     profile = day4["results"]["image_profile"]
     plan = day4["results"]["method_plan"]
+    selection_visual = day4["results"].get(
+        "method_selection_visual_assessment", {}
+    )
+    screening = day4["results"].get("method_screening", {})
+    siren = day4["results"].get("siren_comparison", {})
     lines = [
         "# Tensor Inpainting Agent 实验报告",
         "",
@@ -174,6 +259,18 @@ def render_research_report(
         "- Run ID：`%s`" % final_state["run_id"],
         "- 输入任务：%s" % final_state["prompt"],
         "- 选择的张量分解：`%s`" % day4["selected_model"],
+        "- 分解短名单 / 数值预赛胜者：`%s / %s`"
+        % (screening.get("shortlist", []), screening.get("winner", "N/A")),
+        "- SIREN 对比：`%s`" % siren.get("status", "not_recorded"),
+        "- 选择前视觉 / 变异视觉：`%s / %s`"
+        % (
+            "on" if final_state["config"].get(
+                "selection_visual_assessment", False
+            ) else "off",
+            "on" if final_state["config"].get(
+                "mutation_visual_assessment", False
+            ) else "off",
+        ),
         "- 候选代码验证：`%s`" % day5["validation"]["status"],
         "- 进化轮数：`%s`" % (len(day6["rounds"]) if day6 else 0),
         "- 接受并替换当前最优的轮次：`%s`"
@@ -210,6 +307,34 @@ def render_research_report(
         "- `%s`：%s" % (evidence["source"], evidence["claim"])
         for evidence in plan["evidence"]
     )
+    lines.append(
+        "- 选择前视觉状态：`%s`" % selection_visual.get("status", "not_recorded")
+    )
+    if selection_visual.get("status") == "completed":
+        visual_prior = selection_visual.get("assessment", {})
+        lines.extend(
+            [
+                "- 视觉建议分解：`%s`"
+                % visual_prior.get("preferred_methods", []),
+                "- 视觉粗粒度秩先验：`%s`"
+                % visual_prior.get("rank_regime", {}),
+                "- 视觉置信度：`%s`"
+                % visual_prior.get("confidence", "unknown"),
+            ]
+        )
+    if screening.get("status") == "completed":
+        lines.extend(
+            [
+                "- 数值预赛候选：`%s`" % screening.get("shortlist", []),
+                "- 预赛选择范围：`%s`"
+                % screening.get("selection_scope", "unknown"),
+                "- 预赛共享步数 / 每方法 trials：`%s / %s`"
+                % (
+                    screening.get("shared_max_steps", "N/A"),
+                    screening.get("trials_per_method", "N/A"),
+                ),
+            ]
+        )
     lines.extend([""] + _comparison_image_lines(final_state))
     lines.extend(
         [
@@ -227,39 +352,53 @@ def render_research_report(
             "",
             "## 最终指标",
             "",
-            "| 方法 | 角色 | Missing PSNR ↑ | Composite SSIM ↑ | LPIPS ↓ | MANIQA ↑ | CLIP-IQA ↑ | MUSIQ ↑ | 最终拟合时间 | 参数量 | 可作为最终输出 |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
+    full_reference_optional = [("lpips", "LPIPS ↓")]
+    no_reference_optional = [
+        ("maniqa", "MANIQA ↑"),
+        ("clip_iqa", "CLIP-IQA ↑"),
+        ("musiq", "MUSIQ ↑"),
+    ]
+    show_lpips = any(
+        "lpips"
+        in item["metrics"].get("learned_metric_status", {}).get(
+            "requested_metrics", []
+        )
+        or item["metrics"].get("lpips") is not None
+        for item in final_state["method_results"]
+    )
+    show_no_reference = any(
+        item["metrics"].get("metric_group_status", {})
+        .get("no_reference", {})
+        .get("enabled", False)
+        or any(
+            item["metrics"].get(key) is not None
+            for key, _ in no_reference_optional
+        )
+        for item in final_state["method_results"]
+    )
+    columns = [("missing_psnr", "Missing-region PSNR ↑"),
+               ("full_psnr", "Full-image PSNR ↑"),
+               ("composite_ssim", "Composite SSIM ↑")]
+    if show_lpips:
+        columns += full_reference_optional
+    if show_no_reference:
+        columns += no_reference_optional
+    headers = ["方法", "角色"] + [label for _, label in columns] + ["最终拟合时间", "参数量", "可作为最终输出"]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join(["---", "---"] + ["---:"] * (len(columns) + 2) + ["---"]) + "|")
     for item in final_state["method_results"]:
-        metrics = item["metrics"]
-        runtime = (
-            "N/A"
-            if item["runtime_seconds"] is None
-            else _number(item["runtime_seconds"]) + " s"
-        )
-        lines.append(
-            "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %d | %s |"
-            % (
-                item["algorithm"],
-                item["role"],
-                _number(metrics["missing_psnr"]),
-                _number(metrics["composite_ssim"]),
-                _number(metrics.get("lpips")),
-                _number(metrics.get("maniqa")),
-                _number(metrics.get("clip_iqa")),
-                _number(metrics.get("musiq")),
-                runtime,
-                item["parameter_count"],
-                "是" if item["eligible_for_final_output"] else "否",
-            )
-        )
-    lines.extend(
-        [
+        runtime = "N/A" if item["runtime_seconds"] is None else _number(item["runtime_seconds"]) + " s"
+        cells = [item["algorithm"], item["role"]]
+        cells += [_number(item["metrics"].get(key)) for key, _ in columns]
+        cells += [runtime, str(item["parameter_count"]), "是" if item["eligible_for_final_output"] else "否"]
+        lines.append("| " + " | ".join(cells) + " |")
+    if show_lpips or show_no_reference:
+        lines.extend([
             "",
-            "LPIPS 为全参考感知距离（越低越好）；MANIQA、CLIP-IQA 与 MUSIQ 为无参考质量评估（越高越好）。它们仅适用于 RGB `[H,W,3]`，MSI/视频会明确跳过；PSNR 和 SSIM 仍在全部波段/帧/通道上计算。`N/A` 的具体原因记录在 state JSON 的 `learned_metric_status` 中。",
-        ]
-    )
+            "全参考组包含 MSE、PSNR、SSIM 与 LPIPS；无参考组包含 MANIQA、CLIP-IQA 与 MUSIQ。神经指标仅适用于 RGB `[H,W,3]`，MSI/视频会明确跳过；`N/A` 的具体原因记录在 state JSON 的 `learned_metric_status` 中。",
+        ])
     if day6:
         judgment = day6["rounds"][-1]["judgment"]
         lines.extend(
@@ -276,8 +415,14 @@ def render_research_report(
                     if day6.get("promotion")
                     else "未产生"
                 ),
-                "- 基础模型 trials：%d" % judgment["budget_audit"]["baseline_trial_count"],
-                "- 候选模型 trials：%d" % judgment["budget_audit"]["candidate_trial_count"],
+                "- incumbent 调参训练次数：%d"
+                % judgment["budget_audit"]["baseline_trial_count"],
+                "- candidate 调参训练次数：%d"
+                % judgment["budget_audit"]["candidate_trial_count"],
+                "- 调优口径：`%s`"
+                % judgment["budget_audit"].get(
+                    "trial_count_policy", "legacy equal-trial protocol"
+                ),
                 "- 本轮共享训练配置：`%s`"
                 % judgment["budget_audit"].get("shared_training_config", "legacy/default"),
                 "- LLM 请求步数 / 用户上限：`%s / %s`"
@@ -285,16 +430,20 @@ def render_research_report(
                     judgment["budget_audit"].get("llm_requested_max_steps", "N/A"),
                     judgment["budget_audit"].get("user_max_steps_ceiling", "N/A"),
                 ),
-                "- Missing PSNR 差值：%s dB" % _number(judgment["psnr_delta"]),
+                "- Missing-region PSNR 差值：%s dB"
+                % _number(judgment["psnr_delta"]),
                 "- Composite SSIM 差值：%s" % _number(judgment["ssim_delta"]),
                 "- 总运行时间比：%s" % _number(judgment["runtime_ratio"]),
                 "- 决策：`%s`" % judgment["decision"],
                 "- 停止原因：`%s`" % day6["stop_reason"],
                 "",
-                "调参函数不接收缺失区域 Ground Truth。超参数和训练步数确定后，模型才在全部观测像素上重新拟合并执行最终隐藏区域评估。",
+                "模型梯度始终只由全部可见像素计算；缺失区 Ground Truth MSE 直接选择结构、学习率、早停点和最终输出。该结果属于单图 oracle 搜索，不代表未见数据泛化性。",
                 "每轮只允许一个算法或 loss 变异点；接受后更新当前最优并继续，而不是提前终止。",
             ]
         )
+    visual_lines = _visual_assessment_lines(day5, day6)
+    if visual_lines:
+        lines.extend([""] + visual_lines)
     lines.extend(
         [
             "",

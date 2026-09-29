@@ -1,13 +1,17 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from PIL import Image
 
+from research_agent.method_selector import manual_method_plan
 from research_agent.workflow_day4 import (
+    Day4Workflow,
     Day4WorkflowConfig,
     _candidates_from_plan,
+    _siren_tuning_candidates,
     run_day4_workflow,
 )
 from research_agent.workflow_day5 import (
@@ -120,25 +124,125 @@ def test_new_tensor_network_plans_become_bounded_tuning_candidates():
         profile,
     )
 
-    assert [item["hyperparameters"]["rank_1"] for item in tt_candidates] == [4, 8]
-    assert [item["hyperparameters"]["rank_2"] for item in tt_candidates] == [2, 3]
-    assert [item["hyperparameters"]["rank"] for item in ring_candidates] == [2, 4, 6]
-    assert [item["hyperparameters"]["rank"] for item in mode3_candidates] == [1, 2, 3]
-    assert [
-        item["hyperparameters"]["rank"]
-        for item in nonnegative_cp_candidates
-    ] == [4, 8, 12]
-    assert [item["hyperparameters"]["num_blocks"] for item in btd_candidates] == [1, 2]
-    assert [item["hyperparameters"]["rank"] for item in tsvd_candidates] == [2, 4, 8]
+    default_rates = {0.001, 0.01, 0.1}
+    assert {
+        (item["hyperparameters"]["rank_1"], item["hyperparameters"]["rank_2"])
+        for item in tt_candidates
+    } == {(4, 2), (8, 3)}
+    assert {item["hyperparameters"]["rank"] for item in ring_candidates} == {2, 4, 6}
+    assert {item["hyperparameters"]["rank"] for item in mode3_candidates} == {1, 2, 3}
+    assert {
+        item["hyperparameters"]["rank"] for item in nonnegative_cp_candidates
+    } == {4, 8, 12}
+    assert {item["hyperparameters"]["num_blocks"] for item in btd_candidates} == {1, 2}
+    assert {item["hyperparameters"]["rank"] for item in tsvd_candidates} == {2, 4, 8}
+    for candidates in (
+        tt_candidates,
+        ring_candidates,
+        mode3_candidates,
+        nonnegative_cp_candidates,
+        btd_candidates,
+        tsvd_candidates,
+        nonnegative_candidates,
+        hierarchical_candidates,
+    ):
+        assert {item["learning_rate"] for item in candidates} == default_rates
     assert all(
         set(item["hyperparameters"])
         == {"rank_h", "rank_w", "rank_c", "init_scale"}
         for item in nonnegative_candidates
     )
-    assert [
+    assert {
         item["hyperparameters"]["rank_spatial"]
         for item in hierarchical_candidates
-    ] == [1, 2, 3]
+    } == {1, 2, 3}
+
+
+def test_joint_tuning_honors_explicit_learning_rate_candidates():
+    candidates = _candidates_from_plan(
+        {
+            "method": "cp",
+            "suggested_hyperparameters": {
+                "rank_candidates": [4, 8],
+                "learning_rate_candidates": [0.002, 0.02],
+            },
+        },
+        {"image_shape": [32, 32, 3]},
+    )
+
+    assert len(candidates) == 4
+    assert {item["hyperparameters"]["rank"] for item in candidates} == {4, 8}
+    assert {item["learning_rate"] for item in candidates} == {0.002, 0.02}
+
+
+def test_siren_tuning_design_covers_width_depth_and_frequency():
+    candidates = _siren_tuning_candidates(4)
+
+    assert len(candidates) == 4
+    assert {item["hyperparameters"]["hidden_features"] for item in candidates} == {
+        64,
+        128,
+    }
+    assert {item["hyperparameters"]["hidden_layers"] for item in candidates} == {
+        2,
+        3,
+    }
+    assert {item["hyperparameters"]["first_omega_0"] for item in candidates} == {
+        20.0,
+        30.0,
+    }
+    assert all(item["learning_rate"] == 1e-4 for item in candidates)
+
+
+def test_numerical_screening_can_override_the_selector_seed():
+    workflow = object.__new__(Day4Workflow)
+    workflow.config = SimpleNamespace(
+        model_name="auto",
+        method_shortlist_size=2,
+        max_steps=20,
+        screening_max_steps=10,
+        screening_patience=2,
+        screening_trials=1,
+        seed=7,
+        validation_interval=2,
+        patience=4,
+        device="cpu",
+    )
+    workflow.run_id = "screening-test"
+    workflow.run_dir = Path("/private/tmp/screening-test")
+    workflow.state = {
+        "artifacts": {"corrupted": "corrupted.npy", "mask": "mask.npy"},
+        "results": {
+            "image_profile": {
+                "image_shape": [32, 32, 3],
+                "image_aspect_ratio": 1.0,
+            }
+        },
+    }
+    scores = {"tucker": 0.03, "cp": 0.01}
+
+    def fake_call(tool_name, parameters):
+        assert tool_name == "tune_tensor_model"
+        assert parameters["patience"] == 2
+        best = {
+            "best_validation_mse": scores[parameters["model_name"]],
+            "hyperparameters": parameters["candidates"][0]["hyperparameters"],
+            "best_step": 3,
+        }
+        return SimpleNamespace(data={"best": best, "trial_count": 1})
+
+    workflow._call_tool = fake_call
+    selector_plan = manual_method_plan("tucker", workflow.state["results"]["image_profile"]).model_dump()
+    plan, screening = workflow._screen_method_shortlist(
+        selector_plan,
+        {"active_rules": [{"prefer": "cp", "weight": 2.0}], "evidence": []},
+        {"status": "skipped"},
+    )
+
+    assert screening["shortlist"] == ["tucker", "cp"]
+    assert screening["winner"] == "cp"
+    assert plan["method"] == "cp"
+    assert plan["selection_mode"] == "numerical_screening"
 
 
 def test_day4_fallback_selects_and_trains_a_valid_method(tmp_path):
@@ -152,10 +256,17 @@ def test_day4_fallback_selects_and_trains_a_valid_method(tmp_path):
             missing_rate=0.3,
             seed=7,
             max_steps=12,
+            max_steps_ceiling=12,
+            screening_max_steps=12,
+            screening_patience=2,
             validation_interval=3,
             patience=10,
+            siren_max_steps=12,
+            siren_tuning_trials=1,
+            siren_validation_interval=3,
+            siren_patience=2,
             device="cpu",
-            learned_metrics=False,
+            full_reference_metrics=False,
             llm_mode="off",
             retrieval_top_k=5,
         )
@@ -176,15 +287,32 @@ def test_day4_fallback_selects_and_trains_a_valid_method(tmp_path):
         "tt",
         "tensor_ring",
     }
-    assert plan["selection_mode"] == "deterministic_fallback"
+    assert plan["selection_mode"] == "numerical_screening"
+    screening = state["results"]["method_screening"]
+    assert screening["status"] == "completed"
+    assert len(screening["shortlist"]) == 3
+    assert screening["winner"] == plan["method"]
+    assert screening["selection_scope"] == "missing_region_ground_truth"
+    assert screening["ground_truth_used"] is True
+    method_plan = json.loads(Path(state["artifacts"]["method_plan"]).read_text())
+    assert method_plan["selector_recommendation"]["selection_mode"] == (
+        "deterministic_fallback"
+    )
     assert state["selected_model"] == plan["method"]
     assert state["results"]["training"]["model_name"] == plan["method"]
     assert state["results"]["selector_diagnostics"]["llm_used"] is False
 
-    method_plan = json.loads(Path(state["artifacts"]["method_plan"]).read_text())
     assert method_plan["ground_truth_provided_to_selector"] is False
     assert method_plan["final_metrics_provided_to_selector"] is False
     assert Path(state["artifacts"]["retrieval_result"]).is_file()
+    assert Path(state["artifacts"]["method_screening"]).is_file()
+    assert state["results"]["siren_comparison"]["status"] == "completed"
+    assert state["results"]["baseline_comparison"]["winner"] in {
+        "nearest_neighbor_manhattan",
+        "siren",
+        state["selected_model"],
+    }
+
 
     trace_text = Path(state["artifacts"]["trace_jsonl"]).read_text()
     assert '"event": "method_selection"' in trace_text
@@ -214,12 +342,14 @@ def test_day4_fallback_selects_and_trains_a_valid_method(tmp_path):
             output_dir=str(tmp_path / "outputs"),
             llm_mode="off",
             tuning_trials=1,
+            learning_rate_candidates=(0.03,),
+            refine_learning_rate=False,
             max_steps=5,
             max_improvement_rounds=1,
             validation_interval=1,
             patience=5,
             device="cpu",
-            learned_metrics=False,
+            full_reference_metrics=False,
         )
     )
     assert day6_state["stage"] == "COMPLETED"
@@ -227,12 +357,175 @@ def test_day4_fallback_selects_and_trains_a_valid_method(tmp_path):
     round_result = day6_state["rounds"][0]
     assert round_result["baseline_tuning"]["trial_count"] == 1
     assert round_result["candidate_tuning"]["trial_count"] == 1
-    assert round_result["baseline_tuning"]["ground_truth_used"] is False
-    assert round_result["candidate_tuning"]["ground_truth_used"] is False
+    assert round_result["baseline_tuning"]["ground_truth_used"] is True
+    assert round_result["candidate_tuning"]["ground_truth_used"] is True
     assert day6_state["stop_reason"] in {
         "candidate_accepted",
         "maximum_improvement_rounds_reached",
     }
+
+
+def test_siren_training_is_reused_for_the_same_data_and_config(tmp_path):
+    corrupted_path = tmp_path / "corrupted.npy"
+    mask_path = tmp_path / "mask.npy"
+    ground_truth_path = tmp_path / "ground_truth.npy"
+    np.save(corrupted_path, np.zeros((4, 5, 3), dtype=np.float32))
+    np.save(mask_path, np.ones((4, 5), dtype=bool))
+    np.save(ground_truth_path, np.zeros((4, 5, 3), dtype=np.float32))
+    config = SimpleNamespace(
+        output_dir=str(tmp_path / "outputs"), siren_comparison=True, seed=7,
+        siren_tuning_trials=1, siren_max_steps=12, siren_validation_interval=3,
+        siren_patience=2, device="cpu", full_reference_metrics=False,
+        no_reference_metrics=False,
+    )
+    calls = []
+
+    def make_workflow(run_name):
+        workflow = object.__new__(Day4Workflow)
+        workflow.config = config
+        workflow.run_id = run_name
+        workflow.run_dir = tmp_path / run_name
+        workflow.run_dir.mkdir()
+        workflow.state = {
+            "selected_model": "tucker",
+            "artifacts": {"corrupted": str(corrupted_path), "mask": str(mask_path)},
+            "results": {
+                "interpolation_metrics": {"missing_psnr": 10.0},
+                "tensor_metrics": {"missing_psnr": 11.0},
+            },
+        }
+
+        def fake_call(tool_name, parameters):
+            calls.append((run_name, tool_name))
+            if tool_name == "tune_tensor_model":
+                Path(parameters["output_path"]).parent.mkdir(parents=True, exist_ok=True)
+                Path(parameters["output_path"]).write_text("{}", encoding="utf-8")
+                model_dir = Path(parameters["output_path"]).parent / "selected_model"
+                model_dir.mkdir(parents=True, exist_ok=True)
+                reconstruction = model_dir / "reconstruction.npy"
+                preview = model_dir / "preview.png"
+                np.save(reconstruction, np.zeros((4, 5, 3), dtype=np.float32))
+                preview.write_bytes(b"preview")
+                selected_output = {
+                    "model_name": "siren",
+                    "hyperparameters": {"hidden_features": 16},
+                    "learning_rate": 0.001, "fitted_steps": 3,
+                    "final_train_mse": 0.1, "observed_pixels_used": 20,
+                    "parameter_count": 100, "runtime_seconds": 0.2,
+                    "device": "cpu",
+                    "artifacts": {"reconstruction": str(reconstruction),
+                                  "preview": str(preview)},
+                }
+                return SimpleNamespace(data={
+                    "best": {
+                        "hyperparameters": {"hidden_features": 16},
+                        "learning_rate": 0.001, "best_step": 3,
+                    },
+                    "selected_output": selected_output,
+                })
+            if tool_name == "evaluate_reconstruction":
+                Path(parameters["output_path"]).parent.mkdir(parents=True, exist_ok=True)
+                Path(parameters["output_path"]).write_text("{}", encoding="utf-8")
+                return SimpleNamespace(data={
+                    "missing_mse": 0.1, "missing_psnr": 12.0,
+                    "full_psnr": 14.0, "perfect_reconstruction": False,
+                    "composite_ssim": 0.8, "lpips": None, "maniqa": None,
+                    "clip_iqa": None, "musiq": None,
+                    "learned_metric_status": {}, "metric_group_status": {},
+                })
+            raise AssertionError("Unexpected tool: %s" % tool_name)
+
+        workflow._call_tool = fake_call
+        return workflow
+
+    first = make_workflow("run-first")
+    first._run_additional_baselines(str(ground_truth_path))
+    second = make_workflow("run-second")
+    second._run_additional_baselines(str(ground_truth_path))
+
+    assert first.state["results"]["siren_comparison"]["training_cache"]["reused"] is False
+    assert second.state["results"]["siren_comparison"]["training_cache"]["reused"] is True
+    assert [tool for run, tool in calls if run == "run-first"] == [
+        "tune_tensor_model", "evaluate_reconstruction",
+    ]
+    assert [tool for run, tool in calls if run == "run-second"] == [
+        "evaluate_reconstruction"
+    ]
+    assert Path(second.state["artifacts"]["siren_reconstruction"]).is_file()
+
+
+def test_day4_can_feed_one_shot_interpolation_visual_prior_to_selector(tmp_path):
+    class RecordingVisualEvaluator:
+        def __init__(self):
+            self.calls = []
+
+        def assess_method_selection(self, interpolation_path, tensor_context):
+            self.calls.append((interpolation_path, tensor_context))
+            return {
+                "status": "completed",
+                "scope": "manhattan_interpolation_preview_only",
+                "ground_truth_provided": False,
+                "assessment": {
+                    "preferred_methods": ["tucker"],
+                    "rank_regime": {
+                        "height": "medium",
+                        "width": "high",
+                        "feature": "low",
+                        "overall": "medium",
+                    },
+                },
+            }
+
+    class RecordingSelector:
+        llm = object()
+
+        def __init__(self):
+            self.visual_assessment = None
+
+        def select(self, profile, retrieval, visual_assessment=None):
+            self.visual_assessment = visual_assessment
+            return {
+                "plan": manual_method_plan("tucker", profile),
+                "attempts": 1,
+                "fallback_reason": None,
+                "validation_errors": [],
+                "raw_outputs": [],
+            }
+
+    image_path = tmp_path / "selection-visual.png"
+    _write_small_image(image_path)
+    selector = RecordingSelector()
+    visual_evaluator = RecordingVisualEvaluator()
+    state = run_day4_workflow(
+        Day4WorkflowConfig(
+            image_path=str(image_path),
+            output_dir=str(tmp_path / "outputs"),
+            image_size=None,
+            missing_rate=0.3,
+            seed=13,
+            max_steps=3,
+            max_steps_ceiling=3,
+            validation_interval=1,
+            patience=3,
+            device="cpu",
+            full_reference_metrics=False,
+            llm_mode="off",
+            selection_visual_assessment=True,
+        ),
+        selector=selector,
+        visual_evaluator=visual_evaluator,
+    )
+
+    assert state["stage"] == "COMPLETED"
+    assert len(visual_evaluator.calls) == 1
+    assert visual_evaluator.calls[0][0].endswith("interpolated_preview.png")
+    assert selector.visual_assessment["status"] == "completed"
+    assert state["results"]["selector_diagnostics"][
+        "selection_visual_assessment_status"
+    ] == "completed"
+    assert Path(
+        state["artifacts"]["method_selection_visual_assessment"]
+    ).is_file()
 
 
 @pytest.mark.parametrize(
@@ -270,10 +563,11 @@ def test_day4_manual_selection_is_preserved_through_training(
             missing_rate=0.3,
             seed=17,
             max_steps=3,
+            max_steps_ceiling=3,
             validation_interval=1,
             patience=3,
             device="cpu",
-            learned_metrics=False,
+            full_reference_metrics=False,
             llm_mode="off",
             retrieval_top_k=5,
         )

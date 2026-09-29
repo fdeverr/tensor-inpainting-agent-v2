@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 
+from .cli_options import add_optional_evaluation
+
 from .workflow import Day3WorkflowConfig, run_day3_workflow
 
 
@@ -19,11 +21,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--max-steps", type=int, default=200)
-    parser.add_argument("--validation-ratio", type=float, default=0.1)
     parser.add_argument("--validation-interval", type=int, default=10)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--skip-learned-metrics", action="store_true")
+    add_optional_evaluation(parser, "full-reference-metrics")
+    add_optional_evaluation(parser, "no-reference-metrics")
     return parser
 
 
@@ -39,11 +41,11 @@ def main() -> None:
             image_size=args.image_size or None,
             mat_key=args.mat_key,
             max_steps=args.max_steps,
-            validation_ratio=args.validation_ratio,
             validation_interval=args.validation_interval,
             patience=args.patience,
             device=args.device,
-            learned_metrics=not args.skip_learned_metrics,
+            full_reference_metrics=args.full_reference_metrics,
+            no_reference_metrics=args.no_reference_metrics,
         )
     )
     comparison = state["results"]["comparison"]
@@ -53,10 +55,21 @@ def main() -> None:
     print("  run_id: %s" % state["run_id"])
     print("  stage: %s" % state["stage"])
     print("  selected_model: %s" % state["selected_model"])
-    interpolation_psnr = interpolation["missing_psnr"]
-    tensor_psnr = tensor["missing_psnr"]
+    for label, value in (
+        ("interpolation_missing_psnr", interpolation["missing_psnr"]),
+        ("tensor_missing_psnr", tensor["missing_psnr"]),
+    ):
+        print(
+            "  %s: %s"
+            % (
+                label,
+                "infinite (perfect)" if value is None else "%.4f dB" % value,
+            )
+        )
+    interpolation_psnr = interpolation["full_psnr"]
+    tensor_psnr = tensor["full_psnr"]
     print(
-        "  interpolation_psnr: %s"
+        "  interpolation_full_psnr: %s"
         % (
             "infinite (perfect)"
             if interpolation_psnr is None
@@ -64,7 +77,7 @@ def main() -> None:
         )
     )
     print(
-        "  tensor_psnr: %s"
+        "  tensor_full_psnr: %s"
         % (
             "infinite (perfect)"
             if tensor_psnr is None

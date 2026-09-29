@@ -108,6 +108,25 @@ def test_registry_schema_and_defaults_cover_the_same_model_names():
     assert all(get_default_hyperparameters(name) for name in SUPPORTED_MODEL_NAMES)
 
 
+def test_siren_forward_backward_matches_image_shape():
+    model = create_model(
+        model_name="siren",
+        image_shape=(8, 7, 3),
+        initial_channel_mean=[0.4, 0.5, 0.6],
+        hyperparameters={
+            "hidden_features": 16,
+            "hidden_layers": 2,
+            "first_omega_0": 30.0,
+            "hidden_omega_0": 30.0,
+        },
+    )
+    prediction = model()
+    loss = prediction.square().mean()
+    loss.backward()
+    assert tuple(prediction.shape) == (8, 7, 3)
+    assert all(parameter.grad is not None for parameter in model.parameters())
+
+
 @pytest.mark.parametrize("model_name,hyperparameters,expected_parameters", MODEL_CASES)
 def test_tensor_model_forward_backward_and_parameters(
     model_name,

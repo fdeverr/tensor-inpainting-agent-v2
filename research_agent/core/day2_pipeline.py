@@ -23,7 +23,7 @@ from .data import (
 from .interpolation import nearest_neighbor_fill
 from .masks import generate_observation_mask
 from .metrics import evaluate_reconstruction_metrics
-from .trainer import fit_tensor_model_on_all_observations, train_tensor_model
+from .trainer import train_tensor_model
 
 
 def _make_run_id(model_name: str) -> str:
@@ -43,14 +43,16 @@ def _evaluate(
     ground_truth,
     observed_mask,
     device: str,
-    include_learned_metrics: bool,
+    include_full_reference_metrics: bool,
+    include_no_reference_metrics: bool,
 ) -> Dict[str, Any]:
     return evaluate_reconstruction_metrics(
         reconstruction,
         ground_truth,
         observed_mask,
         device=device,
-        include_learned_metrics=include_learned_metrics,
+        include_full_reference_metrics=include_full_reference_metrics,
+        include_no_reference_metrics=include_no_reference_metrics,
     )
 
 
@@ -90,20 +92,11 @@ def run_day2_experiment(config: Day2ExperimentConfig) -> Dict[str, Any]:
         observed_mask=observed_mask,
         config=config.training,
         seed=config.seed,
+        ground_truth=ground_truth,
     )
-    final_fit_output = fit_tensor_model_on_all_observations(
-        model_name=config.model_name,
-        model_hyperparameters=config.model_hyperparameters,
-        observed_image=corrupted,
-        observed_mask=observed_mask,
-        config=config.training,
-        selected_steps=selection_output.best_step,
-        seed=config.seed,
-    )
-
     selection_reconstruction = selection_output.reconstruction.copy()
     selection_reconstruction[observed_mask] = corrupted[observed_mask]
-    raw_reconstruction = final_fit_output.reconstruction
+    raw_reconstruction = selection_output.reconstruction
     completed_reconstruction = raw_reconstruction.copy()
     completed_reconstruction[observed_mask] = corrupted[observed_mask]
 
@@ -172,8 +165,8 @@ def run_day2_experiment(config: Day2ExperimentConfig) -> Dict[str, Any]:
             "model_name": config.model_name,
             "model_hyperparameters": config.model_hyperparameters,
             "image_shape": tuple(ground_truth.shape),
-            "state_dict": final_fit_output.state_dict,
-            "training_phase": "refit_on_all_observations",
+            "state_dict": selection_output.state_dict,
+            "training_phase": "all_observed_training_gt_checkpoint_selection",
             "selected_steps": selection_output.best_step,
             "selection_best_validation_mse": selection_output.best_validation_mse,
         },
@@ -185,21 +178,24 @@ def run_day2_experiment(config: Day2ExperimentConfig) -> Dict[str, Any]:
         ground_truth,
         observed_mask,
         config.training.device,
-        config.learned_metrics,
+        config.full_reference_metrics,
+        config.no_reference_metrics,
     )
     selection_metrics = _evaluate(
         selection_reconstruction,
         ground_truth,
         observed_mask,
         config.training.device,
-        config.learned_metrics,
+        config.full_reference_metrics,
+        config.no_reference_metrics,
     )
     model_metrics = _evaluate(
         completed_reconstruction,
         ground_truth,
         observed_mask,
         config.training.device,
-        config.learned_metrics,
+        config.full_reference_metrics,
+        config.no_reference_metrics,
     )
     psnr_delta = None
     if (
@@ -221,20 +217,28 @@ def run_day2_experiment(config: Day2ExperimentConfig) -> Dict[str, Any]:
         "selection": {
             "best_step": selection_output.best_step,
             "best_validation_mse": selection_output.best_validation_mse,
+            "best_missing_gt_mse": selection_output.best_validation_mse,
+            "best_missing_psnr": selection_output.best_missing_psnr,
+            "selection_metric": selection_output.selection_metric,
+            "ground_truth_used_for_selection": True,
             "runtime_seconds": selection_output.runtime_seconds,
             "parameter_count": selection_output.parameter_count,
             "device": selection_output.device,
             "stopped_early": selection_output.stopped_early,
             "train_observed_pixels": int(selection_output.train_mask.sum()),
-            "validation_observed_pixels": int(selection_output.validation_mask.sum()),
+            "selection_missing_pixels": int(selection_output.validation_mask.sum()),
         },
         "final_fit": {
-            "fitted_steps": final_fit_output.fitted_steps,
-            "final_train_mse": final_fit_output.final_train_mse,
-            "runtime_seconds": final_fit_output.runtime_seconds,
-            "parameter_count": final_fit_output.parameter_count,
-            "device": final_fit_output.device,
-            "observed_pixels_used": int(final_fit_output.fit_mask.sum()),
+            "fitted_steps": selection_output.best_step,
+            "final_train_mse": next(
+                item["data_train_loss"] for item in selection_output.history
+                if item["step"] == selection_output.best_step
+            ),
+            "runtime_seconds": 0.0,
+            "parameter_count": selection_output.parameter_count,
+            "device": selection_output.device,
+            "observed_pixels_used": int(selection_output.train_mask.sum()),
+            "reused_without_retraining": True,
         },
         "interpolation": interpolation_metrics,
         "selection_model_diagnostic": selection_metrics,
@@ -252,13 +256,15 @@ def run_day2_experiment(config: Day2ExperimentConfig) -> Dict[str, Any]:
                 else model_metrics["missing_psnr"]
                 - selection_metrics["missing_psnr"]
             ),
+            "psnr_metric": "missing_psnr",
         },
         "total_runtime_seconds": float(time.perf_counter() - started_at),
         "artifacts": artifact_paths,
         "notes": {
-            "ground_truth_usage": "final_evaluation_only",
-            "tuning_signal": "held_out_observed_pixels_only",
-            "final_fit": "Selected steps are refit from scratch on 100% of observed pixels.",
+            "ground_truth_usage": "missing_region_checkpoint_and_hyperparameter_selection",
+            "tuning_signal": "missing_region_ground_truth_mse",
+            "training_pixels": "All observed pixels; missing GT never enters the gradient loss.",
+            "final_fit": "The already-trained GT-best checkpoint is reused without retraining.",
             "model_output": "Known samples in model_completed.npy are copied from observations.",
             "learned_iqa": (
                 "LPIPS/MANIQA/CLIP-IQA/MUSIQ are evaluation-only diagnostics "
@@ -277,7 +283,7 @@ def run_day2_experiment(config: Day2ExperimentConfig) -> Dict[str, Any]:
     )
     _write_json(
         Path(artifact_paths["final_fit_history"]),
-        {"history": final_fit_output.history},
+        {"history": selection_output.history, "reused_without_retraining": True},
     )
     _write_json(Path(artifact_paths["metrics"]), payload)
     return payload

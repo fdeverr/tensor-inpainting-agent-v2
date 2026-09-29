@@ -30,11 +30,11 @@ python -m research_agent.run \
 
 ## 1:20–1:50：候选与公平实验
 
-打开候选 `idea.json`、`validation.json` 和一轮 `paired_configurations.json`：
+打开候选 `idea.json`、`validation.json` 和一轮 `tuning_configurations.json`：
 
 - idea 是 Tucker + TV；
 - 代码先通过 AST 和独立进程训练 smoke test；
-- baseline/candidate 各 4 个 trial，配对配置只差 `tv_weight`；
+- baseline/candidate 在同一结构 trial 上限内分别调优，小空间穷举、大空间继续搜索；
 - 调参函数没有 Ground Truth 参数。
 
 ## 1:50–2:20：指标和图片

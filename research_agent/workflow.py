@@ -50,12 +50,12 @@ class Day3WorkflowConfig:
     mat_key: Optional[str] = None
     model_name: str = "tucker"
     max_steps: int = 200
-    validation_ratio: float = 0.1
     validation_interval: int = 10
     patience: int = 20
     device: str = "auto"
     candidates: Optional[List[Dict[str, Any]]] = field(default=None)
-    learned_metrics: bool = True
+    full_reference_metrics: bool = True
+    no_reference_metrics: bool = False
 
     def validate(self) -> None:
         if not Path(self.image_path).is_file():
@@ -74,8 +74,10 @@ class Day3WorkflowConfig:
             raise ValueError("max_steps must be positive")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be auto, cpu, or cuda")
-        if not isinstance(self.learned_metrics, bool):
-            raise ValueError("learned_metrics must be a bool")
+        if not isinstance(self.full_reference_metrics, bool):
+            raise ValueError("full_reference_metrics must be a bool")
+        if not isinstance(self.no_reference_metrics, bool):
+            raise ValueError("no_reference_metrics must be a bool")
 
 
 class WorkflowExecutionError(RuntimeError):
@@ -133,7 +135,7 @@ class Day3Workflow:
 
     @staticmethod
     def _trace_parameters(parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """Keep paths/configs in Trace while excluding evaluation-only GT."""
+        """Keep paths/configs in Trace while excluding the raw GT tensor content."""
 
         return {
             key: value
@@ -232,6 +234,16 @@ class Day3Workflow:
 
         return self.config.candidates
 
+    def _tuning_parameter_overrides(self) -> Dict[str, Any]:
+        """Allow later workflows to add controls to formal tuning."""
+
+        return {}
+
+    def _run_additional_baselines(self, ground_truth_path: str) -> None:
+        """Hook for Day 4 comparison baselines such as SIREN."""
+
+        del ground_truth_path
+
     def run(self) -> Dict[str, Any]:
         """Execute all Day 3 stages and return the persisted final state."""
 
@@ -261,9 +273,8 @@ class Day3Workflow:
             )
             self.state["artifacts"].update(analysis.data["artifacts"])
             self.state["results"]["image_profile"] = analysis.data["profile"]
-            # This path is never returned by AnalyzeImageTool and therefore is
-            # unavailable to a future LLM controller.  Only the deterministic
-            # evaluator branch knows the fixed internal artifact name.
+            # The raw tensor stays outside the LLM context, but deterministic
+            # training tools use it as the per-image checkpoint-selection target.
             ground_truth_path = str(self.run_dir / "evaluation_ground_truth.npy")
             self._transition("CREATED", "ANALYZED")
 
@@ -325,15 +336,16 @@ class Day3Workflow:
                 "run_id": self.run_id,
                 "corrupted_path": self.state["artifacts"]["corrupted"],
                 "mask_path": self.state["artifacts"]["mask"],
+                "ground_truth_path": ground_truth_path,
                 "output_path": str(tuning_path),
                 "model_name": selected_model,
                 "seed": self.config.seed,
                 "max_steps": self.config.max_steps,
-                "validation_ratio": self.config.validation_ratio,
                 "validation_interval": self.config.validation_interval,
                 "patience": self.config.patience,
                 "device": self.config.device,
             }
+            tuning_parameters.update(self._tuning_parameter_overrides())
             tuning_candidates = self._tuning_candidates(
                 selected_model,
                 method_plan,
@@ -348,30 +360,20 @@ class Day3Workflow:
             self._transition("INTERPOLATED", "TUNED")
 
             best = tuning.data["best"]
-            training = self._call_tool(
-                "train_tensor_model",
-                {
-                    "run_id": self.run_id,
-                    "corrupted_path": self.state["artifacts"]["corrupted"],
-                    "mask_path": self.state["artifacts"]["mask"],
-                    "output_dir": str(self.run_dir / "tensor_model"),
-                    "model_name": selected_model,
-                    "hyperparameters": best["hyperparameters"],
-                    "learning_rate": best["learning_rate"],
-                    "selected_steps": best["best_step"],
-                    "seed": self.config.seed,
-                    "validation_interval": self.config.validation_interval,
-                    "device": self.config.device,
-                },
+            training_data = tuning.data["selected_output"]
+            print(
+                "🎯 调参完成，直接使用 GT 评分最优 checkpoint：%s，%d 步"
+                % (selected_model, int(best["best_step"])),
+                flush=True,
             )
             self.state["artifacts"].update(
                 {
                     "tensor_%s" % key: value
-                    for key, value in training.data["artifacts"].items()
+                    for key, value in training_data["artifacts"].items()
                 }
             )
             self.state["results"]["training"] = {
-                key: training.data[key]
+                key: training_data[key]
                 for key in (
                     "model_name",
                     "hyperparameters",
@@ -384,6 +386,7 @@ class Day3Workflow:
                     "device",
                 )
             }
+            self.state["results"]["training"]["reused_without_retraining"] = True
             self._transition("TUNED", "TRAINED")
 
             baseline_metrics_path = self.run_dir / "interpolation_metrics.json"
@@ -398,7 +401,8 @@ class Day3Workflow:
                     "mask_path": self.state["artifacts"]["mask"],
                     "output_path": str(baseline_metrics_path),
                     "device": self.config.device,
-                    "learned_metrics": self.config.learned_metrics,
+                    "full_reference_metrics": self.config.full_reference_metrics,
+                    "no_reference_metrics": self.config.no_reference_metrics,
                 },
             )
             tensor_evaluation = self._call_tool(
@@ -414,7 +418,8 @@ class Day3Workflow:
                     "mask_path": self.state["artifacts"]["mask"],
                     "output_path": str(tensor_metrics_path),
                     "device": self.config.device,
-                    "learned_metrics": self.config.learned_metrics,
+                    "full_reference_metrics": self.config.full_reference_metrics,
+                    "no_reference_metrics": self.config.no_reference_metrics,
                 },
             )
             self.state["artifacts"]["interpolation_metrics"] = str(
@@ -424,6 +429,7 @@ class Day3Workflow:
             metric_keys = (
                 "missing_mse",
                 "missing_psnr",
+                "full_psnr",
                 "perfect_reconstruction",
                 "composite_ssim",
                 "lpips",
@@ -431,6 +437,7 @@ class Day3Workflow:
                 "clip_iqa",
                 "musiq",
                 "learned_metric_status",
+                "metric_group_status",
             )
             self.state["results"]["interpolation_metrics"] = {
                 key: baseline_evaluation.data[key] for key in metric_keys
@@ -438,6 +445,7 @@ class Day3Workflow:
             self.state["results"]["tensor_metrics"] = {
                 key: tensor_evaluation.data[key] for key in metric_keys
             }
+            self._run_additional_baselines(ground_truth_path)
             self._transition("TRAINED", "EVALUATED")
 
             comparison_path = self.run_dir / "comparison.json"

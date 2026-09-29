@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 
 from .agent_tools.framework import TraceLogger
 from .reporting import build_method_results, write_research_report
-from .schemas import SUPPORTED_MODEL_NAMES
+from .schemas import SUPPORTED_TENSOR_MODEL_NAMES
 from .workflow import _make_run_id, _write_json
 from .workflow_day4 import Day4WorkflowConfig, run_day4_workflow
 from .workflow_day5 import Day5WorkflowConfig, run_day5_workflow
@@ -34,20 +34,39 @@ class FullWorkflowConfig:
     image_size: Optional[int] = 128
     mat_key: Optional[str] = None
     base_model: str = "auto"
-    method_max_steps: int = 1000
-    fair_max_steps: int = 2000
+    method_max_steps: int = 1500
+    method_max_steps_ceiling: int = 6000
+    tuning_near_limit_ratio: float = 0.9
+    tuning_expansion_factor: float = 2.0
+    fair_max_steps: int = 3000
     tuning_trials: int = 4
+    ablation_screen_trials: int = 1
+    ablation_screen_max_steps: int = 300
+    fair_learning_rate_candidates: tuple[float, ...] = (0.001, 0.01, 0.1)
+    fair_refine_learning_rate: bool = True
+    fair_learning_rate_refinement_factor: float = 3.0
     max_improvement_rounds: int = 5
-    validation_ratio: float = 0.1
     validation_interval: int = 10
-    patience: int = 40
+    patience: int = 20
     device: str = "auto"
     llm_mode: str = "auto"
     retrieval_top_k: int = 8
     minimum_psnr_delta: float = 0.2
     ssim_tolerance: float = 0.002
     smoke_timeout_seconds: float = 10.0
-    learned_metrics: bool = True
+    full_reference_metrics: bool = True
+    no_reference_metrics: bool = False
+    selection_visual_assessment: bool = False
+    mutation_visual_assessment: bool = False
+    method_shortlist_size: int = 3
+    screening_trials: int = 2
+    screening_max_steps: int = 400
+    screening_patience: int = 10
+    siren_comparison: bool = True
+    siren_max_steps: int = 4000
+    siren_tuning_trials: int = 4
+    siren_validation_interval: int = 25
+    siren_patience: int = 20
 
     def validate(self) -> None:
         if not Path(self.image_path).is_file():
@@ -62,23 +81,84 @@ class FullWorkflowConfig:
             raise ValueError("image_size must be at least 8 or None")
         if self.mat_key is not None and not self.mat_key.strip():
             raise ValueError("mat_key must be a non-empty string or None")
-        if self.base_model not in {"auto", *SUPPORTED_MODEL_NAMES}:
+        if self.base_model not in {"auto", *SUPPORTED_TENSOR_MODEL_NAMES}:
             raise ValueError(
                 "base_model must be auto or one of %s"
-                % sorted(SUPPORTED_MODEL_NAMES)
+                % sorted(SUPPORTED_TENSOR_MODEL_NAMES)
             )
         if min(self.method_max_steps, self.fair_max_steps) < 1:
             raise ValueError("training steps must be positive")
+        if self.method_max_steps_ceiling < self.method_max_steps:
+            raise ValueError(
+                "method_max_steps_ceiling must be at least method_max_steps"
+            )
+        if not 0.0 < self.tuning_near_limit_ratio <= 1.0:
+            raise ValueError("tuning_near_limit_ratio must be in (0, 1]")
+        if self.tuning_expansion_factor <= 1.0:
+            raise ValueError("tuning_expansion_factor must be greater than 1")
         if not 1 <= self.tuning_trials <= 5:
             raise ValueError("tuning_trials must be in [1, 5]")
+        if not 1 <= self.ablation_screen_trials <= 3:
+            raise ValueError("ablation_screen_trials must be in [1, 3]")
+        if self.ablation_screen_max_steps < 1:
+            raise ValueError("ablation_screen_max_steps must be positive")
+        if not self.fair_learning_rate_candidates or any(
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not 1e-5 <= float(rate) <= 1.0
+            for rate in self.fair_learning_rate_candidates
+        ):
+            raise ValueError(
+                "fair_learning_rate_candidates must contain numbers in [1e-5, 1.0]"
+            )
+        if not isinstance(self.fair_refine_learning_rate, bool):
+            raise ValueError("fair_refine_learning_rate must be a bool")
+        if self.fair_learning_rate_refinement_factor <= 1.0:
+            raise ValueError(
+                "fair_learning_rate_refinement_factor must be greater than 1"
+            )
+        if self.fair_refine_learning_rate and any(
+            float(rate) / self.fair_learning_rate_refinement_factor < 1e-5
+            or float(rate) * self.fair_learning_rate_refinement_factor > 1.0
+            for rate in self.fair_learning_rate_candidates
+        ):
+            raise ValueError(
+                "fair_learning_rate_candidates must remain in [1e-5, 1.0] "
+                "after local refinement"
+            )
         if not 1 <= self.max_improvement_rounds <= 100:
             raise ValueError("max_improvement_rounds must be in [1, 100]")
-        if not isinstance(self.learned_metrics, bool):
-            raise ValueError("learned_metrics must be a bool")
+        if not isinstance(self.full_reference_metrics, bool):
+            raise ValueError("full_reference_metrics must be a bool")
+        if not isinstance(self.no_reference_metrics, bool):
+            raise ValueError("no_reference_metrics must be a bool")
+        if not isinstance(self.selection_visual_assessment, bool):
+            raise ValueError("selection_visual_assessment must be a bool")
+        if not isinstance(self.mutation_visual_assessment, bool):
+            raise ValueError("mutation_visual_assessment must be a bool")
+        if not 2 <= self.method_shortlist_size <= 5:
+            raise ValueError("method_shortlist_size must be in [2, 5]")
+        if not 1 <= self.screening_trials <= 3:
+            raise ValueError("screening_trials must be in [1, 3]")
+        if self.screening_max_steps < 1:
+            raise ValueError("screening_max_steps must be positive")
+        if self.screening_patience < 1:
+            raise ValueError("screening_patience must be positive")
+        if not isinstance(self.siren_comparison, bool):
+            raise ValueError("siren_comparison must be a bool")
+        if self.siren_max_steps < 1:
+            raise ValueError("siren_max_steps must be positive")
+        if not 1 <= self.siren_tuning_trials <= 4:
+            raise ValueError("siren_tuning_trials must be in [1, 4]")
+        if self.siren_validation_interval < 1 or self.siren_patience < 1:
+            raise ValueError(
+                "siren_validation_interval and siren_patience must be positive"
+            )
 
 
 def _score(metrics: Dict[str, Any]) -> float:
-    return float("inf") if metrics["missing_psnr"] is None else metrics["missing_psnr"]
+    psnr = metrics.get("missing_psnr")
+    return float("inf") if psnr is None else float(psnr)
 
 
 def _export_comparison_images(
@@ -98,8 +178,9 @@ def _export_comparison_images(
     output_names = {
         "corrupted_input": "00_corrupted_input.png",
         "interpolation_baseline": "01_manhattan_interpolation.png",
-        "tensor_baseline": "02_tensor_baseline.png",
-        "candidate": "03_candidate.png",
+        "implicit_neural_baseline": "02_siren_baseline.png",
+        "tensor_baseline": "03_tensor_baseline.png",
+        "candidate": "04_candidate.png",
     }
     for result in method_results:
         role = result["role"]
@@ -202,13 +283,30 @@ class FullResearchWorkflow:
                     mat_key=self.config.mat_key,
                     model_name=self.config.base_model,
                     max_steps=self.config.method_max_steps,
-                    validation_ratio=self.config.validation_ratio,
+                    max_steps_ceiling=self.config.method_max_steps_ceiling,
+                    tuning_near_limit_ratio=self.config.tuning_near_limit_ratio,
+                    tuning_expansion_factor=self.config.tuning_expansion_factor,
                     validation_interval=self.config.validation_interval,
                     patience=self.config.patience,
                     device=self.config.device,
-                    learned_metrics=self.config.learned_metrics,
+                    full_reference_metrics=self.config.full_reference_metrics,
+                    no_reference_metrics=self.config.no_reference_metrics,
                     llm_mode=self.config.llm_mode,
                     retrieval_top_k=self.config.retrieval_top_k,
+                    selection_visual_assessment=(
+                        self.config.selection_visual_assessment
+                    ),
+                    method_shortlist_size=self.config.method_shortlist_size,
+                    screening_trials=self.config.screening_trials,
+                    screening_max_steps=self.config.screening_max_steps,
+                    screening_patience=self.config.screening_patience,
+                    siren_comparison=self.config.siren_comparison,
+                    siren_max_steps=self.config.siren_max_steps,
+                    siren_tuning_trials=self.config.siren_tuning_trials,
+                    siren_validation_interval=(
+                        self.config.siren_validation_interval
+                    ),
+                    siren_patience=self.config.siren_patience,
                 )
             )
             self._child_completed("day4", day4)
@@ -230,13 +328,14 @@ class FullResearchWorkflow:
                     knowledge_root=self.config.knowledge_root,
                     llm_mode=self.config.llm_mode,
                     smoke_timeout_seconds=self.config.smoke_timeout_seconds,
+                    visual_assessment=self.config.mutation_visual_assessment,
                 )
             )
             self._child_completed("day5", day5)
 
             # ── 阶段 3：公平实验与晋升（Day 6 工作流，条件执行）──────────
             # 输入：day4 的 run 目录（基线）+ day5 的候选目录
-            # 作用：成对调参 → GT 隔离的公平评估 → 确定性 Judge → 接受则晋升 / 拒绝则带反馈改进
+            # 作用：成对调参 → 缺失区 GT 选优 → 确定性 Judge → 接受则晋升 / 拒绝则带反馈改进
             # 输出：day6 state（rounds、accepted、promotion）；候选验证失败时跳过，day6 保持 None
             if day5["validation"]["eligible_for_training"]:
                 self.state["stage"] = "FAIR_EVALUATION"
@@ -254,13 +353,27 @@ class FullResearchWorkflow:
                         knowledge_root=self.config.knowledge_root,
                         llm_mode=self.config.llm_mode,
                         tuning_trials=self.config.tuning_trials,
+                        ablation_screen_trials=self.config.ablation_screen_trials,
+                        ablation_screen_max_steps=(
+                            self.config.ablation_screen_max_steps
+                        ),
+                        learning_rate_candidates=(
+                            self.config.fair_learning_rate_candidates
+                        ),
+                        refine_learning_rate=(
+                            self.config.fair_refine_learning_rate
+                        ),
+                        learning_rate_refinement_factor=(
+                            self.config.fair_learning_rate_refinement_factor
+                        ),
                         max_steps=self.config.fair_max_steps,
                         max_improvement_rounds=self.config.max_improvement_rounds,
-                        validation_ratio=self.config.validation_ratio,
                         validation_interval=self.config.validation_interval,
                         patience=self.config.patience,
                         device=self.config.device,
-                        learned_metrics=self.config.learned_metrics,
+                        full_reference_metrics=self.config.full_reference_metrics,
+                        no_reference_metrics=self.config.no_reference_metrics,
+                        visual_assessment=self.config.mutation_visual_assessment,
                         minimum_psnr_delta=self.config.minimum_psnr_delta,
                         ssim_tolerance=self.config.ssim_tolerance,
                         smoke_timeout_seconds=self.config.smoke_timeout_seconds,
@@ -280,7 +393,7 @@ class FullResearchWorkflow:
                 )
 
             # ── 阶段 4：汇总 → 选冠军 → 出报告 ──────────────────────────
-            # 作用：标准化所有方法结果 → 在 eligible 方法中选 Missing PSNR 最高者 → 复制冠军图 → 生成 report.md
+            # 作用：标准化结果 → 以缺失区 PSNR 选冠军 → 复制冠军图 → 生成 report.md
             self.state["method_results"] = build_method_results(day4, day6)
             comparison_images = _export_comparison_images(
                 self.run_dir,

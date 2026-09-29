@@ -1,9 +1,11 @@
 import json
+from copy import deepcopy
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from research_agent.candidate.generator import CandidateGenerator, deterministic_candidate
 from research_agent.candidate.approved_registry import promote_candidate
@@ -27,39 +29,59 @@ def test_candidate_declares_exactly_one_controlled_change():
 
 def test_metric_descriptions_include_value_direction_scope_and_meaning():
     described = describe_metrics(
-        {"missing_psnr": 21.5, "composite_ssim": 0.81, "lpips": 0.2}
+        {
+            "full_psnr": 25.5,
+            "missing_psnr": 21.5,
+            "composite_ssim": 0.81,
+            "lpips": 0.2,
+        }
     )
 
+    assert described["full_psnr"]["value"] == 25.5
+    assert described["full_psnr"]["scope"].startswith("full completed tensor")
     assert described["missing_psnr"]["value"] == 21.5
     assert described["missing_psnr"]["unit"] == "dB"
     assert described["missing_psnr"]["direction"] == "higher_is_better"
     assert "missing region" in described["missing_psnr"]["physical_meaning"]
     assert described["lpips"]["direction"] == "lower_is_better"
 
+    evolution_described = describe_metrics(
+        {"full_psnr": 25.5, "missing_psnr": 21.5, "composite_ssim": 0.81},
+        include_full_psnr=False,
+    )
+    assert "full_psnr" not in evolution_described
+    assert evolution_described["missing_psnr"]["value"] == 21.5
+
 
 def _practice_record():
     metrics = describe_metrics(
-        {"missing_psnr": 20.0, "composite_ssim": 0.8}
+        {"full_psnr": 24.0, "missing_psnr": 20.0, "composite_ssim": 0.8}
     )
     return {
-        "workflow_id": "workflow-1",
-        "round": 1,
-        "base_method": "tucker",
-        "incumbent_before": "tucker",
-        "candidate_id": "candidate-1",
-        "mutation_goal": "Improve continuity in the held-out image region.",
-        "idea": "Add one bounded total-variation term to the loss.",
-        "mutation_target": "loss",
-        "single_change": "Add total variation to loss_terms.",
+        "framework": {
+            "name": "tucker",
+            "base_method": "tucker",
+            "conditions": {"seed": 42},
+            "training_diagnostics": {
+                "record_count": 1,
+                "signals": [{"code": "training_loss_plateau"}],
+            },
+        },
+        "goal": "Improve continuity in the held-out image region.",
+        "method": {
+            "idea": "Add one bounded total-variation term to the loss.",
+            "target": "loss",
+            "single_change": "Add total variation to loss_terms.",
+        },
         "result": {
             "incumbent_metrics": metrics,
             "candidate_metrics": metrics,
+            "deltas": {"missing_psnr_db": 0.0, "composite_ssim": 0.0},
+            "decision": "reject",
+            "accepted": False,
+            "incumbent_after": "tucker",
             "visual_assessment": {"status": "not_configured"},
         },
-        "judgment": {"decision": "reject"},
-        "incumbent_updated": False,
-        "incumbent_after": "tucker",
-        "conditions": {"seed": 42},
     }
 
 
@@ -99,10 +121,41 @@ def test_practice_is_run_scoped_and_global_experience_accumulates_across_runs(
     assert "candidate-1" not in markdown
     assert "第 1 轮" not in markdown
     assert second_practice.context()["current_run_practice"] == []
-    assert first_practice.context()["current_run_practice"][0]["candidate_id"] == (
-        "candidate-1"
-    )
+    stored_practice = first_practice.context()["current_run_practice"][0]
+    assert set(stored_practice) == {"framework", "goal", "method", "result"}
+    assert stored_practice["framework"]["name"] == "tucker"
     assert not (global_root / "tucker" / "practice.md").exists()
+
+
+def test_experience_is_extracted_from_the_complete_practice_tuple():
+    class RecordingLLM:
+        def __init__(self):
+            self.messages = None
+
+        def invoke(self, messages, temperature=0.0):
+            self.messages = messages
+            return json.dumps(
+                {
+                    "experience": (
+                        "在低秩张量框架出现训练平台时，小权重平滑先验可能改善连续性，"
+                        "但必须检查结构细节是否退化。"
+                    ),
+                    "confidence": "low",
+                },
+                ensure_ascii=False,
+            )
+
+    llm = RecordingLLM()
+    experience = CandidateGenerator(llm).extract_experience(_practice_record())
+    payload = json.loads(llm.messages[1]["content"])
+
+    assert set(payload["practice_tuple"]) == {
+        "framework",
+        "goal",
+        "method",
+        "result",
+    }
+    assert set(experience) == {"experience", "confidence"}
 
 
 def test_legacy_verbose_experience_is_compacted_on_open(tmp_path):
@@ -219,7 +272,7 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
             pass
 
     candidates = []
-    for name in ("candidate-1", "candidate-2"):
+    for name in ("candidate-1", "candidate-2", "candidate-3"):
         directory = tmp_path / "candidates" / "tucker" / name
         directory.mkdir(parents=True)
         (directory / "model.py").write_text("# model")
@@ -246,16 +299,20 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
         output_dir=str(tmp_path / "outputs"),
         llm_mode="off",
         tuning_trials=1,
+        learning_rate_candidates=(0.01,),
+        refine_learning_rate=False,
+        learning_rate_refinement_factor=3.0,
         max_steps=5,
-        max_improvement_rounds=2,
-        validation_ratio=0.1,
+        max_improvement_rounds=3,
         validation_interval=1,
         patience=2,
         device="cpu",
         minimum_psnr_delta=0.2,
         ssim_tolerance=0.002,
         smoke_timeout_seconds=1.0,
-        learned_metrics=False,
+            full_reference_metrics=True,
+            no_reference_metrics=False,
+            visual_assessment=False,
     )
     workflow.workflow_id = "workflow-test"
     workflow.run_dir = tmp_path / "run"
@@ -276,6 +333,7 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
             "training": {"learning_rate": 0.01},
             "selected_trial": {"hyperparameters": {"rank": 1}},
             "interpolation_metrics": {
+                "full_psnr": 9.0,
                 "missing_psnr": 5.0,
                 "composite_ssim": 0.5,
             },
@@ -299,14 +357,26 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
         "artifacts": {"run_dir": str(workflow.run_dir)},
         "updated_at": None,
     }
-    workflow._make_next_candidate = lambda context, round_index: str(candidates[1])
+    generation_contexts = []
+
+    def make_next(context, round_index):
+        generation_contexts.append(deepcopy(context))
+        return str(candidates[round_index - 1])
+
+    workflow._make_next_candidate = make_next
+
+    class ForbiddenVisualEvaluator:
+        def evaluate(self, *args, **kwargs):
+            raise AssertionError("Disabled visual assessment must never run")
+
+    workflow.visual_evaluator = ForbiddenVisualEvaluator()
 
     monkeypatch.setattr(
         "research_agent.workflow_day6.MODEL_CLASSES", {"tucker": FakeModel}
     )
     monkeypatch.setattr(
         "research_agent.workflow_day6.load_improver_context",
-        lambda path: {"base_run_id": "base-run", "base_method": "tucker"},
+        lambda path: {"base_run_id": "base-run", "base_method": "tucker", "base_class_name": "TuckerDecomposition"},
     )
     monkeypatch.setattr(
         "research_agent.workflow_day6.load_tensor_data",
@@ -334,7 +404,11 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
         ),
     )
 
+    tuning_calls = []
+    final_calls = []
+
     def tuning(*args, **kwargs):
+        tuning_calls.append(kwargs["model_name"])
         return {
             "trial_count": 1,
             "trials": [{"runtime_seconds": 0.1}],
@@ -342,16 +416,36 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
                 "best_validation_mse": 0.1,
                 "best_step": 1,
                 "hyperparameters": {"rank": 1},
+                "learning_rate": 0.01,
+                "history": [
+                    {
+                        "step": 1,
+                        "data_train_loss": 0.1,
+                        "total_train_loss": 0.1,
+                        "validation_mse": 0.1,
+                    }
+                ],
             },
         }
 
-    scores = {"tucker": (10.0, 0.8), "candidate-1": (11.0, 0.81), "candidate-2": (10.5, 0.80)}
+    scores = {
+        "tucker": (10.0, 0.8, 0.30),
+        "candidate-1": (11.0, 0.81, 0.24),
+        "candidate-2": (10.5, 0.80, 0.28),
+        "candidate-3": (10.0, 0.79, 0.32),
+    }
 
     def final(model_name, *args, **kwargs):
-        psnr, ssim = scores[model_name]
+        final_calls.append(model_name)
+        psnr, ssim, lpips = scores[model_name]
         output = workflow.run_dir / (model_name + ".npy")
         return {
-            "metrics": {"missing_psnr": psnr, "composite_ssim": ssim},
+            "metrics": {
+                "full_psnr": psnr,
+                "missing_psnr": psnr - 4.0,
+                "composite_ssim": ssim,
+                "lpips": lpips,
+            },
             "runtime_seconds": 0.1,
             "parameter_count": 1,
             "final_train_mse": 0.01,
@@ -371,16 +465,87 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
 
     state = workflow.run()
 
-    assert len(state["rounds"]) == 2
+    assert len(state["rounds"]) == 3
     assert state["accepted_rounds"] == [1]
     assert state["rounds"][1]["incumbent_before"] == "candidate-1"
+    assert tuning_calls == ["tucker", "candidate-1", "candidate-2", "candidate-3"]
+    assert final_calls == ["tucker", "candidate-1", "candidate-2", "candidate-3"]
+    assert state["rounds"][0]["judgment"]["budget_audit"][
+        "incumbent_training_reused"
+    ] is False
+    assert state["rounds"][1]["judgment"]["budget_audit"][
+        "incumbent_training_reused"
+    ] is True
+    assert state["rounds"][2]["judgment"]["budget_audit"][
+        "incumbent_training_reused"
+    ] is True
+    assert state["rounds"][0]["result_summary"]["incumbent_metrics"]["lpips"][
+        "value"
+    ] == 0.30
+    assert state["rounds"][0]["result_summary"]["candidate_metrics"]["lpips"][
+        "value"
+    ] == 0.24
+    assert state["rounds"][0]["result_summary"]["deltas"]["lpips"] == pytest.approx(
+        -0.06
+    )
+    assert state["feedback_history"][0]["lpips_delta"] == pytest.approx(-0.06)
+    assert all(
+        round_record["training_budget"]["effective_shared_budget"]
+        == state["rounds"][0]["training_budget"]["effective_shared_budget"]
+        for round_record in state["rounds"]
+    )
     assert state["promotion"]["algorithm_name"] == "tucker_evolved"
     assert state["stop_reason"] == "maximum_improvement_rounds_reached"
     assert len(
         (workflow.run_dir / "knowledge" / "practice.jsonl").read_text().splitlines()
-    ) == 2
+    ) == 3
     assert len(
         (tmp_path / "knowledge" / "tucker" / "reusable_experience.jsonl")
         .read_text()
         .splitlines()
     ) == 2
+
+    assert len(generation_contexts) == 2
+    assert all(
+        context["run_wide_fair_training_contract"]["training_config"]
+        == state["rounds"][0]["training_budget"]["effective_shared_budget"]
+        for context in generation_contexts
+    )
+    second_memory = generation_contexts[0]["evolution_memory"]["current_run_practice"]
+    third_context = generation_contexts[1]
+    third_memory = third_context["evolution_memory"]["current_run_practice"]
+    assert second_memory["round_count"] == 1
+    assert third_memory["round_count"] == 2
+    assert all(
+        set(item) == {"framework", "goal", "method", "result"}
+        for item in third_memory["current_run_practice"]
+    )
+    assert [
+        item["result"]["accepted"]
+        for item in third_memory["current_run_practice"]
+    ] == [True, False]
+    assert len(third_context["previous_failure_feedback"]) == 2
+    assert third_context["previous_round_result"]["goal"].startswith("Improve")
+    latest_comparison = third_context["algorithm_comparison_reference"][
+        "latest_evolution_round"
+    ]
+    assert latest_comparison["round"] == 2
+    assert latest_comparison["incumbent_before"] == "candidate-1"
+    assert latest_comparison["candidate"] == "candidate-2"
+    assert latest_comparison["decision"] == "reject"
+    assert latest_comparison["deltas"]["missing_psnr_db"] == pytest.approx(-0.5)
+    assert third_context["incumbent_candidate"]["idea"]["candidate_id"] == "candidate-1"
+    assert generation_contexts[0]["training_curve_summary"]["signals"][0][
+        "code"
+    ] == "best_validation_at_budget_end"
+    prompt = json.loads(CandidateGenerator._messages(third_context)[1]["content"])
+    assert prompt["context"]["evolution_memory"]["current_run_practice"]["round_count"] == 2
+    assert len(prompt["experiment_feedback"]) == 2
+    assert len(state["search_space_contract_migrations"]) == 3
+    migrated_manifest = json.loads(
+        (candidates[0] / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert migrated_manifest["declared_search_space"] == {"rank": [1]}
+    assert migrated_manifest["executable_search_space"] == {"rank": [1]}
+    assert migrated_manifest["effective_search_space"] == {"rank": [1]}
+    assert "allowed_search_space" not in migrated_manifest

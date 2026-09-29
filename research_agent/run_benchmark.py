@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 
+from .cli_options import add_optional_evaluation
+
 from .benchmark import BenchmarkConfig, run_benchmark
 
 
@@ -37,15 +39,24 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument("--method-max-steps", type=int, default=50)
+    parser.add_argument("--method-max-steps-ceiling", type=int, default=50)
+    parser.add_argument("--tuning-near-limit-ratio", type=float, default=0.9)
+    parser.add_argument("--tuning-expansion-factor", type=float, default=2.0)
     parser.add_argument("--fair-max-steps", type=int, default=50)
     parser.add_argument("--tuning-trials", type=int, default=2)
     parser.add_argument("--max-improvement-rounds", type=int, default=5)
+    parser.add_argument("--screening-max-steps", type=int, default=50)
+    parser.add_argument("--screening-patience", type=int, default=5)
+    parser.add_argument("--siren-max-steps", type=int, default=50)
+    parser.add_argument("--siren-tuning-trials", type=int, default=2)
+    parser.add_argument("--siren-validation-interval", type=int, default=10)
+    parser.add_argument("--siren-patience", type=int, default=5)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument(
-        "--skip-learned-metrics",
-        action="store_true",
-        help="skip LPIPS/MANIQA/CLIP-IQA/MUSIQ evaluation",
-    )
+    add_optional_evaluation(parser, "full-reference-metrics")
+    add_optional_evaluation(parser, "no-reference-metrics")
+    add_optional_evaluation(parser, "selection-visual-assessment")
+    add_optional_evaluation(parser, "mutation-visual-assessment")
+    add_optional_evaluation(parser, "siren-comparison")
     parser.add_argument("--llm-mode", choices=("auto", "off", "required"), default="off")
     return parser
 
@@ -65,11 +76,24 @@ def main() -> None:
             mat_key=args.mat_key,
             base_model=args.base_model,
             method_max_steps=args.method_max_steps,
+            method_max_steps_ceiling=args.method_max_steps_ceiling,
+            tuning_near_limit_ratio=args.tuning_near_limit_ratio,
+            tuning_expansion_factor=args.tuning_expansion_factor,
             fair_max_steps=args.fair_max_steps,
             tuning_trials=args.tuning_trials,
             max_improvement_rounds=args.max_improvement_rounds,
+            screening_max_steps=args.screening_max_steps,
+            screening_patience=args.screening_patience,
+            siren_max_steps=args.siren_max_steps,
+            siren_tuning_trials=args.siren_tuning_trials,
+            siren_validation_interval=args.siren_validation_interval,
+            siren_patience=args.siren_patience,
             device=args.device,
-            learned_metrics=not args.skip_learned_metrics,
+            full_reference_metrics=args.full_reference_metrics,
+            no_reference_metrics=args.no_reference_metrics,
+            selection_visual_assessment=args.selection_visual_assessment,
+            mutation_visual_assessment=args.mutation_visual_assessment,
+            siren_comparison=args.siren_comparison,
             llm_mode=args.llm_mode,
         )
     )

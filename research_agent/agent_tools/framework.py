@@ -7,6 +7,7 @@ The learning project is intentionally a standalone folder inside the
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -29,6 +30,23 @@ def _make_namespace_package(name: str, package_dir: Path):
     package.__package__ = name
     package.__path__ = [str(package_dir)]
     sys.modules[name] = package
+    return package
+
+
+def _load_local_package(name: str, package_dir: Path):
+    """Load this checkout under its canonical package name, regardless of folder name."""
+
+    init_path = package_dir / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        name,
+        init_path,
+        submodule_search_locations=[str(package_dir)],
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load local package from %s" % init_path)
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[name] = package
+    spec.loader.exec_module(package)
     return package
 
 
@@ -57,8 +75,13 @@ if all(path.is_file() for path in local_framework_files):
             ):
                 sys.modules.pop(module_name, None)
 
-    if (local_package_dir / "__init__.py").is_file():
-        import tensor_inpainting_agent  # noqa: E402,F401
+    loaded_package = sys.modules.get("tensor_inpainting_agent")
+    if loaded_package is not None and _comes_from(loaded_package, local_package_dir):
+        tensor_inpainting_agent = loaded_package
+    elif (local_package_dir / "__init__.py").is_file():
+        tensor_inpainting_agent = _load_local_package(
+            "tensor_inpainting_agent", local_package_dir
+        )
     else:
         # A source-only deployment may omit the package marker at the checkout
         # root. Build a minimal namespace package so absolute framework imports

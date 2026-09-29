@@ -25,6 +25,9 @@ LEARNED_IQA_SPECS = {
     "musiq": {"model_name": "musiq", "reference": False, "lower_better": False},
 }
 
+FULL_REFERENCE_LEARNED_METRICS = ("lpips",)
+NO_REFERENCE_METRICS = ("maniqa", "clip_iqa", "musiq")
+
 _LEARNED_MODEL_CACHE: Dict[Tuple[str, str], Any] = {}
 
 
@@ -70,6 +73,36 @@ def missing_region_psnr(
     if data_range <= 0:
         raise ValueError("data_range must be positive")
     mse = missing_region_mse(prediction, ground_truth, observed_mask)
+    if mse == 0.0:
+        return float("inf")
+    return float(10.0 * math.log10((data_range * data_range) / mse))
+
+
+def full_image_mse(
+    prediction: np.ndarray,
+    ground_truth: np.ndarray,
+    observed_mask: np.ndarray,
+) -> float:
+    """MSE over the completed full tensor after restoring observed samples."""
+
+    _validate_metric_inputs(prediction, ground_truth, observed_mask)
+    composite = prediction.copy()
+    composite[observed_mask] = ground_truth[observed_mask]
+    difference = composite - ground_truth
+    return float(np.mean(np.square(difference, dtype=np.float64)))
+
+
+def full_image_psnr(
+    prediction: np.ndarray,
+    ground_truth: np.ndarray,
+    observed_mask: np.ndarray,
+    data_range: float = 1.0,
+) -> float:
+    """PSNR over the entire completed tensor, including restored observed samples."""
+
+    if data_range <= 0:
+        raise ValueError("data_range must be positive")
+    mse = full_image_mse(prediction, ground_truth, observed_mask)
     if mse == 0.0:
         return float("inf")
     return float(10.0 * math.log10((data_range * data_range) / mse))
@@ -220,6 +253,8 @@ def learned_image_quality_metrics(
     ground_truth: np.ndarray,
     observed_mask: np.ndarray,
     device: str = "auto",
+    include_full_reference_metrics: bool = True,
+    include_no_reference_metrics: bool = False,
 ) -> Tuple[Dict[str, Optional[float]], Dict[str, Any]]:
     """Evaluate LPIPS, MANIQA, CLIP-IQA, and MUSIQ on the completed image.
 
@@ -233,21 +268,39 @@ def learned_image_quality_metrics(
     scores: Dict[str, Optional[float]] = {
         metric_name: None for metric_name in LEARNED_IQA_SPECS
     }
+    requested_metrics = list(
+        FULL_REFERENCE_LEARNED_METRICS
+        if include_full_reference_metrics
+        else ()
+    ) + list(NO_REFERENCE_METRICS if include_no_reference_metrics else ())
+    if not requested_metrics:
+        return scores, {
+            "enabled": False,
+            "requested": False,
+            "requested_metrics": [],
+            "device": None,
+            "scope": "composite_full_image",
+            "errors": {},
+            "skipped_reason": "optional perceptual/IQA metrics disabled",
+        }
     if prediction.ndim != 3 or prediction.shape[-1] != 3:
         return scores, {
             "enabled": False,
             "requested": True,
+            "requested_metrics": requested_metrics,
             "device": None,
             "scope": "unsupported_non_rgb_tensor",
             "errors": {},
             "skipped_reason": (
-                "LPIPS/MANIQA/CLIP-IQA/MUSIQ only support RGB [H,W,3]; "
+                "%s only support RGB [H,W,3]; "
                 "PSNR and SSIM were computed over all tensor features"
+                % "/".join(requested_metrics).upper()
             ),
         }
     status: Dict[str, Any] = {
         "enabled": True,
         "requested": True,
+        "requested_metrics": requested_metrics,
         "device": None,
         "scope": "composite_full_image",
         "errors": {},
@@ -265,11 +318,12 @@ def learned_image_quality_metrics(
     except Exception as error:
         message = _error_text(error)
         status["errors"] = {
-            metric_name: message for metric_name in LEARNED_IQA_SPECS
+            metric_name: message for metric_name in requested_metrics
         }
         return scores, status
 
-    for metric_name, spec in LEARNED_IQA_SPECS.items():
+    for metric_name in requested_metrics:
+        spec = LEARNED_IQA_SPECS[metric_name]
         try:
             model = _learned_metric_model(str(spec["model_name"]), resolved_device)
             with torch.inference_mode():
@@ -292,23 +346,28 @@ def evaluate_reconstruction_metrics(
     observed_mask: np.ndarray,
     *,
     device: str = "auto",
-    include_learned_metrics: bool = True,
+    include_full_reference_metrics: bool = True,
+    include_no_reference_metrics: bool = False,
 ) -> Dict[str, Any]:
     """Return the complete metric payload used by every experiment path."""
 
-    psnr = missing_region_psnr(prediction, ground_truth, observed_mask)
+    missing_psnr = missing_region_psnr(prediction, ground_truth, observed_mask)
+    full_psnr = full_image_psnr(prediction, ground_truth, observed_mask)
     result: Dict[str, Any] = {
         "missing_mse": missing_region_mse(prediction, ground_truth, observed_mask),
-        "missing_psnr": psnr if math.isfinite(psnr) else None,
-        "perfect_reconstruction": not math.isfinite(psnr),
+        "missing_psnr": missing_psnr if math.isfinite(missing_psnr) else None,
+        "full_psnr": full_psnr if math.isfinite(full_psnr) else None,
+        "perfect_reconstruction": not math.isfinite(full_psnr),
         "composite_ssim": composite_ssim(prediction, ground_truth, observed_mask),
     }
-    if include_learned_metrics:
+    if include_full_reference_metrics or include_no_reference_metrics:
         learned_scores, learned_status = learned_image_quality_metrics(
             prediction,
             ground_truth,
             observed_mask,
             device=device,
+            include_full_reference_metrics=include_full_reference_metrics,
+            include_no_reference_metrics=include_no_reference_metrics,
         )
     else:
         learned_scores = {
@@ -320,8 +379,33 @@ def evaluate_reconstruction_metrics(
             "device": None,
             "scope": "composite_full_image",
             "errors": {},
-            "skipped_reason": "learned metrics disabled by configuration",
+            "requested_metrics": [],
+            "skipped_reason": "optional perceptual/IQA metrics disabled by configuration",
         }
     result.update(learned_scores)
     result["learned_metric_status"] = learned_status
+    result["metric_group_status"] = {
+        "full_reference": {
+            "enabled": True,
+            "required_metrics": [
+                "missing_mse",
+                "missing_psnr",
+                "full_psnr",
+                "composite_ssim",
+            ],
+            "optional_metrics": (
+                list(FULL_REFERENCE_LEARNED_METRICS)
+                if include_full_reference_metrics
+                else []
+            ),
+        },
+        "no_reference": {
+            "enabled": include_no_reference_metrics,
+            "metrics": (
+                list(NO_REFERENCE_METRICS)
+                if include_no_reference_metrics
+                else []
+            ),
+        },
+    }
     return result

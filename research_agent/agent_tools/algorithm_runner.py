@@ -22,7 +22,7 @@ class AlgorithmRunnerTool(ResearchTool):
             name="run_approved_tensor_algorithm",
             description=(
                 "按 approved manifest 加载已晋升的张量算法，使用固定 Trainer "
-                "在全部观测像素上重新拟合，并进行一次最终评估。"
+                "在全部观测像素上重新拟合，并用缺失区 GT 选择最佳输出。"
             ),
         )
 
@@ -31,16 +31,23 @@ class AlgorithmRunnerTool(ResearchTool):
             ToolParameter(name="approved_dir", type="string", description="已晋升算法版本目录"),
             ToolParameter(name="corrupted_path", type="string", description="缺失图像路径"),
             ToolParameter(name="mask_path", type="string", description="观测 mask 路径"),
-            ToolParameter(name="ground_truth_path", type="string", description="仅供最终评估的真值路径"),
+            ToolParameter(name="ground_truth_path", type="string", description="用于缺失区选择与评估的真值路径"),
             ToolParameter(name="output_dir", type="string", description="本次运行输出目录"),
             ToolParameter(name="seed", type="integer", description="随机种子", required=False, default=42),
             ToolParameter(name="device", type="string", description="auto、cpu 或 cuda", required=False, default="auto"),
             ToolParameter(
-                name="learned_metrics",
+                name="full_reference_metrics",
                 type="boolean",
-                description="是否计算 LPIPS/MANIQA/CLIP-IQA/MUSIQ",
+                description="是否计算全参考 LPIPS；PSNR/SSIM 始终计算",
                 required=False,
                 default=True,
+            ),
+            ToolParameter(
+                name="no_reference_metrics",
+                type="boolean",
+                description="是否计算 MANIQA/CLIP-IQA/MUSIQ",
+                required=False,
+                default=False,
             ),
         ]
 
@@ -67,13 +74,13 @@ class AlgorithmRunnerTool(ResearchTool):
             training = TrainingConfig(
                 learning_rate=float(best["learning_rate"]),
                 max_steps=max(1, int(best["selected_steps"])),
-                validation_observed_ratio=0.1,
                 validation_interval=max(1, int(best["selected_steps"])),
                 early_stopping_patience=1,
                 device=str(parameters.get("device", "auto")),
             )
             selected_trial = {
                 "hyperparameters": best["hyperparameters"],
+                "learning_rate": float(best["learning_rate"]),
                 "best_step": int(best["selected_steps"]),
                 "best_validation_mse": 0.0,
                 "runtime_seconds": 0.0,
@@ -88,8 +95,11 @@ class AlgorithmRunnerTool(ResearchTool):
                 training_config=training,
                 seed=int(parameters.get("seed", 42)),
                 output_dir=_required_string(parameters, "output_dir"),
-                include_learned_metrics=bool(
-                    parameters.get("learned_metrics", True)
+                include_full_reference_metrics=bool(
+                    parameters.get("full_reference_metrics", True)
+                ),
+                include_no_reference_metrics=bool(
+                    parameters.get("no_reference_metrics", False)
                 ),
             )
             return ToolResponse.success(

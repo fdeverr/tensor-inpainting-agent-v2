@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 
+from .cli_options import add_optional_evaluation
+
 from .core.day2_pipeline import run_day2_experiment
 from .core.models import get_default_hyperparameters
 from .schemas import Day2ExperimentConfig, TrainingConfig
@@ -29,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
             "hierarchical_tucker",
             "tt",
             "tensor_ring",
+            "siren",
         ),
         required=True,
     )
@@ -38,10 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--skip-learned-metrics", action="store_true")
+    add_optional_evaluation(parser, "full-reference-metrics")
+    add_optional_evaluation(parser, "no-reference-metrics")
     parser.add_argument("--learning-rate", type=float, default=0.03)
     parser.add_argument("--max-steps", type=int, default=500)
-    parser.add_argument("--validation-ratio", type=float, default=0.1)
     parser.add_argument("--validation-interval", type=int, default=10)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--rank", type=int)
@@ -98,7 +101,6 @@ def main() -> None:
     training = TrainingConfig(
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
-        validation_observed_ratio=args.validation_ratio,
         validation_interval=args.validation_interval,
         early_stopping_patience=args.patience,
         device=args.device,
@@ -114,7 +116,8 @@ def main() -> None:
         seed=args.seed,
         image_size=args.image_size or None,
         mat_key=args.mat_key,
-        learned_metrics=not args.skip_learned_metrics,
+        full_reference_metrics=args.full_reference_metrics,
+        no_reference_metrics=args.no_reference_metrics,
     )
     result = run_day2_experiment(config)
     interpolation = result["interpolation"]
@@ -129,6 +132,18 @@ def main() -> None:
     tensor_psnr_text = (
         "infinite (perfect)" if tensor_psnr is None else "%.4f dB" % tensor_psnr
     )
+    interpolation_full_psnr = interpolation["full_psnr"]
+    tensor_full_psnr = tensor_model["full_psnr"]
+    interpolation_full_psnr_text = (
+        "infinite (perfect)"
+        if interpolation_full_psnr is None
+        else "%.4f dB" % interpolation_full_psnr
+    )
+    tensor_full_psnr_text = (
+        "infinite (perfect)"
+        if tensor_full_psnr is None
+        else "%.4f dB" % tensor_full_psnr
+    )
 
     print("Day 2 tensor experiment completed")
     print("  run_id: %s" % result["run_id"])
@@ -136,8 +151,10 @@ def main() -> None:
     print("  device: %s" % result["final_fit"]["device"])
     print("  selected_step: %d" % result["selection"]["best_step"])
     print("  final_fit_observed_pixels: %d" % result["final_fit"]["observed_pixels_used"])
-    print("  interpolation_psnr: %s" % interpolation_psnr_text)
-    print("  tensor_model_psnr: %s" % tensor_psnr_text)
+    print("  interpolation_missing_psnr: %s" % interpolation_psnr_text)
+    print("  tensor_model_missing_psnr: %s" % tensor_psnr_text)
+    print("  interpolation_full_psnr: %s" % interpolation_full_psnr_text)
+    print("  tensor_model_full_psnr: %s" % tensor_full_psnr_text)
     print("  tensor_model_ssim: %.6f" % tensor_model["composite_ssim"])
     for key in ("lpips", "maniqa", "clip_iqa", "musiq"):
         value = tensor_model.get(key)

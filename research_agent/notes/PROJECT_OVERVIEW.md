@@ -9,11 +9,11 @@
 | Day | 主题 | 核心能力 | 关键文件 |
 |---|---|---|---|
 | 1 | 可信实验基线 | GT 分离、mask 语义统一、seed 复现、只评缺失区、唯一 run ID | `run_day1.py`、`core/{data,masks,metrics,interpolation}.py` |
-| 2 | 张量模型与训练 | Matrix/CP/Tucker 统一 `forward/loss_terms`；train/val 选步数 → 全量重训 | `core/models/*`、`core/trainer.py` |
+| 2 | 张量模型与训练 | Matrix/CP/Tucker 统一 `forward/loss_terms`；全部可见像素训练 + 缺失区 GT 选步数 | `core/models/*`、`core/trainer.py` |
 | 3 | 变成 Agent 工具 | Tool 边界、Registry、ToolResponse、确定性状态机、TraceLogger | `agent_tools/*`、`workflow.py` |
-| 4 | 检索增强方法选择 | ImageProfile、本地知识库、Pydantic MethodPlan、LLM+规则 fallback | `workflow_day4.py`、`method_selector.py`、`knowledge/` |
+| 4 | 检索增强方法选择 | ImageProfile、视觉/规则候选召回、跨家族数值预赛、SIREN 基线 | `workflow_day4.py`、`method_selector.py`、`knowledge/` |
 | 5 | 候选生成与验证 | schema 约束、LLM/确定性模板、AST 静态 + 独立进程 smoke | `candidate/{schemas,generator,validator,smoke_runner}.py` |
-| 6 | 公平实验与晋升 | 成对配置、GT 隔离、确定性 Judge、晋升/改进闭环 | `workflow_day6.py`、`core/{fair_experiment,experiment_judge}.py` |
+| 6 | 公平实验与晋升 | 成对配置、缺失区 GT 直接选择、确定性 Judge、晋升/改进闭环 | `workflow_day6.py`、`core/{fair_experiment,experiment_judge}.py` |
 | 7 | 端到端交付 | 组合子工作流、统一入口、标准化报告、benchmark | `workflow_full.py`、`run.py`、`reporting.py`、`benchmark.py` |
 
 **演进逻辑**：先建立可信的数据/评估协议（1–2）→ 封装成 Agent 可调用的工具（3）→ 逐步引入 LLM 决策（4 选方法、5 造候选、6 验候选）→ 组装成可交付项目（7）。
@@ -26,10 +26,11 @@
 run.py（Day 7 顶层 FullResearchWorkflow）
   │
   ├─ 阶段1 方法选择（Day 4）
-  │     analyze_image：完整图 → 自动造 mask/corrupted，GT 藏到 evaluation_ground_truth.png
+  │     analyze_image：完整图 → 自动造 mask/corrupted，GT 以内部 NPY 供选择与评估
   │     run_interpolation：最近邻插值基线
-  │     knowledge/ 检索 + MethodSelector（LLM/规则）→ MethodPlan → 选 Matrix/CP/Tucker
-  │     train：训练基础张量模型
+  │     knowledge/ + 可选前置视觉 → 候选分解短名单
+  │     缺失区 GT 同预算数值预赛 → 选定张量家族与秩范围
+  │     train：训练基础张量模型 + 独立 SIREN 对比基线
   │
   ├─ 阶段2 候选生成（Day 5）
   │     load_improver_context：读 Day4 上下文（不给 GT）
@@ -37,13 +38,13 @@ run.py（Day 7 顶层 FullResearchWorkflow）
   │     CandidateValidator：AST 静态检查 → 独立进程 smoke test
   │
   ├─ 阶段3 公平实验（Day 6，候选验证通过才跑）
-  │     paired_trial_configurations：基线与候选成对配置（共享参数一致）
-  │     tune：GT 隔离调参 → final_fit_and_evaluate：GT 首次进入，算 PSNR/SSIM
+  │     independent_trial_configurations：基线与候选在同一上限内独立调优
+  │     tune：缺失区 GT 选结构/学习率/checkpoint → final_fit_and_evaluate：输出最佳结果
   │     judge_candidate：确定性门禁 → 接受则晋升 / 拒绝则带反馈改进（≤2 轮）
   │
   └─ 汇总
-        build_method_results：标准化所有方法
-        → 在 eligible 方法中选 Missing PSNR 最高者
+        build_method_results：标准化插值 / SIREN / 张量 / 进化候选
+        → 在 eligible 方法中选 Missing-region PSNR 最高者
         → 复制 best_completion.png + 生成 report.md
 ```
 
@@ -56,11 +57,11 @@ research_agent/
 ├── core/               # 无 LLM 的可信内核
 │   ├── data.py         #   图片读写、mask 应用
 │   ├── masks.py        #   自动生成 mask（random/block）
-│   ├── metrics.py      #   缺失区 PSNR/SSIM
+│   ├── metrics.py      #   缺失区主 PSNR、最终展示用全图 PSNR 与 SSIM
 │   ├── interpolation.py#   最近邻插值基线
 │   ├── models/         #   Matrix/CP/Tucker 统一模型 + registry
 │   ├── trainer.py      #   固定 Trainer（train/val 选步数 + 全量重训 + ModelBuilder）
-│   ├── fair_experiment.py  # Day6 成对配置、GT 隔离调参、最终评估
+│   ├── fair_experiment.py  # Day6 成对配置、GT 选优、最佳 checkpoint 直接评估
 │   └── experiment_judge.py # Day6 确定性晋升门禁 + 结构化反馈
 ├── agent_tools/        # Day3 把内核封装成 Tensor Inpainting Agent Framework 工具
 ├── candidate/          # Day5/6 候选：schema、generator、validator、loader、晋升 registry
@@ -84,7 +85,7 @@ LLM 负责选择、解释、提 hypothesis、生成受约束代码；程序负�
 `schema 约束 → AST 策略检查 → 独立进程 smoke test → 代码哈希门控 → 固定 Trainer`。每道门解决不同风险（字段合法 / 无危险 import/call / 能训练 / 未被篡改 / 不越权）。
 
 **3. 公平、无泄漏的实验协议**
-基线与候选成对配置、预算一致；隐藏区域 GT 只在最终评估出现一次；候选是否成功只能由确定性 Judge 宣布（LLM 不当裁判）。
+基线与候选使用同一预算协议；梯度只来自全部可见像素，隐藏区域 GT 直接选择超参数与 checkpoint；候选是否晋级仍只由确定性 Judge 宣布。
 
 **4. 正确处理失败与证据边界**
 候选失败时保存反馈并有限迭代（≤2 轮）；晋升后仍与强插值基线比较；单图结果不包装成 SOTA。
@@ -93,7 +94,7 @@ LLM 负责选择、解释、提 hypothesis、生成受约束代码；程序负�
 
 ## 五、面试高频问题速答
 
-1. **为什么不用缺失区域 GT 调参？** 因为 agent 会「偷看标准答案」过拟合评测样本。正确做法：调参只在观测像素内部的 train/val split 上进行，GT 只在最后评估出现一次。
+1. **为什么现在直接用缺失区 GT 调参？** 当前目标是把每张图当作一个独立优化任务，输出已搜索方案中该图效果最好的结果。代价是这个分数属于 oracle/development 分数，不能当作未见数据的无偏测试结果。
 
 2. **为什么不让 LLM 生成整个训练脚本？** 自由生成会重复已验证逻辑、易踩 shape/初始化错误，且无法执行权限边界。改为：候选继承已选基类、只覆盖允许改动，配合 AST + smoke + 哈希门控。
 
@@ -109,7 +110,7 @@ LLM 负责选择、解释、提 hypothesis、生成受约束代码；程序负�
 
 | 术语 | 含义 |
 |---|---|
-| GT（Ground Truth） | 完整图，藏于 `evaluation_ground_truth.png`，只在最终评估使用 |
+| GT（Ground Truth） | 完整图，以内部 NPY 供缺失区选择与最终评估，不把原始张量内容交给 LLM |
 | mask | `True`=观测可见，`False`=缺失待修 |
 | corrupted | 缺损图（mask 应用到 GT 得到） |
 | ImageProfile | 只由可见像素算出的图像画像（不泄漏 GT） |

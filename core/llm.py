@@ -21,8 +21,13 @@ class TensorInpaintingLLM:
 
     支持的接口：
     - OpenAI及所有兼容接口（DeepSeek、Qwen、Kimi、智谱、Ollama等）
+    - OpenAI Responses API（设置 LLM_API_STYLE=responses）
     - Anthropic Claude
     - Google Gemini
+
+    OpenAI 接口风格：
+    - chat（默认）：/v1/chat/completions，兼容所有第三方 OpenAI 格式服务
+    - responses：/v1/responses，仅 OpenAI 官方及少数厂商支持
     """
 
     def __init__(
@@ -33,6 +38,7 @@ class TensorInpaintingLLM:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         timeout: Optional[int] = None,
+        api_style: Optional[str] = None,
         **kwargs
     ):
         """
@@ -47,12 +53,15 @@ class TensorInpaintingLLM:
             temperature: 温度参数，默认0.7
             max_tokens: 最大token数
             timeout: 超时时间（秒），默认从 LLM_TIMEOUT 读取，默认60秒
+            api_style: OpenAI 接口风格，"chat"（默认）或 "responses"，
+                默认从 LLM_API_STYLE 读取。仅对 OpenAI 系接口生效
         """
         # 加载配置
         self.model = model or os.getenv("LLM_MODEL_ID")
         self.api_key = api_key or os.getenv("LLM_API_KEY")
         self.base_url = base_url or os.getenv("LLM_BASE_URL")
         self.timeout = timeout or int(os.getenv("LLM_TIMEOUT", "60"))
+        self.api_style = api_style or os.getenv("LLM_API_STYLE")
 
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -71,7 +80,8 @@ class TensorInpaintingLLM:
             api_key=self.api_key,
             base_url=self.base_url,
             timeout=self.timeout,
-            model=self.model
+            model=self.model,
+            api_style=self.api_style
         )
 
         # 最后一次调用的统计信息（用于流式调用）
@@ -92,6 +102,7 @@ class TensorInpaintingLLM:
         Note:
             流式调用结束后，可通过 llm.last_call_stats 获取统计信息
         """
+        self.last_call_stats = None
         print(f"🧠 正在调用 {self.model} 模型...")
 
         # 准备参数
@@ -160,6 +171,7 @@ class TensorInpaintingLLM:
         Note:
             流式调用结束后，可通过 llm.last_call_stats 获取统计信息
         """
+        self.last_call_stats = None
         temperature = kwargs.pop("temperature", None)
 
         # 准备参数
@@ -258,6 +270,7 @@ class TensorInpaintingLLM:
             async for chunk in llm.astream_invoke(messages):
                 print(chunk, end="", flush=True)
         """
+        self.last_call_stats = None
         # 使用 adapter 的异步流式方法
         async for chunk in self._adapter.astream_invoke(messages, **kwargs):
             yield chunk

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 
+from .cli_options import add_optional_evaluation
+
 from .core.pipeline import run_day1_baseline
 from .schemas import ExperimentConfig
 
@@ -33,7 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resize the largest side to this value; use 0 to keep source size",
     )
     parser.add_argument("--missing-fill-value", type=float, default=0.0)
-    parser.add_argument("--skip-learned-metrics", action="store_true")
+    add_optional_evaluation(parser, "full-reference-metrics")
+    add_optional_evaluation(parser, "no-reference-metrics")
     return parser
 
 
@@ -48,20 +51,33 @@ def main() -> None:
         image_size=args.image_size or None,
         mat_key=args.mat_key,
         missing_fill_value=args.missing_fill_value,
-        learned_metrics=not args.skip_learned_metrics,
+        full_reference_metrics=args.full_reference_metrics,
+        no_reference_metrics=args.no_reference_metrics,
     )
     result = run_day1_baseline(config)
 
-    psnr_text = "infinite (perfect)" if result.missing_psnr is None else "%.4f dB" % result.missing_psnr
+    missing_psnr_text = (
+        "infinite (perfect)"
+        if result.missing_psnr is None
+        else "%.4f dB" % result.missing_psnr
+    )
+    full_psnr_text = (
+        "infinite (perfect)"
+        if result.full_psnr is None
+        else "%.4f dB" % result.full_psnr
+    )
     print("Day 1 interpolation baseline completed")
     print("  run_id: %s" % result.run_id)
     print("  actual_missing_rate: %.4f" % result.actual_missing_rate)
-    print("  missing_region_psnr: %s" % psnr_text)
+    print("  missing_region_psnr: %s" % missing_psnr_text)
+    print("  full_image_psnr: %s" % full_psnr_text)
     print("  composite_ssim: %.6f" % result.composite_ssim)
-    print("  lpips: %s" % ("N/A" if result.lpips is None else "%.6f" % result.lpips))
-    print("  maniqa: %s" % ("N/A" if result.maniqa is None else "%.6f" % result.maniqa))
-    print("  clip_iqa: %s" % ("N/A" if result.clip_iqa is None else "%.6f" % result.clip_iqa))
-    print("  musiq: %s" % ("N/A" if result.musiq is None else "%.6f" % result.musiq))
+    if args.full_reference_metrics:
+        print("  lpips: %s" % ("N/A" if result.lpips is None else "%.6f" % result.lpips))
+    if args.no_reference_metrics:
+        print("  maniqa: %s" % ("N/A" if result.maniqa is None else "%.6f" % result.maniqa))
+        print("  clip_iqa: %s" % ("N/A" if result.clip_iqa is None else "%.6f" % result.clip_iqa))
+        print("  musiq: %s" % ("N/A" if result.musiq is None else "%.6f" % result.musiq))
     print("  artifacts: %s" % result.artifacts["metrics"])
 
 

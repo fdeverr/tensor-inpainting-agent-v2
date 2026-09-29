@@ -22,8 +22,10 @@ def judge_candidate(
 ) -> Dict[str, Any]:
     """Apply the fixed promotion gate; the LLM never decides acceptance."""
 
-    baseline_psnr = baseline_final["metrics"]["missing_psnr"]
-    candidate_psnr = candidate_final["metrics"]["missing_psnr"]
+    baseline_metrics = baseline_final["metrics"]
+    candidate_metrics = candidate_final["metrics"]
+    baseline_psnr = baseline_metrics.get("missing_psnr")
+    candidate_psnr = candidate_metrics.get("missing_psnr")
     psnr_delta = (
         None
         if baseline_psnr is None or candidate_psnr is None
@@ -32,6 +34,16 @@ def judge_candidate(
     ssim_delta = float(
         candidate_final["metrics"]["composite_ssim"]
         - baseline_final["metrics"]["composite_ssim"]
+    )
+    baseline_lpips = baseline_metrics.get("lpips")
+    candidate_lpips = candidate_metrics.get("lpips")
+    lpips_delta = (
+        float(candidate_lpips - baseline_lpips)
+        if isinstance(baseline_lpips, (int, float))
+        and isinstance(candidate_lpips, (int, float))
+        and math.isfinite(float(baseline_lpips))
+        and math.isfinite(float(candidate_lpips))
+        else None
     )
     baseline_runtime = _total_runtime(baseline_tuning, baseline_final)
     candidate_runtime = _total_runtime(candidate_tuning, candidate_final)
@@ -42,9 +54,6 @@ def judge_candidate(
         failures.append("missing-region PSNR improvement is below the promotion threshold")
     if ssim_delta < -ssim_tolerance:
         failures.append("composite SSIM regression exceeds the allowed tolerance")
-    if baseline_tuning["trial_count"] != candidate_tuning["trial_count"]:
-        failures.append("baseline and candidate received unequal tuning trial counts")
-
     selected_candidate = candidate_tuning["best"]["hyperparameters"]
     selected_weight = selected_candidate.get("tv_weight")
     baseline_best = baseline_tuning["best"]
@@ -55,25 +64,25 @@ def judge_candidate(
     candidate_last_step = (
         candidate_best["history"][-1]["step"] if candidate_best.get("history") else None
     )
-    baseline_final_total_loss = baseline_final.get("final_total_loss")
-    candidate_final_total_loss = candidate_final.get("final_total_loss")
-    candidate_final_train_mse = candidate_final.get("final_train_mse")
-    final_fit_diverged = (
-        isinstance(candidate_final_total_loss, (int, float))
-        and math.isfinite(float(candidate_final_total_loss))
+    baseline_selected_total_loss = baseline_final.get("final_total_loss")
+    candidate_selected_total_loss = candidate_final.get("final_total_loss")
+    candidate_selected_train_mse = candidate_final.get("final_train_mse")
+    selected_checkpoint_unstable = (
+        isinstance(candidate_selected_total_loss, (int, float))
+        and math.isfinite(float(candidate_selected_total_loss))
         and (
-            float(candidate_final_total_loss) > 1.0
+            float(candidate_selected_total_loss) > 1.0
             or (
-                isinstance(baseline_final_total_loss, (int, float))
-                and math.isfinite(float(baseline_final_total_loss))
-                and float(candidate_final_total_loss)
-                > max(0.1, 100.0 * float(baseline_final_total_loss))
+                isinstance(baseline_selected_total_loss, (int, float))
+                and math.isfinite(float(baseline_selected_total_loss))
+                and float(candidate_selected_total_loss)
+                > max(0.1, 100.0 * float(baseline_selected_total_loss))
             )
         )
     )
-    if final_fit_diverged:
+    if selected_checkpoint_unstable:
         failures.append(
-            "candidate final all-observation refit became numerically unstable"
+            "candidate selected checkpoint has a numerically unstable training loss"
         )
     accepted = not failures
     suspected_causes = []
@@ -82,14 +91,16 @@ def judge_candidate(
         constraints.extend(
             [
                 (
-                    "Keep the same trial count, seed, split, device, optimizer, and "
-                    "judge thresholds; any revised LLM-requested training budget must "
-                    "still be shared by baseline and candidate and stay under the user ceiling."
+                    "Keep the same GT-selection scope, seed, per-trial training protocol, "
+                    "learning-rate search policy, device, optimizer, and judge thresholds. "
+                    "Each model may independently exhaust its own bounded structure "
+                    "space. The run-wide fair training budget is frozen after round one "
+                    "so an already trained incumbent can be reused."
                 ),
                 (
-                    "Do not expose ground-truth tensor contents to generation, tuning, or "
-                    "checkpoint selection; later evolution rounds may use only persisted "
-                    "aggregate evaluation results."
+                    "Do not expose raw ground-truth tensor contents to candidate generation; "
+                    "training tools may use missing-region GT scores for checkpoint selection, "
+                    "and evolution rounds may use persisted aggregate comparison results."
                 ),
             ]
         )
@@ -109,11 +120,10 @@ def judge_candidate(
         suspected_causes.append(
             "The candidate reduced structural similarity, consistent with excessive smoothing or rank mismatch."
         )
-    if not accepted and final_fit_diverged:
+    if not accepted and selected_checkpoint_unstable:
         suspected_causes.append(
-            "The candidate's final all-observation refit became unstable: its total "
-            "training loss was far above the baseline even though validation-time "
-            "data loss had appeared reasonable. A residual branch, regularizer, "
+            "The candidate's GT-selected checkpoint has an unstable total training "
+            "loss relative to the baseline. A residual branch, regularizer, "
             "normalization, initialization, or learning-rate interaction likely diverged."
         )
         constraints.append(
@@ -131,7 +141,8 @@ def judge_candidate(
             "The candidate's best checkpoint was the final budgeted step, so optimization may be unfinished."
         )
         constraints.append(
-            "Request a longer shared training budget in the next proposal if the user ceiling permits it."
+            "Treat the unfinished optimization as evidence for a future run-wide budget change; "
+            "do not change the frozen protocol inside the current evolution run."
         )
     if not accepted and not suspected_causes:
         suspected_causes.append(
@@ -142,7 +153,14 @@ def judge_candidate(
         "decision": "accept" if accepted else "reject",
         "accepted": accepted,
         "psnr_delta": psnr_delta,
+        "psnr_metric": "missing_psnr",
         "ssim_delta": ssim_delta,
+        "lpips_delta": lpips_delta,
+        "lpips_delta_interpretation": (
+            "candidate_minus_incumbent; lower_is_better"
+            if lpips_delta is not None
+            else "unavailable"
+        ),
         "runtime_ratio": runtime_ratio,
         "thresholds": {
             "minimum_psnr_delta": minimum_psnr_delta,
@@ -163,15 +181,19 @@ def judge_candidate(
                 candidate_last_step is not None
                 and candidate_best["best_step"] == candidate_last_step
             ),
-            "baseline_final_train_mse": baseline_final.get("final_train_mse"),
-            "candidate_final_train_mse": candidate_final_train_mse,
-            "baseline_final_total_loss": baseline_final_total_loss,
-            "candidate_final_total_loss": candidate_final_total_loss,
-            "candidate_final_fit_diverged": final_fit_diverged,
+            "baseline_selected_train_mse": baseline_final.get("final_train_mse"),
+            "candidate_selected_train_mse": candidate_selected_train_mse,
+            "baseline_selected_total_loss": baseline_selected_total_loss,
+            "candidate_selected_total_loss": candidate_selected_total_loss,
+            "candidate_selected_checkpoint_unstable": selected_checkpoint_unstable,
         },
         "suspected_causes": suspected_causes,
         "next_round_constraints": constraints,
         "budget_audit": {
+            "trial_count_policy": (
+                "independent model-specific tuning up to the configured per-model limit"
+            ),
+            "trial_count_equality_required": False,
             "baseline_trial_count": baseline_tuning["trial_count"],
             "candidate_trial_count": candidate_tuning["trial_count"],
             "baseline_total_runtime_seconds": baseline_runtime,

@@ -1,5 +1,6 @@
 """LLM适配器 - 支持OpenAI、Anthropic、Gemini等不同接口格式"""
 
+import os
 import time
 import asyncio
 import json
@@ -82,12 +83,15 @@ class BaseLLMAdapter(ABC):
 
 
 class OpenAIAdapter(BaseLLMAdapter):
-    """OpenAI兼容接口适配器（默认）
+    """OpenAI Chat Completions 适配器（/v1/chat/completions，默认）
 
     支持：
     - OpenAI官方API
     - 所有OpenAI兼容接口（DeepSeek、Qwen、Kimi、智谱等）
     - Thinking Models（o1、deepseek-reasoner等）
+
+    若需要 OpenAI 官方新的 Responses API，请改用 OpenAIResponsesAdapter
+    （设置 LLM_API_STYLE=responses）。
     """
 
     def create_client(self) -> Any:
@@ -324,6 +328,451 @@ class OpenAIAdapter(BaseLLMAdapter):
 
         except Exception as e:
             raise TensorInpaintingException(f"OpenAI Function Calling调用失败: {str(e)}")
+
+
+class OpenAIResponsesAdapter(BaseLLMAdapter):
+    """OpenAI Responses API 适配器（/v1/responses）
+
+    与 OpenAIAdapter（Chat Completions）的关键差异：
+    - 端点：responses.create 而非 chat.completions.create
+    - system 消息通过顶层 instructions 参数传入，不放进 input 列表
+    - 消息放在 input 中；工具调用与结果用 function_call / function_call_output 条目表达
+    - 工具 schema 为扁平结构（name/description/parameters 与 type 同级，无 function 包裹）
+    - 上限参数为 max_output_tokens，需要与 max_tokens 互相映射
+    - 多模态图片块为 input_image，image_url 直接是字符串
+
+    注意：/v1/responses 目前主要由 OpenAI 官方提供。DeepSeek、Qwen、Kimi、
+    智谱、Ollama 等兼容接口只有 /v1/chat/completions，请继续使用 OpenAIAdapter。
+    """
+
+    def create_client(self) -> Any:
+        """创建OpenAI客户端"""
+        from openai import OpenAI
+
+        return OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.timeout
+        )
+
+    def create_async_client(self) -> Any:
+        """创建OpenAI异步客户端"""
+        from openai import AsyncOpenAI
+
+        return AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.timeout
+        )
+
+    # ==================== 请求格式转换 ====================
+
+    @classmethod
+    def _convert_content(cls, content: Any) -> Any:
+        """将 Chat Completions 风格的多模态内容块转换为 Responses 风格
+
+        - {"type": "text", "text": ...}            -> {"type": "input_text", "text": ...}
+        - {"type": "image_url", "image_url": {...}} -> {"type": "input_image", "image_url": "..."}
+        """
+        if not isinstance(content, list):
+            return content
+
+        converted = []
+        for block in content:
+            if not isinstance(block, dict):
+                converted.append(block)
+                continue
+
+            block_type = block.get("type")
+            if block_type == "text":
+                converted.append({"type": "input_text", "text": block.get("text", "")})
+            elif block_type == "image_url":
+                image_url = block.get("image_url")
+                if isinstance(image_url, dict):
+                    url = image_url.get("url")
+                    detail = image_url.get("detail")
+                else:
+                    url, detail = image_url, None
+
+                item = {"type": "input_image", "image_url": url}
+                if detail:
+                    item["detail"] = detail
+                converted.append(item)
+            else:
+                converted.append(block)
+
+        return converted
+
+    def _convert_messages(self, messages: List[Dict]) -> tuple[Optional[str], List[Dict]]:
+        """将统一消息格式转换为 Responses 的 (instructions, input) 结构"""
+        instructions_parts = []
+        input_items = []
+
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+
+            if role == "system":
+                if content:
+                    instructions_parts.append(content)
+            elif role == "tool":
+                # 工具执行结果 -> function_call_output 条目
+                if isinstance(content, str):
+                    output = content
+                else:
+                    output = json.dumps(content, ensure_ascii=False)
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": msg.get("tool_call_id"),
+                    "output": output,
+                })
+            elif role == "assistant" and msg.get("responses_output"):
+                # 原始条目已经包含文本与 function_call，不能再次重建以免重复。
+                input_items.extend(msg["responses_output"])
+            elif role == "assistant" and msg.get("tool_calls"):
+                # 助手文本 + 工具调用 -> 文本消息条目 + 若干 function_call 条目
+                if content:
+                    input_items.append({
+                        "role": "assistant",
+                        "content": self._convert_content(content),
+                    })
+                for tool_call in msg["tool_calls"]:
+                    function = tool_call.get("function", {})
+                    arguments = function.get("arguments", "")
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments, ensure_ascii=False)
+                    input_items.append({
+                        "type": "function_call",
+                        "call_id": tool_call.get("id"),
+                        "name": function.get("name"),
+                        "arguments": arguments,
+                    })
+            else:
+                input_items.append({
+                    "role": role,
+                    "content": self._convert_content(content) if content is not None else "",
+                })
+
+        instructions = "\n\n".join(instructions_parts) if instructions_parts else None
+        return instructions, input_items
+
+    @staticmethod
+    def _convert_tools(tools: List[Dict]) -> List[Dict]:
+        """将统一（Chat Completions）工具 schema 转换为 Responses 扁平 schema"""
+        converted = []
+        for tool in tools:
+            if tool.get("type") == "function" and "function" in tool:
+                function = tool["function"]
+                entry = {
+                    "type": "function",
+                    "name": function["name"],
+                    "description": function.get("description", ""),
+                    "parameters": function.get("parameters") or {
+                        "type": "object",
+                        "properties": {},
+                    },
+                }
+                if function.get("strict") is not None:
+                    entry["strict"] = function["strict"]
+                converted.append(entry)
+            else:
+                converted.append(tool)
+        return converted
+
+    @staticmethod
+    def _convert_tool_choice(tool_choice: Any) -> Any:
+        """将 Chat Completions 风格的 tool_choice 转换为 Responses 风格"""
+        if isinstance(tool_choice, dict):
+            function = tool_choice.get("function")
+            if function and function.get("name"):
+                return {"type": "function", "name": function["name"]}
+            if tool_choice.get("name"):
+                return tool_choice
+        return tool_choice
+
+    @staticmethod
+    def _prune_none(params: Dict) -> Dict:
+        """剔除值为 None 的参数，避免向接口发送显式 null"""
+        return {key: value for key, value in params.items() if value is not None}
+
+    def _build_request(self, messages: List[Dict], **kwargs) -> Dict:
+        """构建 responses.create 的请求参数"""
+        instructions, input_items = self._convert_messages(messages)
+
+        # max_tokens 与 max_output_tokens 互认，统一落到 max_output_tokens
+        max_tokens = kwargs.pop("max_tokens", None)
+        if max_tokens is None:
+            max_tokens = kwargs.pop("max_output_tokens", None)
+        else:
+            kwargs.pop("max_output_tokens", None)
+
+        request = {"model": self.model, "input": input_items, **self._prune_none(kwargs)}
+        if instructions:
+            request["instructions"] = instructions
+        if max_tokens is not None:
+            request["max_output_tokens"] = max_tokens
+
+        return request
+
+    # ==================== 响应解析 ====================
+
+    @staticmethod
+    def _check_response_status(response: Any, status: Optional[str] = None) -> None:
+        """失败或不完整的输出不可作为成功结果交给上层。"""
+        status = status or getattr(response, "status", None)
+        if status is None or status == "completed":
+            return
+        error = getattr(response, "error", None)
+        details = getattr(response, "incomplete_details", None)
+        reason = (
+            getattr(error, "message", None)
+            or getattr(details, "reason", None)
+            or getattr(error, "code", None)
+            or status
+        )
+        raise TensorInpaintingException(f"Responses 状态 {status}: {reason}")
+
+    @classmethod
+    def _check_stream_event(cls, event: Any) -> None:
+        event_type = getattr(event, "type", None)
+        if event_type in ("response.failed", "response.incomplete", "response.cancelled"):
+            cls._check_response_status(getattr(event, "response", None), event_type.split(".")[1])
+        elif event_type == "error":
+            raise TensorInpaintingException(
+                f"Responses 流错误: {getattr(event, 'message', None) or getattr(event, 'code', 'unknown')}"
+            )
+
+    @staticmethod
+    def _serialize_output(response: Any) -> List[Dict]:
+        """保留所有原始字段，包括 reasoning、加密状态和 assistant phase。"""
+        def serialize(item):
+            if hasattr(item, "model_dump"):
+                return item.model_dump(mode="json", exclude_none=True)
+            return vars(item)
+
+        return json.loads(json.dumps(getattr(response, "output", None) or [], default=serialize))
+
+    @staticmethod
+    def _extract_usage(usage: Any) -> Dict[str, int]:
+        """Responses 的 usage 字段名与 Chat Completions 不同，统一映射"""
+        if not usage:
+            return {}
+        return {
+            "prompt_tokens": getattr(usage, "input_tokens", 0) or 0,
+            "completion_tokens": getattr(usage, "output_tokens", 0) or 0,
+            "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+        }
+
+    @staticmethod
+    def _item_text(item: Any) -> Optional[str]:
+        """兼容对象/字典两种形态的取值"""
+        if isinstance(item, dict):
+            return item.get("text")
+        return getattr(item, "text", None)
+
+    @classmethod
+    def _extract_output(cls, response: Any) -> tuple[str, List[ToolCall], Optional[str]]:
+        """从 Responses 结果中解析文本、工具调用与推理摘要"""
+        content_parts = []
+        tool_calls = []
+        reasoning_parts = []
+
+        for item in getattr(response, "output", None) or []:
+            item_type = getattr(item, "type", None)
+
+            if item_type == "message":
+                for part in getattr(item, "content", None) or []:
+                    if getattr(part, "type", None) == "output_text":
+                        text = cls._item_text(part)
+                        if text:
+                            content_parts.append(text)
+            elif item_type == "function_call":
+                tool_calls.append(ToolCall(
+                    id=getattr(item, "call_id", None) or getattr(item, "id", "") or "",
+                    name=getattr(item, "name", "") or "",
+                    arguments=getattr(item, "arguments", "") or "",
+                ))
+            elif item_type == "reasoning":
+                for summary in getattr(item, "summary", None) or []:
+                    text = cls._item_text(summary)
+                    if text:
+                        reasoning_parts.append(text)
+
+        content = "".join(content_parts)
+        if not content:
+            content = getattr(response, "output_text", None) or ""
+
+        reasoning_content = "\n".join(reasoning_parts) if reasoning_parts else None
+        return content, tool_calls, reasoning_content
+
+    # ==================== 调用实现 ====================
+
+    def invoke(self, messages: List[Dict], **kwargs) -> LLMResponse:
+        """非流式调用"""
+        if not self._client:
+            self._client = self.create_client()
+
+        start_time = time.time()
+
+        try:
+            response = self._client.responses.create(**self._build_request(messages, **kwargs))
+            self._check_response_status(response)
+            latency_ms = int((time.time() - start_time) * 1000)
+
+            content, _, reasoning_content = self._extract_output(response)
+
+            return LLMResponse(
+                content=content,
+                model=getattr(response, "model", None) or self.model,
+                usage=self._extract_usage(getattr(response, "usage", None)),
+                latency_ms=latency_ms,
+                reasoning_content=reasoning_content
+            )
+
+        except Exception as e:
+            raise TensorInpaintingException(f"OpenAI Responses API调用失败: {str(e)}")
+
+    def stream_invoke(self, messages: List[Dict], **kwargs) -> Iterator[str]:
+        """流式调用"""
+        self.last_stats = None
+        if not self._client:
+            self._client = self.create_client()
+
+        start_time = time.time()
+
+        stream = None
+        try:
+            stream = self._client.responses.create(**self._build_request(messages, stream=True, **kwargs))
+
+            reasoning_parts = []
+            usage = {}
+            finished = False
+
+            for event in stream:
+                self._check_stream_event(event)
+                event_type = getattr(event, "type", None)
+
+                if event_type == "response.output_text.delta":
+                    delta = getattr(event, "delta", None)
+                    if delta:
+                        yield delta
+                elif event_type == "response.reasoning_summary_text.delta":
+                    delta = getattr(event, "delta", None)
+                    if delta:
+                        reasoning_parts.append(delta)
+                elif event_type == "response.completed":
+                    completed = getattr(event, "response", None)
+                    self._check_response_status(completed)
+                    finished = True
+                    if completed is not None:
+                        usage = self._extract_usage(getattr(completed, "usage", None))
+
+            if not finished:
+                raise TensorInpaintingException("Responses 流提前结束，未收到 response.completed")
+            latency_ms = int((time.time() - start_time) * 1000)
+
+            self.last_stats = StreamStats(
+                model=self.model,
+                usage=usage,
+                latency_ms=latency_ms,
+                reasoning_content="".join(reasoning_parts) if reasoning_parts else None
+            )
+
+        except Exception as e:
+            raise TensorInpaintingException(f"OpenAI Responses API流式调用失败: {str(e)}")
+        finally:
+            if stream is not None and hasattr(stream, "close"):
+                stream.close()
+
+    async def astream_invoke(self, messages: List[Dict], **kwargs) -> AsyncIterator[str]:
+        """真正的异步流式调用（使用 OpenAI 原生异步客户端）"""
+        self.last_stats = None
+        if not self._async_client:
+            self._async_client = self.create_async_client()
+
+        start_time = time.time()
+
+        stream = None
+        try:
+            stream = await self._async_client.responses.create(
+                **self._build_request(messages, stream=True, **kwargs)
+            )
+
+            reasoning_parts = []
+            usage = {}
+            finished = False
+
+            async for event in stream:
+                self._check_stream_event(event)
+                event_type = getattr(event, "type", None)
+
+                if event_type == "response.output_text.delta":
+                    delta = getattr(event, "delta", None)
+                    if delta:
+                        yield delta
+                elif event_type == "response.reasoning_summary_text.delta":
+                    delta = getattr(event, "delta", None)
+                    if delta:
+                        reasoning_parts.append(delta)
+                elif event_type == "response.completed":
+                    completed = getattr(event, "response", None)
+                    self._check_response_status(completed)
+                    finished = True
+                    if completed is not None:
+                        usage = self._extract_usage(getattr(completed, "usage", None))
+
+            if not finished:
+                raise TensorInpaintingException("Responses 流提前结束，未收到 response.completed")
+            latency_ms = int((time.time() - start_time) * 1000)
+
+            self.last_stats = StreamStats(
+                model=self.model,
+                usage=usage,
+                latency_ms=latency_ms,
+                reasoning_content="".join(reasoning_parts) if reasoning_parts else None
+            )
+
+        except Exception as e:
+            raise TensorInpaintingException(f"OpenAI Responses API异步流式调用失败: {str(e)}")
+        finally:
+            if stream is not None and hasattr(stream, "close"):
+                await stream.close()
+
+    def invoke_with_tools(self, messages: List[Dict], tools: List[Dict],
+                         tool_choice: Union[str, Dict] = "auto", **kwargs) -> LLMToolResponse:
+        """工具调用（Function Calling）"""
+        if not self._client:
+            self._client = self.create_client()
+
+        start_time = time.time()
+        try:
+            request = self._build_request(messages, **kwargs)
+            # store=False 时也能通过加密 reasoning 条目续接工具调用。
+            request["include"] = list(request.get("include") or [])
+            if "reasoning.encrypted_content" not in request["include"]:
+                request["include"].append("reasoning.encrypted_content")
+            if tools:
+                request["tools"] = self._convert_tools(tools)
+                if tool_choice is not None:
+                    request["tool_choice"] = self._convert_tool_choice(tool_choice)
+
+            response = self._client.responses.create(**request)
+            self._check_response_status(response)
+            latency_ms = int((time.time() - start_time) * 1000)
+
+            content, tool_calls, _ = self._extract_output(response)
+
+            return LLMToolResponse(
+                content=content if content else None,
+                tool_calls=tool_calls,
+                model=getattr(response, "model", None) or self.model,
+                usage=self._extract_usage(getattr(response, "usage", None)),
+                latency_ms=latency_ms,
+                responses_output=self._serialize_output(response),
+            )
+
+        except Exception as e:
+            raise TensorInpaintingException(f"OpenAI Responses Function Calling调用失败: {str(e)}")
 
 
 class AnthropicAdapter(BaseLLMAdapter):
@@ -861,7 +1310,8 @@ def create_adapter(
     api_key: str,
     base_url: Optional[str],
     timeout: int,
-    model: str
+    model: str,
+    api_style: Optional[str] = None
 ) -> BaseLLMAdapter:
     """
     根据base_url自动选择适配器
@@ -869,7 +1319,12 @@ def create_adapter(
     检测逻辑：
     - anthropic.com -> AnthropicAdapter
     - googleapis.com 或 generativelanguage -> GeminiAdapter
-    - 其他 -> OpenAIAdapter（默认）
+    - api_style=responses -> OpenAIResponsesAdapter（OpenAI 官方 Responses API）
+    - 其他 -> OpenAIAdapter（默认，兼容所有OpenAI格式接口）
+
+    Args:
+        api_style: OpenAI 接口风格，"chat"（默认）或 "responses"；
+            为 None 时读取 LLM_API_STYLE 环境变量
     """
     if base_url:
         base_url_lower = base_url.lower()
@@ -880,6 +1335,9 @@ def create_adapter(
         if "googleapis.com" in base_url_lower or "generativelanguage" in base_url_lower:
             return GeminiAdapter(api_key, base_url, timeout, model)
 
+    style = (api_style or os.getenv("LLM_API_STYLE") or "chat").strip().lower()
+    if style in ("responses", "response"):
+        return OpenAIResponsesAdapter(api_key, base_url, timeout, model)
+
     # 默认使用OpenAI适配器（兼容所有OpenAI格式接口）
     return OpenAIAdapter(api_key, base_url, timeout, model)
-

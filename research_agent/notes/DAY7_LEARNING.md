@@ -275,7 +275,7 @@ LLM 负责选择、解释、提出 hypothesis 和生成受约束代码；程序�
 
 ### 11.3 公平、无泄漏的实验协议
 
-基础与候选配对预算一致，隐藏区域只在最终评估中出现。Agent 的成功只能由固定 Judge 宣布。
+基础与候选在同一结构搜索上限内独立调优，并共享数据划分、学习率搜索规则和单次训练协议；隐藏区域只在最终评估中出现。Agent 的成功只能由固定 Judge 宣布。
 
 ### 11.4 正确处理失败和证据边界
 
@@ -289,7 +289,7 @@ LLM 负责选择、解释、提出 hypothesis 和生成受约束代码；程序�
 2. 执行一条 quick start 命令。
 3. 打开 `report.md` 展示方法选择证据。
 4. 打开候选 `idea.json` 和 `validation.json`。
-5. 打开 `paired_configurations.json` 证明公平预算。
+5. 打开 `tuning_configurations.json` 检查双方独立搜索数、覆盖率与单次训练协议。
 6. 展示三张补全图与 Judge 指标。
 7. 展示 Trace HTML 和 approved manifest。
 8. 以限制与下一步结束。

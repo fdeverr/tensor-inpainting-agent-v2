@@ -85,6 +85,34 @@ def test_final_refit_uses_every_observed_pixel_and_no_hidden_pixel():
     assert np.isfinite(result.reconstruction).all()
 
 
+def test_ground_truth_selection_trains_on_all_observed_and_scores_only_missing():
+    ground_truth = _smooth_rgb_image()
+    observed_mask = generate_observation_mask(12, 10, 0.25, "random", seed=8)
+    corrupted = apply_observation_mask(ground_truth, observed_mask)
+    result = train_tensor_model(
+        model_name="matrix",
+        model_hyperparameters={"rank": 3, "init_scale": 0.1},
+        observed_image=corrupted,
+        observed_mask=observed_mask,
+        ground_truth=ground_truth,
+        config=TrainingConfig(
+            learning_rate=0.05,
+            max_steps=20,
+            validation_interval=5,
+            early_stopping_patience=20,
+            device="cpu",
+        ),
+        seed=17,
+    )
+
+    assert np.array_equal(result.train_mask, observed_mask)
+    assert np.array_equal(result.validation_mask, ~observed_mask)
+    assert result.selection_metric == "missing_region_ground_truth_mse"
+    assert result.ground_truth_used_for_selection is True
+    assert result.best_missing_psnr is not None
+    assert all(item["missing_gt_mse"] is not None for item in result.history)
+
+
 def test_training_progress_reports_current_step_and_eta(capsys):
     ground_truth = _smooth_rgb_image(8, 8)
     observed_mask = generate_observation_mask(8, 8, 0.25, "random", seed=3)

@@ -49,6 +49,12 @@ MODEL_PARAMETERS = {
     },
     "tt": {"rank_1": 3, "rank_2": 3, "init_scale": 0.1},
     "tensor_ring": {"rank": 3, "init_scale": 0.1},
+    "siren": {
+        "hidden_features": 16,
+        "hidden_layers": 2,
+        "first_omega_0": 30.0,
+        "hidden_omega_0": 30.0,
+    },
 }
 
 
@@ -150,7 +156,8 @@ def test_video_training_and_metrics_use_all_features():
         ground_truth,
         ground_truth,
         mask,
-        include_learned_metrics=True,
+        include_full_reference_metrics=True,
+        include_no_reference_metrics=True,
     )
 
     assert output.reconstruction.shape == shape
@@ -176,10 +183,12 @@ def test_day4_workflow_preserves_hwtc_outputs(tmp_path):
             missing_rate=0.25,
             seed=7,
             max_steps=2,
+            max_steps_ceiling=2,
             validation_interval=1,
             patience=2,
             device="cpu",
-            learned_metrics=True,
+            full_reference_metrics=True,
+            no_reference_metrics=True,
             llm_mode="off",
             retrieval_top_k=3,
         )

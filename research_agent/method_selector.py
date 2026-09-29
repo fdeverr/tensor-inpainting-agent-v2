@@ -13,6 +13,38 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from .agent_tools.framework import TensorInpaintingLLM
 
 
+LLM_SAFE_SOURCE_METADATA_FIELDS = {
+    "source_format",
+    "original_dtype",
+    "mat_key",
+    "mat_backend",
+    "original_shape",
+    "loaded_shape",
+    "data_type",
+    "feature_shape",
+    "feature_count",
+}
+
+METHOD_SELECTION_VISUAL_SOURCE = "visual:manhattan_interpolation_structure"
+
+
+def llm_safe_image_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove raw-source paths and full-input value statistics from LLM context."""
+
+    safe_profile = dict(profile)
+    source_metadata = profile.get("source_metadata")
+    if isinstance(source_metadata, dict):
+        safe_profile["source_metadata"] = {
+            key: value
+            for key, value in source_metadata.items()
+            if key in LLM_SAFE_SOURCE_METADATA_FIELDS
+        }
+    safe_profile["llm_information_scope"] = (
+        "visible-pixel statistics and non-content tensor metadata only"
+    )
+    return safe_profile
+
+
 class EvidenceReference(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -73,10 +105,16 @@ def _json_from_text(text: str) -> Dict[str, Any]:
     return payload
 
 
-def _validate_sources(plan: MethodPlan, retrieval: Dict[str, Any]) -> None:
+def _validate_sources(
+    plan: MethodPlan,
+    retrieval: Dict[str, Any],
+    visual_assessment: Optional[Dict[str, Any]] = None,
+) -> None:
     allowed = {
         item["source"] for item in retrieval["evidence"]
     } | {rule["source"] for rule in retrieval["active_rules"]}
+    if visual_assessment and visual_assessment.get("status") == "completed":
+        allowed.add(METHOD_SELECTION_VISUAL_SOURCE)
     unknown = [item.source for item in plan.evidence if item.source not in allowed]
     if unknown:
         raise ValueError("MethodPlan cited unknown evidence sources: %s" % unknown) #| 是集合的并集运算符，表示合并两个集合中的所有元素。
@@ -85,19 +123,19 @@ def _validate_sources(plan: MethodPlan, retrieval: Dict[str, Any]) -> None:
 HYPERPARAMETER_CONTRACTS = {
     "matrix": {
         "required": ["rank_candidates"],
-        "optional": ["learning_rate", "init_scale"],
+        "optional": ["learning_rate", "learning_rate_candidates", "init_scale"],
     },
     "mode3": {
         "required": ["rank_candidates"],
-        "optional": ["learning_rate", "init_scale"],
+        "optional": ["learning_rate", "learning_rate_candidates", "init_scale"],
     },
     "cp": {
         "required": ["rank_candidates"],
-        "optional": ["learning_rate", "init_scale"],
+        "optional": ["learning_rate", "learning_rate_candidates", "init_scale"],
     },
     "nonnegative_cp": {
         "required": ["rank_candidates"],
-        "optional": ["learning_rate", "init_scale"],
+        "optional": ["learning_rate", "learning_rate_candidates", "init_scale"],
     },
     "tucker": {
         "required": [
@@ -105,7 +143,7 @@ HYPERPARAMETER_CONTRACTS = {
             "rank_w_candidates",
             "rank_c_candidates",
         ],
-        "optional": ["learning_rate", "init_scale"],
+        "optional": ["learning_rate", "learning_rate_candidates", "init_scale"],
     },
     "btd": {
         "required": [
@@ -114,11 +152,11 @@ HYPERPARAMETER_CONTRACTS = {
             "rank_w_candidates",
             "rank_c_candidates",
         ],
-        "optional": ["learning_rate", "init_scale"],
+        "optional": ["learning_rate", "learning_rate_candidates", "init_scale"],
     },
     "tsvd": {
         "required": ["rank_candidates"],
-        "optional": ["learning_rate", "init_scale"],
+        "optional": ["learning_rate", "learning_rate_candidates", "init_scale"],
     },
     "nonnegative_tucker": {
         "required": [
@@ -126,7 +164,7 @@ HYPERPARAMETER_CONTRACTS = {
             "rank_w_candidates",
             "rank_c_candidates",
         ],
-        "optional": ["learning_rate", "init_scale"],
+        "optional": ["learning_rate", "learning_rate_candidates", "init_scale"],
     },
     "hierarchical_tucker": {
         "required": [
@@ -135,15 +173,15 @@ HYPERPARAMETER_CONTRACTS = {
             "rank_c_candidates",
             "rank_spatial_candidates",
         ],
-        "optional": ["learning_rate", "init_scale"],
+        "optional": ["learning_rate", "learning_rate_candidates", "init_scale"],
     },
     "tt": {
         "required": ["rank_1_candidates", "rank_2_candidates"],
-        "optional": ["learning_rate", "init_scale"],
+        "optional": ["learning_rate", "learning_rate_candidates", "init_scale"],
     },
     "tensor_ring": {
         "required": ["rank_candidates"],
-        "optional": ["learning_rate", "init_scale"],
+        "optional": ["learning_rate", "learning_rate_candidates", "init_scale"],
     },
 }
 
@@ -218,6 +256,24 @@ def _validate_hyperparameter_contract(
         learning_rate = float(suggestions["learning_rate"])
         if not 1e-5 <= learning_rate <= 1.0:
             raise ValueError("learning_rate must be between 1e-5 and 1.0")
+    if "learning_rate_candidates" in suggestions:
+        values = suggestions["learning_rate_candidates"]
+        if not isinstance(values, list) or not values:
+            raise ValueError("learning_rate_candidates must be a non-empty list")
+        normalized_rates = []
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    "learning_rate_candidates must contain numbers only"
+                )
+            rate = float(value)
+            if not 1e-5 <= rate <= 1.0:
+                raise ValueError(
+                    "learning_rate_candidates values must be between 1e-5 and 1.0"
+                )
+            if rate not in normalized_rates:
+                normalized_rates.append(rate)
+        suggestions["learning_rate_candidates"] = normalized_rates[:4]
     if "init_scale" in suggestions:
         init_scale = float(suggestions["init_scale"])
         if not 0.0 < init_scale <= 1.0:
@@ -439,22 +495,41 @@ class MethodSelector:
         self.require_valid_llm_output = bool(require_valid_llm_output)
 
     @staticmethod
-    def _prompt(profile: Dict[str, Any], retrieval: Dict[str, Any]) -> List[Dict[str, str]]:
+    def _prompt(
+        profile: Dict[str, Any],
+        retrieval: Dict[str, Any],
+        visual_assessment: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, str]]:
         allowed_sources = [
             item["source"] for item in retrieval["evidence"]
         ] + [rule["source"] for rule in retrieval["active_rules"]]
+        completed_visual = bool(
+            visual_assessment
+            and visual_assessment.get("status") == "completed"
+        )
+        if completed_visual:
+            allowed_sources.append(METHOD_SELECTION_VISUAL_SOURCE)
         schema = MethodPlan.model_json_schema()
         user_payload = {
             "fixed_prompt": (
                 "请根据当前图像的缺失模式、统计特征、插值结果和张量分解经验文档，"
-                "选择一个合适的基础张量分解方法完成图像补全。"
+                "提供一个张量分解首选建议。该建议只用于组建候选短名单，"
+                "最终家族由同预算数值预赛决定。"
             ),
-            "image_profile": profile,
+            "image_profile": llm_safe_image_profile(profile),
             "interpolation": {
                 "available": True,
                 "metrics_available_during_selection": False,
-                "visual_description_available": False,
+                "visual_description_available": completed_visual,
+                "visual_evidence_source": (
+                    METHOD_SELECTION_VISUAL_SOURCE if completed_visual else None
+                ),
             },
+            "interpolation_visual_structure_assessment": (
+                visual_assessment.get("assessment")
+                if completed_visual and visual_assessment is not None
+                else {"status": "unavailable"}
+            ),
             "active_rules": retrieval["active_rules"],
             "evidence_chunks": retrieval["evidence"],
             "allowed_evidence_sources": allowed_sources,
@@ -462,7 +537,9 @@ class MethodSelector:
                 "rule": (
                     "Use exactly the required keys for the selected method. Optional "
                     "keys may be omitted. Do not invent aliases such as rank, "
-                    "spatial_rank_candidates, or channel_rank_candidates."
+                    "spatial_rank_candidates, or channel_rank_candidates. Prefer "
+                    "learning_rate_candidates with two or three log-spaced values; "
+                    "a legacy scalar learning_rate will be expanded around its center."
                 ),
                 **HYPERPARAMETER_CONTRACTS,
             },
@@ -473,13 +550,19 @@ class MethodSelector:
                 "role": "system",
                 "content": (
                     "You are a tensor-decomposition method selector. Return one JSON "
-                    "object only. Choose exactly one of matrix, mode3, cp, "
+                    "object only. Recommend exactly one shortlist seed from matrix, mode3, cp, "
                     "nonnegative_cp, tucker, btd, tsvd, nonnegative_tucker, "
                     "hierarchical_tucker, tt, or tensor_ring. Here mode3 means "
                     "X = A ×₃ E; btd is Block-Term "
                     "Decomposition; tsvd is a low-tubal-rank t-product model. Every "
                     "reason must cite supplied profile values or allowed evidence sources. "
+                    "If interpolation_visual_structure_assessment is available, use it only "
+                    "as a coarse prior for the decomposition family and low/medium/high rank "
+                    "regime. Translate that regime into two or three bounded candidates; "
+                    "do not assume the interpolation is ground truth. "
                     "Never request or infer missing-region ground truth or final metrics."
+                    " Your recommendation is not the final winner; a deterministic "
+                    "equal-budget numerical screening stage makes that decision."
                 ),
             },
             {
@@ -505,8 +588,9 @@ class MethodSelector:
         self,
         profile: Dict[str, Any],
         retrieval: Dict[str, Any],
+        visual_assessment: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        messages = self._prompt(profile, retrieval)
+        messages = self._prompt(profile, retrieval, visual_assessment)
         raw_outputs = []
         validation_errors = []
         attempt_count = 0
@@ -543,7 +627,7 @@ class MethodSelector:
                     )
                     raw_outputs.append(raw)
                     plan = MethodPlan.model_validate(_json_from_text(raw))
-                    _validate_sources(plan, retrieval)
+                    _validate_sources(plan, retrieval, visual_assessment)
                     _validate_hyperparameter_contract(plan, profile)
                     plan.selection_mode = "llm" if attempt == 0 else "llm_repaired"
                     return {

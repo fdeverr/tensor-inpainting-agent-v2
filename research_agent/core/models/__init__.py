@@ -8,6 +8,7 @@ from .matrix_factorization import MatrixFactorization
 from .mode3_factorization import Mode3Factorization
 from .nonnegative_cp import NonnegativeCPDecomposition
 from .nonnegative_tucker import NonnegativeTuckerDecomposition
+from .siren import SirenImplicitNetwork
 from .registry import create_model, get_default_hyperparameters
 from .t_svd import TSVDDecomposition
 from .tensor_ring import TensorRingDecomposition
@@ -23,6 +24,7 @@ __all__ = [
     "Mode3Factorization",
     "NonnegativeCPDecomposition",
     "NonnegativeTuckerDecomposition",
+    "SirenImplicitNetwork",
     "TSVDDecomposition",
     "TensorRingDecomposition",
     "TensorTrainDecomposition",

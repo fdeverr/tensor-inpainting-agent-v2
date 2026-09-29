@@ -11,10 +11,20 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .agent_tools.framework import TraceLogger
-from .candidate import CandidateGenerator, CandidateValidator
+from .candidate import (
+    CandidateGenerator,
+    CandidateValidator,
+    load_validated_candidate,
+)
 from .candidate.generator import load_improver_context
+from .candidate.search_contract import evaluate_search_space_contract
 from .evolution_knowledge import GlobalExperienceStore, resolve_knowledge_root
 from .method_selector import llm_from_environment
+from .core.models.registry import MODEL_CLASSES
+from .visual_evaluator import (
+    MultimodalQualityEvaluator,
+    visual_llm_from_environment,
+)
 
 
 def _identifier(prefix: str) -> str:
@@ -41,6 +51,7 @@ class Day5WorkflowConfig:
     knowledge_root: Optional[str] = None
     llm_mode: str = "auto"
     smoke_timeout_seconds: float = 10.0
+    visual_assessment: bool = False
 
     def validate(self) -> None:
         state_path = Path(self.base_run_dir) / "state.json"
@@ -50,6 +61,8 @@ class Day5WorkflowConfig:
             raise ValueError("llm_mode must be auto, off, or required")
         if self.smoke_timeout_seconds <= 0:
             raise ValueError("smoke_timeout_seconds must be positive")
+        if not isinstance(self.visual_assessment, bool):
+            raise ValueError("visual_assessment must be a bool")
 
 
 class Day5Workflow:
@@ -60,6 +73,7 @@ class Day5Workflow:
         config: Day5WorkflowConfig,
         generator: Optional[CandidateGenerator] = None,
         validator: Optional[CandidateValidator] = None,
+        visual_evaluator: Optional[MultimodalQualityEvaluator] = None,
     ) -> None:
         config.validate()
         self.config = config
@@ -67,9 +81,19 @@ class Day5Workflow:
         self.run_dir = Path(config.output_dir) / self.workflow_id
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self.state_path = self.run_dir / "state.json"
-        self.generator = generator or CandidateGenerator(
-            llm_from_environment(config.llm_mode),
-            require_valid_llm_output=config.llm_mode == "required",
+        if generator is None:
+            configured_llm = llm_from_environment(config.llm_mode)
+            self.generator = CandidateGenerator(
+                configured_llm,
+                require_valid_llm_output=config.llm_mode == "required",
+            )
+        else:
+            self.generator = generator
+            configured_llm = getattr(generator, "llm", None)
+        self.visual_evaluator = visual_evaluator or MultimodalQualityEvaluator(
+            visual_llm_from_environment(configured_llm)
+            if config.visual_assessment
+            else None
         )
         self.validator = validator or CandidateValidator(
             timeout_seconds=config.smoke_timeout_seconds
@@ -119,10 +143,56 @@ class Day5Workflow:
                 "global_reusable_experience": global_experience.context(),
                 "current_run_practice": [],
             }
+            context["mutation_visual_assessment_enabled"] = bool(
+                self.config.visual_assessment
+            )
+            comparison_reference_path = self.run_dir / "algorithm_comparison_reference.json"
+            _write_json(
+                comparison_reference_path,
+                context.get("algorithm_comparison_reference", {}),
+            )
+            self.state["algorithm_comparison_reference"] = context.get(
+                "algorithm_comparison_reference", {}
+            )
+            self.state["artifacts"]["algorithm_comparison_reference"] = str(
+                comparison_reference_path
+            )
+            print(
+                "\n🧬 首轮变异将参考插值、SIREN 与张量家族的结构化对比结果…",
+                flush=True,
+            )
+            initial_visual_assessment = {
+                "status": "skipped",
+                "reason": (
+                    "structured numerical algorithm references are enabled; the first "
+                    "round does not additionally compare interpolation imagery"
+                ),
+                "comparison_mode": "structured_algorithm_reference_only",
+                "ground_truth_provided": False,
+            }
+            initial_visual_path = self.run_dir / "initial_interpolation_visual.json"
+            _write_json(initial_visual_path, initial_visual_assessment)
+            self.state["initial_interpolation_visual_assessment"] = (
+                initial_visual_assessment
+            )
+            self.state["artifacts"]["initial_interpolation_visual_assessment"] = str(
+                initial_visual_path
+            )
             self.state["artifacts"]["global_experience"] = (
                 global_experience.context()["documents"]
             )
             self.state["base_run_id"] = context["base_run_id"]
+            self._save()
+            self.trace.log_event(
+                "initial_interpolation_visual_assessment",
+                {
+                    "status": initial_visual_assessment.get("status"),
+                    "attempts": initial_visual_assessment.get("attempts", 0),
+                    "comparison_mode": "structured_algorithm_reference_only",
+                    "ground_truth_provided": False,
+                },
+                step=1,
+            )
             self.trace.log_event(
                 "model_improver_input",
                 {
@@ -133,7 +203,9 @@ class Day5Workflow:
                     "base_best_config": context["base_best_config"],
                     "training_curve_summary": context["training_curve_summary"],
                     "base_metrics": context["base_metrics"],
-                    "comparison": context["comparison"],
+                    "algorithm_comparison_reference": context.get(
+                        "algorithm_comparison_reference", {}
+                    ),
                     "ground_truth_provided": False,
                     "base_source_character_count": len(context["base_model_source"]),
                 },
@@ -203,6 +275,9 @@ class Day5Workflow:
                     proposal.model_code.encode("utf-8")
                 ).hexdigest()
                 idea_payload = proposal.model_dump(exclude={"model_code"})
+                idea_payload["declared_search_space"] = idea_payload.pop(
+                    "search_space"
+                )
                 idea_payload.update(
                     {
                         "candidate_id": candidate_id,
@@ -223,9 +298,17 @@ class Day5Workflow:
                     "architecture_family": proposal.architecture_family,
                     "evolution_round": 1,
                     "mutation_goal": proposal.mutation_goal,
+                    "pain_point": proposal.pain_point,
+                    "core_difficulty": proposal.core_difficulty,
+                    "simplified_problem": proposal.simplified_problem,
+                    "mutation_mode": proposal.mutation_mode,
                     "mutation_target": proposal.mutation_target,
                     "idea": proposal.idea,
                     "single_change": proposal.single_change,
+                    "components": [
+                        component.model_dump() for component in proposal.components
+                    ],
+                    "interaction_hypothesis": proposal.interaction_hypothesis,
                     "parent_candidate_id": None,
                     "created_at": datetime.now().isoformat(),
                     "generation_mode": proposal.generation_mode,
@@ -234,7 +317,9 @@ class Day5Workflow:
                     "validation_round": validation_round,
                     "code_sha256": code_hash,
                     "validation_status": "pending",
-                    "allowed_search_space": proposal.search_space,
+                    "declared_search_space": proposal.search_space,
+                    "executable_search_space": None,
+                    "effective_search_space": None,
                     "training_budget": proposal.training_budget.model_dump(),
                     "eligible_for_training": False,
                 }
@@ -300,6 +385,81 @@ class Day5Workflow:
                 manifest["eligible_for_training"] = bool(validation["passed"])
                 manifest["validated_at"] = datetime.now().isoformat()
                 _write_json(manifest_path, manifest)
+                if validation["passed"]:
+                    try:
+                        candidate_class, _ = load_validated_candidate(
+                            str(candidate_dir)
+                        )
+                        image_shape = tuple(
+                            int(value)
+                            for value in context["image_profile"]["image_shape"]
+                        )
+                        contract = evaluate_search_space_contract(
+                            MODEL_CLASSES[proposal.base_method].search_space(
+                                image_shape
+                            ),
+                            candidate_class.search_space(image_shape),
+                            manifest["declared_search_space"],
+                        )
+                        manifest.update(
+                            {
+                                "declared_search_space": contract[
+                                    "declared_search_space"
+                                ],
+                                "executable_search_space": contract[
+                                    "executable_search_space"
+                                ],
+                                "effective_search_space": contract[
+                                    "effective_search_space"
+                                ],
+                                "search_space_contract": {
+                                    "passed": contract["passed"],
+                                    "feedback": contract["feedback"],
+                                    "checked_at": datetime.now().isoformat(),
+                                },
+                            }
+                        )
+                        idea_payload.update(
+                            {
+                                "declared_search_space": contract[
+                                    "declared_search_space"
+                                ],
+                                "executable_search_space": contract[
+                                    "executable_search_space"
+                                ],
+                                "effective_search_space": contract[
+                                    "effective_search_space"
+                                ],
+                                "search_space_contract": manifest[
+                                    "search_space_contract"
+                                ],
+                            }
+                        )
+                        self.state["generation"]["search_space_contract_passed"] = contract[
+                            "passed"
+                        ]
+                        _write_json(idea_path, idea_payload)
+                        _write_json(manifest_path, manifest)
+                        validation["search_space_contract"] = {
+                            **contract,
+                            "image_shape": list(image_shape),
+                        }
+                        _write_json(validation_path, validation)
+                        if not contract["passed"]:
+                            raise ValueError(contract["feedback"])
+                    except Exception as error:
+                        feedback = "%s: %s" % (type(error).__name__, str(error))
+                        validation["passed"] = False
+                        validation["status"] = "rejected"
+                        validation.setdefault("feedback", []).append(feedback)
+                        validation.setdefault(
+                            "search_space_contract",
+                            {"passed": False, "feedback": feedback},
+                        )
+                        manifest["validation_status"] = "rejected"
+                        manifest["eligible_for_training"] = False
+                        _write_json(validation_path, validation)
+                        _write_json(manifest_path, manifest)
                 validation_summary = {
                     "passed": validation["passed"],
                     "status": validation["status"],
@@ -337,6 +497,9 @@ class Day5Workflow:
                         "static_validation": validation["static_validation"],
                         "smoke_test": validation["smoke_test"],
                         "feedback": validation["feedback"],
+                        "search_space_contract": validation.get(
+                            "search_space_contract"
+                        ),
                     },
                     step=3 + (validation_round - 1) * 2,
                 )

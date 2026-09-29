@@ -8,6 +8,8 @@ from research_agent.core.metrics import (
     _LEARNED_MODEL_CACHE,
     composite_ssim,
     evaluate_reconstruction_metrics,
+    full_image_mse,
+    full_image_psnr,
     missing_region_mse,
     missing_region_psnr,
     structural_similarity,
@@ -21,6 +23,8 @@ def test_perfect_reconstruction_metrics():
 
     assert missing_region_mse(ground_truth, ground_truth, mask) == 0.0
     assert math.isinf(missing_region_psnr(ground_truth, ground_truth, mask))
+    assert full_image_mse(ground_truth, ground_truth, mask) == 0.0
+    assert math.isinf(full_image_psnr(ground_truth, ground_truth, mask))
     assert np.isclose(composite_ssim(ground_truth, ground_truth, mask), 1.0)
 
 
@@ -33,6 +37,8 @@ def test_missing_region_error_is_not_diluted_by_observed_pixels():
 
     assert np.isclose(missing_region_mse(prediction, ground_truth, mask), 1.0)
     assert np.isclose(missing_region_psnr(prediction, ground_truth, mask), 0.0)
+    assert np.isclose(full_image_mse(prediction, ground_truth, mask), 0.04)
+    assert np.isclose(full_image_psnr(prediction, ground_truth, mask), 10 * np.log10(25))
     assert composite_ssim(prediction, ground_truth, mask) < 1.0
 
 
@@ -77,6 +83,8 @@ def test_learned_iqa_metrics_use_pyiqa_names_and_composite_image(monkeypatch):
         ground_truth,
         observed_mask,
         device="cpu",
+        include_full_reference_metrics=True,
+        include_no_reference_metrics=True,
     )
 
     assert [name for name, _ in created] == [
@@ -90,6 +98,41 @@ def test_learned_iqa_metrics_use_pyiqa_names_and_composite_image(monkeypatch):
     assert np.isclose(metrics["clip_iqa"], 0.375)
     assert np.isclose(metrics["musiq"], 0.375)
     assert metrics["learned_metric_status"]["errors"] == {}
+
+
+def test_default_metric_group_loads_lpips_only(monkeypatch):
+    ground_truth = np.full((8, 8, 3), 0.5, dtype=np.float32)
+    observed_mask = np.ones((8, 8), dtype=np.bool_)
+    observed_mask[2:6, 2:6] = False
+    created = []
+
+    class ConstantMetric:
+        def __call__(self, *args):
+            return 0.25
+
+    def create_metric(name, device):
+        created.append(name)
+        return ConstantMetric()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pyiqa",
+        SimpleNamespace(create_metric=create_metric),
+    )
+    _LEARNED_MODEL_CACHE.clear()
+    metrics = evaluate_reconstruction_metrics(
+        ground_truth,
+        ground_truth,
+        observed_mask,
+        device="cpu",
+    )
+
+    assert created == ["lpips"]
+    assert metrics["lpips"] == 0.25
+    assert all(
+        metrics[name] is None for name in ("maniqa", "clip_iqa", "musiq")
+    )
+    assert metrics["metric_group_status"]["no_reference"]["enabled"] is False
 
 
 def test_one_learned_iqa_failure_does_not_discard_other_metrics(
@@ -124,10 +167,13 @@ def test_one_learned_iqa_failure_does_not_discard_other_metrics(
         ground_truth,
         observed_mask,
         device="cpu",
+        include_full_reference_metrics=True,
+        include_no_reference_metrics=True,
     )
 
     assert metrics["missing_mse"] == 0.0
     assert metrics["missing_psnr"] is None
+    assert metrics["full_psnr"] is None
     assert metrics["composite_ssim"] == 1.0
     assert metrics["lpips"] == 0.25
     assert metrics["maniqa"] is None

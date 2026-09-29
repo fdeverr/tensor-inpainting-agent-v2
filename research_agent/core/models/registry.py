@@ -12,6 +12,7 @@ from .matrix_factorization import MatrixFactorization
 from .mode3_factorization import Mode3Factorization
 from .nonnegative_cp import NonnegativeCPDecomposition
 from .nonnegative_tucker import NonnegativeTuckerDecomposition
+from .siren import SirenImplicitNetwork
 from .t_svd import TSVDDecomposition
 from .tensor_ring import TensorRingDecomposition
 from .tensor_train import TensorTrainDecomposition
@@ -30,6 +31,7 @@ MODEL_CLASSES = {
     "hierarchical_tucker": HierarchicalTuckerDecomposition,
     "tt": TensorTrainDecomposition,
     "tensor_ring": TensorRingDecomposition,
+    "siren": SirenImplicitNetwork,
 }
 
 
@@ -63,6 +65,12 @@ def get_default_hyperparameters(model_name: str) -> Dict[str, Any]:
         },
         "tt": {"rank_1": 8, "rank_2": 3, "init_scale": 0.1},
         "tensor_ring": {"rank": 4, "init_scale": 0.1},
+        "siren": {
+            "hidden_features": 128,
+            "hidden_layers": 3,
+            "first_omega_0": 30.0,
+            "hidden_omega_0": 30.0,
+        },
     }
     if model_name not in defaults:
         raise ValueError("unknown model_name %r" % model_name)

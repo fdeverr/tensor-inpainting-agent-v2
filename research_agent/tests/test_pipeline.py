@@ -33,7 +33,7 @@ def test_day1_pipeline_writes_reproducible_artifacts(tmp_path):
         missing_rate=0.4,
         seed=42,
         image_size=None,
-        learned_metrics=False,
+        full_reference_metrics=False,
     )
 
     result = run_day1_baseline(config)
@@ -42,6 +42,7 @@ def test_day1_pipeline_writes_reproducible_artifacts(tmp_path):
     assert abs(result.actual_missing_rate - 0.4) < 1.0 / (18 * 24)
     assert result.missing_mse > 0.0
     assert result.missing_psnr is not None
+    assert result.full_psnr is not None
     assert 0.0 <= result.composite_ssim <= 1.0
     for artifact_path in result.artifacts.values():
         assert Path(artifact_path).is_file()
@@ -61,7 +62,7 @@ def test_day1_pipeline_repeats_mask_reconstruction_and_metrics(tmp_path):
         missing_rate=0.35,
         seed=19,
         image_size=None,
-        learned_metrics=False,
+        full_reference_metrics=False,
     )
 
     first = run_day1_baseline(config)
@@ -71,6 +72,7 @@ def test_day1_pipeline_repeats_mask_reconstruction_and_metrics(tmp_path):
     assert first.actual_missing_rate == second.actual_missing_rate
     assert first.missing_mse == second.missing_mse
     assert first.missing_psnr == second.missing_psnr
+    assert first.full_psnr == second.full_psnr
     assert first.composite_ssim == second.composite_ssim
     assert Path(first.artifacts["mask"]).read_bytes() == Path(second.artifacts["mask"]).read_bytes()
     assert Path(first.artifacts["interpolated"]).read_bytes() == Path(

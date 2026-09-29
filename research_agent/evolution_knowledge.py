@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
 METRIC_SEMANTICS: Dict[str, Dict[str, str]] = {
+    "full_psnr": {
+        "name": "Full-image PSNR",
+        "unit": "dB",
+        "direction": "higher_is_better",
+        "scope": "full completed tensor after observed samples are restored",
+        "physical_meaning": (
+            "Logarithmic inverse reconstruction error over the entire completed tensor; "
+            "observed samples contribute zero error after restoration."
+        ),
+    },
     "missing_psnr": {
         "name": "Missing-region PSNR",
         "unit": "dB",
@@ -60,13 +69,20 @@ METRIC_SEMANTICS: Dict[str, Dict[str, str]] = {
 }
 
 
-def describe_metrics(metrics: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+def describe_metrics(
+    metrics: Dict[str, Any],
+    include_full_psnr: bool = True,
+) -> Dict[str, Dict[str, Any]]:
     """Attach stable semantics to every metric value persisted in practice memory."""
 
     described: Dict[str, Dict[str, Any]] = {}
     for name, semantics in METRIC_SEMANTICS.items():
+        if name == "full_psnr" and not include_full_psnr:
+            continue
         described[name] = {"value": metrics.get(name), **semantics}
     for name, value in metrics.items():
+        if name == "full_psnr" and not include_full_psnr:
+            continue
         if name not in described:
             described[name] = {
                 "value": value,
@@ -206,6 +222,7 @@ class RunPracticeStore:
             self.practice_markdown.write_text(
                 "# 当前运行算法进化实践\n\n"
                 "- Workflow：`%s`\n- 基础分解：`%s`\n\n"
+                "每条实践严格保存为（当前框架与条件、目标、方法、结果）四元组。"
                 "本实践库只服务于当前运行，不会被其他运行读取。\n"
                 % (workflow_id, base_method),
                 encoding="utf-8",
@@ -223,26 +240,53 @@ class RunPracticeStore:
         }
 
     def record(self, practice: Dict[str, Any]) -> Dict[str, str]:
-        practice_record = {"recorded_at": datetime.now().isoformat(), **practice}
-        _append_jsonl(self.practice_jsonl, practice_record)
+        required = {"framework", "goal", "method", "result"}
+        missing = required - set(practice)
+        extras = set(practice) - required
+        if missing or extras:
+            raise ValueError(
+                "practice must be exactly (framework, goal, method, result); "
+                "missing=%s; extras=%s"
+                % (sorted(missing), sorted(extras))
+            )
+        round_index = len(_read_jsonl(self.practice_jsonl)) + 1
+        _append_jsonl(self.practice_jsonl, practice)
+        framework = practice["framework"]
+        method = practice["method"]
+        result = practice["result"]
+        signal_codes = [
+            item.get("code", "unknown")
+            for item in framework.get("training_diagnostics", {}).get("signals", [])
+        ]
         with self.practice_markdown.open("a", encoding="utf-8") as stream:
             stream.write(
                 "\n## 第 %s 轮\n\n"
-                "- 目标：%s\n- Idea：%s\n- 变异对象：`%s`\n- 唯一改动：%s\n"
-                "- 结果：`%s`；是否替换当前最优：`%s`\n"
+                "- 当前框架：`%s`（基础分解：`%s`）\n"
+                "- 条件：`%s`\n"
+                "- 训练诊断：`%s`\n"
+                "- 目标：%s\n- 方法：%s\n- 变异对象：`%s`\n- 唯一改动：%s\n"
+                "- 结果：`%s`；是否接受：`%s`\n"
                 % (
-                    practice["round"],
-                    practice["mutation_goal"],
-                    practice["idea"],
-                    practice["mutation_target"],
-                    practice["single_change"],
-                    practice["judgment"]["decision"],
-                    practice["incumbent_updated"],
+                    round_index,
+                    framework.get("name", "unknown"),
+                    framework.get("base_method", "unknown"),
+                    json.dumps(
+                        framework.get("conditions", {}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    ", ".join(signal_codes) if signal_codes else "none",
+                    practice["goal"],
+                    method["idea"],
+                    method["target"],
+                    method["single_change"],
+                    result["decision"],
+                    result["accepted"],
                 )
             )
             for role in ("incumbent_metrics", "candidate_metrics"):
                 stream.write("\n### %s\n\n" % role)
-                for metric in practice["result"][role].values():
+                for metric in result[role].values():
                     stream.write(
                         "- **%s**：`%s %s`，%s；范围：%s。%s\n"
                         % (
@@ -254,10 +298,32 @@ class RunPracticeStore:
                             metric["physical_meaning"],
                         )
                     )
-            stream.write(
-                "\n- 多模态视觉评价：`%s`（后续可接入）\n"
-                % practice["result"]["visual_assessment"]["status"]
-            )
+            visual = result.get("visual_assessment") or {
+                "status": "skipped",
+                "reason": "visual assessment was not recorded",
+            }
+            stream.write("\n### 多模态视觉观察\n\n- 状态：`%s`\n" % visual["status"])
+            if visual["status"] == "completed":
+                assessment = visual["assessment"]
+                stream.write(
+                    "- 可见图像内容：%s\n"
+                    % assessment["visible_image_content"]
+                )
+                stream.write("- 候选对比结论：%s\n" % assessment["comparison"])
+                poorly_recovered = assessment["candidate"].get(
+                    "poorly_recovered_regions", []
+                )
+                stream.write(
+                    "- 候选未良好恢复区域：%s\n"
+                    % ("；".join(poorly_recovered) if poorly_recovered else "未观察到")
+                )
+                stream.write(
+                    "- 下轮变异启示：%s\n"
+                    % "；".join(assessment.get("mutation_guidance", []))
+                )
+                stream.write("- 视觉置信度：`%s`\n" % assessment["confidence"])
+            else:
+                stream.write("- 原因：%s\n" % visual.get("reason", "未提供"))
         return {
             "practice_jsonl": str(self.practice_jsonl),
             "practice_markdown": str(self.practice_markdown),

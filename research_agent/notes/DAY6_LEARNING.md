@@ -36,18 +36,17 @@ Day 5 只回答了“候选代码能不能安全地进入训练”。Day 6 要�
 
 ## 2. 为什么不能直接比较两次随便训练的结果
 
-假设基础 Tucker 搜索 2 组配置、训练 200 步，而候选 Tucker+TV 搜索 10 组配置、训练 1000 步。即使候选指标更高，也无法判断提升来自模型 idea，还是来自更多计算资源。
+假设基础 Tucker 的完整有效空间只有 1 组配置，而候选结构需要在 3 组配置中选优。如果为了让 trial 数相同而只允许候选试 1 组，实际上会让候选调参不充分。Day 6 因此比较“每个算法在同一搜索上限内合理调优后的最佳能力”，而不是强制它们运行相同数量的结构配置。
 
 Day 6 的公平性合同是：
 
-- 两者的 trial 数相同，最多为 5；
-- 最大训练步数、学习率、早停规则相同；
+- 每个模型各自最多搜索 5 个不同结构配置，空间不足时穷举后停止；
+- 单次最大训练步数、学习率搜索规则、早停规则相同；
 - 使用同一张图、同一个 mask、同一个随机种子和同一个设备；
-- 每对 trial 的基础分解参数相同；
-- 候选只额外拥有 idea 引入的参数，例如 `tv_weight`；
+- 两个模型使用自己的可执行搜索空间，不给某一方填充重复 trial；
 - 都依据同一份观测验证集的 MSE 选优。
 
-例如第 4 对配置可能是：
+例如两个模型可以分别评估：
 
 ```python
 baseline = {
@@ -66,30 +65,27 @@ candidate = {
 }
 ```
 
-因此，这一对实验之间唯一的算法差异就是 TV 正则。
+它们不必是一一配对的第 4 次训练；重点是双方均在同一单次训练协议下，尽可能覆盖自己的有界超参数空间。
 
-## 3. 配对超参数是怎样产生的
+## 3. 独立超参数搜索是怎样产生的
 
-`paired_trial_configurations()` 接收基础模型和候选模型各自声明的 `search_space`。
+`independent_trial_configurations()` 接收基础模型和候选模型各自声明的 `search_space`。
 
-它先从基础搜索空间选择相同数量的配置，然后找出候选独有的参数：
+它分别构造两个完整离散空间，再对每个模型取：
 
 ```python
-extra_space = {
-    key: values
-    for key, values in candidate_search_space.items()
-    if key not in base_search_space
-}
+effective_count = min(tuning_trials, available_distinct_configurations)
 ```
 
-之后将候选独有参数逐个配到基础配置上。返回值同时记录：
+返回值同时记录：
 
 - `baseline` 配置列表；
 - `candidate` 配置列表；
+- 双方可用配置数、实际 trial 数与搜索覆盖率；
 - `shared_parameter_names`；
 - `candidate_only_parameter_names`。
 
-这些内容会写入每轮的 `paired_configurations.json`，所以以后可以检查 Agent 有没有偷偷给候选更多机会。
+这些内容会写入每轮的 `tuning_configurations.json`，因此可以检查每个模型是否在同一上限内充分搜索了自己的空间。总运行时作为额外成本单独报告，不再作为 Judge 拒绝的硬条件。
 
 ## 4. 如何从函数接口上隔离 Ground Truth
 
@@ -165,7 +161,7 @@ model_builder(image_shape, initial_channel_mean, hyperparameters)
 ```text
 PSNR_candidate - PSNR_baseline >= 0.2 dB
 SSIM_candidate - SSIM_baseline >= -0.002
-baseline_trial_count == candidate_trial_count
+双方都完成各自的有界超参数搜索
 ```
 
 Judge 输出的不只是 `accept/reject`，还包括：
@@ -302,7 +298,7 @@ python -m research_agent.run_day6 \
 
 ## 13. 建议按这个顺序阅读代码
 
-1. 先读 `paired_trial_configurations()`，手算一组 baseline/candidate 配对。
+1. 先读 `independent_trial_configurations()`，手算两个不同大小搜索空间的实际 trial 数。
 2. 再读 `tune_model_on_observed_pixels()`，确认函数签名中不存在 Ground Truth。
 3. 对照 Day 2 阅读 Trainer 新增的 `model_builder`。
 4. 阅读 `judge_candidate()`，手动代入本次三个指标。
@@ -311,9 +307,9 @@ python -m research_agent.run_day6 \
 
 ## 14. 今天的实践练习
 
-### 练习 1：复核公平配对
+### 练习 1：复核独立调优
 
-打开本次运行的 `round_1/paired_configurations.json`，逐对确认除 `tv_weight` 外的参数都完全相同。
+打开本次运行的 `round_1/tuning_configurations.json`，检查双方的可用配置数、实际 trial 数、搜索覆盖率和是否存在重复配置。
 
 ### 练习 2：强制走失败分支
 
@@ -335,7 +331,7 @@ python -m research_agent.run_day6 \
 
 ## 15. Day 6 完成标准
 
-- [x] 基础模型与候选使用相同 trial 数和训练预算。
+- [x] 基础模型与候选使用相同的单次训练协议，并在同一结构 trial 上限内独立调优。
 - [x] 调参函数不能接收隐藏 Ground Truth。
 - [x] 候选只能通过受限 `model_builder` 接入固定 Trainer。
 - [x] Judge 使用固定 PSNR/SSIM 门槛。

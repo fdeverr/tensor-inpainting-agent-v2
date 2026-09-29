@@ -27,7 +27,8 @@ class ExperimentConfig:
     image_size: Optional[int] = 128
     mat_key: Optional[str] = None
     missing_fill_value: float = 0.0
-    learned_metrics: bool = True
+    full_reference_metrics: bool = True
+    no_reference_metrics: bool = False
 
     def validate(self) -> None:
         image_path = Path(self.image_path)
@@ -46,8 +47,10 @@ class ExperimentConfig:
             raise ValueError("mat_key must be a non-empty string or None")
         if not 0.0 <= self.missing_fill_value <= 1.0:
             raise ValueError("missing_fill_value must be in [0, 1]")
-        if not isinstance(self.learned_metrics, bool):
-            raise ValueError("learned_metrics must be a bool")
+        if not isinstance(self.full_reference_metrics, bool):
+            raise ValueError("full_reference_metrics must be a bool")
+        if not isinstance(self.no_reference_metrics, bool):
+            raise ValueError("no_reference_metrics must be a bool")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -65,6 +68,7 @@ class ExperimentResult:
     actual_missing_rate: float
     missing_mse: float
     missing_psnr: Optional[float]
+    full_psnr: Optional[float]
     perfect_reconstruction: bool
     composite_ssim: float
     runtime_seconds: float
@@ -74,6 +78,7 @@ class ExperimentResult:
     clip_iqa: Optional[float] = None
     musiq: Optional[float] = None
     learned_metric_status: Dict[str, Any] = field(default_factory=dict)
+    metric_group_status: Dict[str, Any] = field(default_factory=dict)
     artifacts: Dict[str, str] = field(default_factory=dict)
     notes: Dict[str, str] = field(default_factory=dict)
 
@@ -93,7 +98,10 @@ SUPPORTED_MODEL_NAMES = {
     "hierarchical_tucker",
     "tt",
     "tensor_ring",
+    "siren",
 }
+
+SUPPORTED_TENSOR_MODEL_NAMES = SUPPORTED_MODEL_NAMES - {"siren"}
 
 
 @dataclass(frozen=True)
@@ -103,6 +111,7 @@ class TrainingConfig:
     learning_rate: float = 0.03
     max_steps: int = 500
     validation_observed_ratio: float = 0.1
+    validation_strategy: str = "mask_matched"
     validation_interval: int = 10
     early_stopping_patience: int = 20
     early_stopping_min_delta: float = 1e-7
@@ -116,6 +125,8 @@ class TrainingConfig:
             raise ValueError("max_steps must be positive")
         if not 0.0 < self.validation_observed_ratio < 1.0:
             raise ValueError("validation_observed_ratio must be strictly between 0 and 1")
+        if self.validation_strategy not in {"random", "mask_matched"}:
+            raise ValueError("validation_strategy must be random or mask_matched")
         if self.validation_interval < 1:
             raise ValueError("validation_interval must be positive")
         if self.early_stopping_patience < 1:
@@ -144,7 +155,8 @@ class Day2ExperimentConfig:
     image_size: Optional[int] = 128
     mat_key: Optional[str] = None
     missing_fill_value: float = 0.0
-    learned_metrics: bool = True
+    full_reference_metrics: bool = True
+    no_reference_metrics: bool = False
 
     def validate(self) -> None:
         ExperimentConfig(
@@ -156,7 +168,8 @@ class Day2ExperimentConfig:
             image_size=self.image_size,
             mat_key=self.mat_key,
             missing_fill_value=self.missing_fill_value,
-            learned_metrics=self.learned_metrics,
+            full_reference_metrics=self.full_reference_metrics,
+            no_reference_metrics=self.no_reference_metrics,
         ).validate()
         if self.model_name not in SUPPORTED_MODEL_NAMES:
             raise ValueError(

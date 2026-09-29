@@ -48,6 +48,86 @@ def _required_string(parameters: Dict[str, Any], name: str) -> str:
     return value
 
 
+def _persist_selected_training_output(
+    output_dir: Path,
+    run_id: str,
+    model_name: str,
+    hyperparameters: Dict[str, Any],
+    learning_rate: float,
+    observed: np.ndarray,
+    observed_mask: np.ndarray,
+    output: Any,
+) -> Dict[str, Any]:
+    """Persist the already-trained GT-best trial for direct downstream reuse."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = output_dir / "model_raw.npy"
+    completed_path = output_dir / "model_completed.npy"
+    raw_mat_path = output_dir / "model_raw.mat"
+    completed_mat_path = output_dir / "model_completed.mat"
+    raw_preview_path = output_dir / "model_raw_preview.png"
+    completed_preview_path = output_dir / "model_completed_preview.png"
+    history_path = output_dir / "selection_history.json"
+    checkpoint_path = output_dir / "model.pt"
+    result_path = output_dir / "training_result.json"
+    completed = output.reconstruction.copy()
+    completed[observed_mask] = observed[observed_mask]
+    save_tensor_data(str(raw_path), output.reconstruction)
+    save_tensor_data(str(completed_path), completed)
+    raw_mat = save_mat_companion(str(raw_mat_path), output.reconstruction)
+    completed_mat = save_mat_companion(str(completed_mat_path), completed)
+    save_image(str(raw_preview_path), output.reconstruction)
+    save_image(str(completed_preview_path), completed)
+    _write_json(history_path, {"history": output.history})
+    torch.save(
+        {
+            "model_name": model_name,
+            "hyperparameters": dict(hyperparameters),
+            "selected_steps": output.best_step,
+            "learning_rate": learning_rate,
+            "state_dict": output.state_dict,
+            "training_phase": "all_observed_training_gt_checkpoint_selection",
+        },
+        checkpoint_path,
+    )
+    best_history = next(
+        item for item in output.history if item["step"] == output.best_step
+    )
+    artifacts = {
+        "raw_reconstruction": str(raw_path),
+        "reconstruction": str(completed_path),
+        "raw_preview": str(raw_preview_path),
+        "preview": str(completed_preview_path),
+        "history": str(history_path),
+        "checkpoint": str(checkpoint_path),
+        "training_result": str(result_path),
+    }
+    if raw_mat is not None:
+        artifacts["raw_reconstruction_mat"] = raw_mat
+    if completed_mat is not None:
+        artifacts["reconstruction_mat"] = completed_mat
+    result = {
+        "run_id": run_id,
+        "model_name": model_name,
+        "hyperparameters": dict(hyperparameters),
+        "learning_rate": learning_rate,
+        "fitted_steps": output.best_step,
+        "final_train_mse": best_history["data_train_loss"],
+        "final_total_loss": best_history["total_train_loss"],
+        "selection_missing_gt_mse": output.best_validation_mse,
+        "selection_missing_psnr": output.best_missing_psnr,
+        "observed_pixels_used": int(output.train_mask.sum()),
+        "parameter_count": output.parameter_count,
+        "runtime_seconds": output.runtime_seconds,
+        "device": output.device,
+        "ground_truth_used_for_selection": True,
+        "reused_without_retraining": True,
+        "artifacts": artifacts,
+    }
+    _write_json(result_path, {key: value for key, value in result.items() if key != "artifacts"})
+    return result
+
+
 def _load_observed_pair(corrupted_path: str, mask_path: str) -> tuple:
     corrupted = load_tensor_data(corrupted_path, max_size=None)
     observed_mask = load_observation_mask(mask_path)
@@ -61,6 +141,9 @@ def _training_config(parameters: Dict[str, Any], learning_rate: float) -> Traini
         learning_rate=float(learning_rate),
         max_steps=int(parameters.get("max_steps", 200)),
         validation_observed_ratio=float(parameters.get("validation_ratio", 0.1)),
+        validation_strategy=str(
+            parameters.get("validation_strategy", "mask_matched")
+        ),
         validation_interval=int(parameters.get("validation_interval", 10)),
         early_stopping_patience=int(parameters.get("patience", 20)),
         device=str(parameters.get("device", "auto")),
@@ -72,14 +155,16 @@ def _metric_payload(
     ground_truth: np.ndarray,
     observed_mask: np.ndarray,
     device: str = "auto",
-    include_learned_metrics: bool = True,
+    include_full_reference_metrics: bool = True,
+    include_no_reference_metrics: bool = False,
 ) -> Dict[str, Any]:
     return evaluate_reconstruction_metrics(
         reconstruction,
         ground_truth,
         observed_mask,
         device=device,
-        include_learned_metrics=include_learned_metrics,
+        include_full_reference_metrics=include_full_reference_metrics,
+        include_no_reference_metrics=include_no_reference_metrics,
     )
 
 
@@ -207,8 +292,9 @@ def _default_candidates(
             alternatives.append(varied)
             break
     configurations = [primary, *alternatives]
+    learning_rate = 1e-4 if model_name == "siren" else 0.03
     return [
-        {"hyperparameters": item, "learning_rate": 0.03}
+        {"hyperparameters": item, "learning_rate": learning_rate}
         for item in configurations
     ]
 
@@ -304,17 +390,13 @@ class AnalyzeImageTool(ResearchTool):
             run_dir.mkdir(parents=True, exist_ok=True)
             ground_truth_path = run_dir / "evaluation_ground_truth.npy"
             corrupted_path = run_dir / "corrupted.npy"
-            ground_truth_mat_path = run_dir / "evaluation_ground_truth.mat"
             corrupted_mat_path = run_dir / "corrupted.mat"
-            ground_truth_preview_path = run_dir / "evaluation_ground_truth_preview.png"
             corrupted_preview_path = run_dir / "corrupted_preview.png"
             mask_path = run_dir / "mask.png"
             profile_path = run_dir / "image_profile.json"
             save_tensor_data(str(ground_truth_path), ground_truth)
             save_tensor_data(str(corrupted_path), corrupted)
-            save_mat_companion(str(ground_truth_mat_path), ground_truth)
             corrupted_mat = save_mat_companion(str(corrupted_mat_path), corrupted)
-            save_image(str(ground_truth_preview_path), ground_truth)
             save_image(str(corrupted_preview_path), corrupted)
             save_mask(str(mask_path), observed_mask)
 
@@ -447,14 +529,14 @@ class RunInterpolationTool(ResearchTool):
 
 
 class TuneTensorModelTool(ResearchTool):
-    """Select hyperparameters and step count using held-out observed pixels."""
+    """Select hyperparameters and checkpoints using missing-region GT."""
 
     def __init__(self) -> None:
         super().__init__(
             name="tune_tensor_model",
             description=(
-                "在观测像素内部划分 train/validation，对候选张量分解配置调参；"
-                "不读取人工缺失区域 Ground Truth。"
+                "使用全部观测像素训练，并用缺失区 Ground Truth 的 MSE "
+                "选择候选结构、学习率和 checkpoint。"
             ),
         )
 
@@ -463,6 +545,7 @@ class TuneTensorModelTool(ResearchTool):
             ToolParameter(name="run_id", type="string", description="工作流运行 ID"),
             ToolParameter(name="corrupted_path", type="string", description="缺损图片路径"),
             ToolParameter(name="mask_path", type="string", description="观测 mask 路径"),
+            ToolParameter(name="ground_truth_path", type="string", description="用于每轮选择的完整真值"),
             ToolParameter(name="output_path", type="string", description="调参结果 JSON 路径"),
             ToolParameter(
                 name="model_name",
@@ -472,6 +555,12 @@ class TuneTensorModelTool(ResearchTool):
             ToolParameter(name="seed", type="integer", description="随机种子"),
             ToolParameter(name="candidates", type="array", description="候选配置列表", required=False),
             ToolParameter(name="max_steps", type="integer", description="每个 trial 最大步数", required=False, default=200),
+            ToolParameter(name="refine_learning_rate", type="boolean", description="在粗搜胜出学习率附近进行二阶段精搜", required=False, default=False),
+            ToolParameter(name="learning_rate_refinement_factor", type="number", description="学习率精搜的缩放倍数", required=False, default=3.0),
+            ToolParameter(name="auto_expand_steps", type="boolean", description="最佳点靠近上限时自动扩大训练预算", required=False, default=False),
+            ToolParameter(name="max_steps_ceiling", type="integer", description="自动扩展的硬上限", required=False),
+            ToolParameter(name="near_limit_ratio", type="number", description="触发扩展的 best_step/max_steps 阈值", required=False, default=0.9),
+            ToolParameter(name="expansion_factor", type="number", description="每次扩展的预算倍数", required=False, default=2.0),
             ToolParameter(name="device", type="string", description="auto、cpu 或 cuda", required=False, default="auto"),
         ]
 
@@ -488,6 +577,9 @@ class TuneTensorModelTool(ResearchTool):
                 _required_string(parameters, "corrupted_path"),
                 _required_string(parameters, "mask_path"),
             )
+            ground_truth = load_tensor_data(
+                _required_string(parameters, "ground_truth_path"), None
+            )
             seed = int(parameters["seed"])
             candidates = parameters.get("candidates") or _default_candidates(
                 model_name,
@@ -496,12 +588,95 @@ class TuneTensorModelTool(ResearchTool):
             if not isinstance(candidates, list) or not candidates:
                 raise ValueError("candidates must be a non-empty list")
 
+            initial_max_steps = int(parameters.get("max_steps", 200))
+            refine_learning_rate = parameters.get("refine_learning_rate", False)
+            if not isinstance(refine_learning_rate, bool):
+                raise ValueError("refine_learning_rate must be a bool")
+            learning_rate_refinement_factor = float(
+                parameters.get("learning_rate_refinement_factor", 3.0)
+            )
+            auto_expand_steps = parameters.get("auto_expand_steps", False)
+            if not isinstance(auto_expand_steps, bool):
+                raise ValueError("auto_expand_steps must be a bool")
+            max_steps_ceiling = int(
+                parameters.get("max_steps_ceiling", initial_max_steps)
+            )
+            near_limit_ratio = float(parameters.get("near_limit_ratio", 0.9))
+            expansion_factor = float(parameters.get("expansion_factor", 2.0))
+            if initial_max_steps < 1:
+                raise ValueError("max_steps must be positive")
+            if learning_rate_refinement_factor <= 1.0:
+                raise ValueError(
+                    "learning_rate_refinement_factor must be greater than 1"
+                )
+            if max_steps_ceiling < initial_max_steps:
+                raise ValueError("max_steps_ceiling must be at least max_steps")
+            if not 0.0 < near_limit_ratio <= 1.0:
+                raise ValueError("near_limit_ratio must be in (0, 1]")
+            if expansion_factor <= 1.0:
+                raise ValueError("expansion_factor must be greater than 1")
+
             print(
                 "\n🔧 进入自动调参：%s，共 %d 个 trial，每个最多 %d 步"
-                % (model_name, len(candidates), int(parameters.get("max_steps", 200))),
+                % (model_name, len(candidates), initial_max_steps),
                 flush=True,
             )
             trials = []
+            training_run_count = 0
+            selected_output = None
+            selected_score = float("inf")
+
+            def execute_trial(
+                hyperparameters: Dict[str, Any],
+                learning_rate: float,
+                stage: str,
+                progress_label: str,
+            ) -> Dict[str, Any]:
+                nonlocal training_run_count, selected_output, selected_score
+                trial_parameters = dict(parameters)
+                trial_parameters["max_steps"] = initial_max_steps
+                trial_config = _training_config(trial_parameters, learning_rate)
+                output = train_tensor_model(
+                    model_name=model_name,
+                    model_hyperparameters=dict(hyperparameters),
+                    observed_image=corrupted,
+                    observed_mask=observed_mask,
+                    config=trial_config,
+                    seed=seed,
+                    progress_label=progress_label,
+                    ground_truth=ground_truth,
+                )
+                training_run_count += 1
+                record = {
+                    "trial_index": len(trials),
+                    "search_stage": stage,
+                    "model_name": model_name,
+                    "hyperparameters": dict(hyperparameters),
+                    "learning_rate": learning_rate,
+                    "max_steps": initial_max_steps,
+                    "best_step": output.best_step,
+                    "best_validation_mse": output.best_validation_mse,
+                    "best_missing_gt_mse": output.best_validation_mse,
+                    "best_missing_psnr": output.best_missing_psnr,
+                    "runtime_seconds": output.runtime_seconds,
+                    "parameter_count": output.parameter_count,
+                    "device": output.device,
+                    "stopped_early": output.stopped_early,
+                    "budget_history": [
+                        {
+                            "max_steps": initial_max_steps,
+                            "best_step": output.best_step,
+                            "best_validation_mse": output.best_validation_mse,
+                            "runtime_seconds": output.runtime_seconds,
+                            "stopped_early": output.stopped_early,
+                        }
+                    ],
+                }
+                if output.best_validation_mse < selected_score:
+                    selected_score = output.best_validation_mse
+                    selected_output = output
+                return record
+
             for trial_index, candidate in enumerate(candidates):
                 if not isinstance(candidate, dict):
                     raise ValueError("each candidate must be an object")
@@ -511,54 +686,187 @@ class TuneTensorModelTool(ResearchTool):
                 if not isinstance(hyperparameters, dict):
                     raise ValueError("candidate hyperparameters must be an object")
                 learning_rate = float(candidate.get("learning_rate", 0.03))
-                config = _training_config(parameters, learning_rate)
-                output = train_tensor_model(
-                    model_name=model_name,
-                    model_hyperparameters=dict(hyperparameters),
-                    observed_image=corrupted,
-                    observed_mask=observed_mask,
-                    config=config,
-                    seed=seed,
-                    progress_label=(
-                        "方法选择自动调参 %s trial %d/%d"
-                        % (model_name, trial_index + 1, len(candidates))
-                    ),
-                )
                 trials.append(
-                    {
-                        "trial_index": trial_index,
-                        "model_name": model_name,
-                        "hyperparameters": dict(hyperparameters),
-                        "learning_rate": learning_rate,
-                        "best_step": output.best_step,
-                        "best_validation_mse": output.best_validation_mse,
-                        "runtime_seconds": output.runtime_seconds,
-                        "parameter_count": output.parameter_count,
-                        "device": output.device,
-                    }
+                    execute_trial(
+                        dict(hyperparameters),
+                        learning_rate,
+                        "coarse",
+                        "方法选择自动调参 %s trial %d/%d"
+                        % (model_name, trial_index + 1, len(candidates)),
+                    )
                 )
 
             best_trial = min(trials, key=lambda trial: trial["best_validation_mse"])
+            coarse_trial_count = len(trials)
+            fine_trial_count = 0
+            if refine_learning_rate:
+                coarse_best = best_trial
+                fine_rates = (
+                    coarse_best["learning_rate"]
+                    / learning_rate_refinement_factor,
+                    coarse_best["learning_rate"]
+                    * learning_rate_refinement_factor,
+                )
+                for learning_rate in fine_rates:
+                    already_tested = any(
+                        trial["hyperparameters"] == coarse_best["hyperparameters"]
+                        and math.isclose(
+                            trial["learning_rate"], learning_rate, rel_tol=1e-12
+                        )
+                        for trial in trials
+                    )
+                    if not 1e-5 <= learning_rate <= 1.0 or already_tested:
+                        continue
+                    trials.append(
+                        execute_trial(
+                            coarse_best["hyperparameters"],
+                            learning_rate,
+                            "fine",
+                            "学习率精搜 %s trial %d"
+                            % (model_name, len(trials) + 1),
+                        )
+                    )
+                    fine_trial_count += 1
+                best_trial = min(
+                    trials, key=lambda trial: trial["best_validation_mse"]
+                )
+            expansion_history = []
+            while (
+                auto_expand_steps
+                and not best_trial["stopped_early"]
+                and best_trial["max_steps"] < max_steps_ceiling
+                and best_trial["best_step"]
+                >= near_limit_ratio * best_trial["max_steps"]
+            ):
+                previous_max_steps = int(best_trial["max_steps"])
+                expanded_max_steps = min(
+                    max_steps_ceiling,
+                    max(
+                        previous_max_steps + 1,
+                        int(math.ceil(previous_max_steps * expansion_factor)),
+                    ),
+                )
+                print(
+                    "\n↗ 当前最佳 trial %d 的最佳点 %d/%d 靠近上限，扩展至 %d 步重跑…"
+                    % (
+                        best_trial["trial_index"],
+                        best_trial["best_step"],
+                        previous_max_steps,
+                        expanded_max_steps,
+                    ),
+                    flush=True,
+                )
+                expanded_parameters = dict(parameters)
+                expanded_parameters["max_steps"] = expanded_max_steps
+                expanded_config = _training_config(
+                    expanded_parameters, best_trial["learning_rate"]
+                )
+                output = train_tensor_model(
+                    model_name=model_name,
+                    model_hyperparameters=dict(best_trial["hyperparameters"]),
+                    observed_image=corrupted,
+                    observed_mask=observed_mask,
+                    config=expanded_config,
+                    seed=seed,
+                    progress_label=(
+                        "调参预算扩展 %s trial %d（%d 步）"
+                        % (model_name, best_trial["trial_index"], expanded_max_steps)
+                    ),
+                    ground_truth=ground_truth,
+                )
+                training_run_count += 1
+                expansion_history.append(
+                    {
+                        "trial_index": best_trial["trial_index"],
+                        "from_max_steps": previous_max_steps,
+                        "to_max_steps": expanded_max_steps,
+                        "previous_best_step": best_trial["best_step"],
+                        "new_best_step": output.best_step,
+                        "new_best_validation_mse": output.best_validation_mse,
+                        "accepted": (
+                            output.best_validation_mse
+                            <= best_trial["best_validation_mse"]
+                        ),
+                    }
+                )
+                if output.best_validation_mse > best_trial["best_validation_mse"]:
+                    break
+                best_trial["max_steps"] = expanded_max_steps
+                best_trial["best_step"] = output.best_step
+                best_trial["best_validation_mse"] = output.best_validation_mse
+                best_trial["best_missing_gt_mse"] = output.best_validation_mse
+                best_trial["best_missing_psnr"] = output.best_missing_psnr
+                best_trial["runtime_seconds"] += output.runtime_seconds
+                best_trial["parameter_count"] = output.parameter_count
+                best_trial["device"] = output.device
+                best_trial["stopped_early"] = output.stopped_early
+                best_trial["budget_history"].append(
+                    {
+                        "max_steps": expanded_max_steps,
+                        "best_step": output.best_step,
+                        "best_validation_mse": output.best_validation_mse,
+                        "runtime_seconds": output.runtime_seconds,
+                        "stopped_early": output.stopped_early,
+                    }
+                )
+                selected_output = output
+                selected_score = output.best_validation_mse
+                best_trial = min(
+                    trials, key=lambda trial: trial["best_validation_mse"]
+                )
+            if selected_output is None:
+                raise RuntimeError("tuning did not retain a selected training output")
+            output_path = Path(_required_string(parameters, "output_path"))
+            selected_result = _persist_selected_training_output(
+                output_dir=output_path.parent / "selected_model",
+                run_id=run_id,
+                model_name=model_name,
+                hyperparameters=best_trial["hyperparameters"],
+                learning_rate=float(best_trial["learning_rate"]),
+                observed=corrupted,
+                observed_mask=observed_mask,
+                output=selected_output,
+            )
+            best_trial["artifacts"] = selected_result["artifacts"]
             result = {
                 "run_id": run_id,
-                "selection_metric": "held_out_observed_mse",
-                "ground_truth_used": False,
+                "selection_metric": "missing_region_ground_truth_mse",
+                "selection_scope": "missing_region_ground_truth",
+                "ground_truth_used": True,
+                "training_pixels": "all_observed_pixels",
                 "trial_count": len(trials),
+                "coarse_trial_count": coarse_trial_count,
+                "fine_trial_count": fine_trial_count,
+                "training_run_count": training_run_count,
+                "learning_rate_refinement_enabled": refine_learning_rate,
+                "learning_rate_refinement_factor": (
+                    learning_rate_refinement_factor
+                ),
+                "initial_max_steps": initial_max_steps,
+                "max_steps_ceiling": max_steps_ceiling,
+                "auto_expansion_enabled": auto_expand_steps,
+                "near_limit_ratio": near_limit_ratio,
+                "expansion_factor": expansion_factor,
+                "expansion_history": expansion_history,
                 "trials": trials,
                 "best": best_trial,
+                "selected_output": selected_result,
             }
-            output_path = Path(_required_string(parameters, "output_path"))
             _write_json(output_path, result)
             return ToolResponse.success(
                 text=(
-                    "调参完成：选择 trial %d，validation MSE=%.8f。"
+                    "调参完成：选择 trial %d，缺失区 GT MSE=%.8f。"
                     % (best_trial["trial_index"], best_trial["best_validation_mse"])
                 ),
                 data={
                     "run_id": run_id,
                     "best": best_trial,
+                    "selected_output": selected_result,
                     "trial_count": len(trials),
-                    "artifacts": {"tuning_result": str(output_path)},
+                    "artifacts": {
+                        "tuning_result": str(output_path),
+                        **selected_result["artifacts"],
+                    },
                 },
             )
         except (KeyError, TypeError, ValueError) as error:
@@ -710,7 +1018,7 @@ class TrainTensorModelTool(ResearchTool):
 
 
 class EvaluateReconstructionTool(ResearchTool):
-    """Evaluate one finished reconstruction; this is the only GT-consuming tool."""
+    """Evaluate one finished reconstruction with the full-reference tensor."""
 
     def __init__(self) -> None:
         super().__init__(
@@ -737,11 +1045,18 @@ class EvaluateReconstructionTool(ResearchTool):
                 default="auto",
             ),
             ToolParameter(
-                name="learned_metrics",
+                name="full_reference_metrics",
                 type="boolean",
-                description="是否计算 LPIPS/MANIQA/CLIP-IQA/MUSIQ",
+                description="是否计算全参考 LPIPS；PSNR/SSIM 始终计算",
                 required=False,
                 default=True,
+            ),
+            ToolParameter(
+                name="no_reference_metrics",
+                type="boolean",
+                description="是否计算 MANIQA/CLIP-IQA/MUSIQ",
+                required=False,
+                default=False,
             ),
         ]
 
@@ -769,8 +1084,11 @@ class EvaluateReconstructionTool(ResearchTool):
                 ground_truth,
                 observed_mask,
                 device=str(parameters.get("device", "auto")),
-                include_learned_metrics=bool(
-                    parameters.get("learned_metrics", True)
+                include_full_reference_metrics=bool(
+                    parameters.get("full_reference_metrics", True)
+                ),
+                include_no_reference_metrics=bool(
+                    parameters.get("no_reference_metrics", False)
                 ),
             )
             result = {
@@ -782,7 +1100,7 @@ class EvaluateReconstructionTool(ResearchTool):
             output_path = Path(_required_string(parameters, "output_path"))
             _write_json(output_path, result)
             psnr_text = (
-                "infinite" if metrics["missing_psnr"] is None else "%.4f" % metrics["missing_psnr"]
+                "infinite" if metrics["full_psnr"] is None else "%.4f" % metrics["full_psnr"]
             )
             return ToolResponse.success(
                 text="%s 评估完成：PSNR=%s dB。" % (algorithm_name, psnr_text),
@@ -803,7 +1121,7 @@ class CompareExperimentsTool(ResearchTool):
     def __init__(self) -> None:
         super().__init__(
             name="compare_experiments",
-            description="读取两个最终指标 JSON，以 missing PSNR 为主、SSIM 为辅选择胜者。",
+            description="读取两个最终指标 JSON，以缺失区域 PSNR 为主、SSIM 为辅选择胜者。",
         )
 
     def get_parameters(self) -> List[ToolParameter]:

@@ -1,6 +1,7 @@
 """LLM响应对象定义"""
 
 from typing import Optional, Dict, List
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 
@@ -20,6 +21,26 @@ class LLMToolResponse:
     model: str
     usage: Dict[str, int] = field(default_factory=dict)
     latency_ms: int = 0
+    responses_output: List[Dict] = field(default_factory=list)
+    """Responses 原始输出条目，供工具结果后的下一轮完整回传。"""
+
+    def to_assistant_message(self) -> Dict:
+        """构建工具调用历史，同时保留供应商所需的续接状态。"""
+        message = {
+            "role": "assistant",
+            "content": self.content,
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.arguments},
+                }
+                for call in self.tool_calls
+            ],
+        }
+        if self.responses_output:
+            message["responses_output"] = deepcopy(self.responses_output)
+        return message
 
 
 @dataclass
@@ -104,4 +125,3 @@ class StreamStats:
         if self.reasoning_content:
             result["reasoning_content"] = self.reasoning_content
         return result
-

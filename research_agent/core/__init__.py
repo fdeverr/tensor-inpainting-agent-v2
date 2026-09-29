@@ -21,6 +21,8 @@ from .masks import generate_observation_mask
 from .metrics import (
     composite_ssim,
     evaluate_reconstruction_metrics,
+    full_image_mse,
+    full_image_psnr,
     learned_image_quality_metrics,
     missing_region_mse,
     missing_region_psnr,
@@ -31,6 +33,8 @@ __all__ = [
     "apply_observation_mask",
     "composite_ssim",
     "evaluate_reconstruction_metrics",
+    "full_image_mse",
+    "full_image_psnr",
     "generate_observation_mask",
     "load_rgb_image",
     "load_tensor_data",

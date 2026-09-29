@@ -73,7 +73,8 @@ def run_day1_baseline(config: ExperimentConfig) -> ExperimentResult:
         reconstruction,
         ground_truth,
         observed_mask,
-        include_learned_metrics=config.learned_metrics,
+        include_full_reference_metrics=config.full_reference_metrics,
+        include_no_reference_metrics=config.no_reference_metrics,
     )
 
     artifact_paths = {
@@ -114,6 +115,7 @@ def run_day1_baseline(config: ExperimentConfig) -> ExperimentResult:
         actual_missing_rate=float((~observed_mask).mean()),
         missing_mse=metrics["missing_mse"],
         missing_psnr=metrics["missing_psnr"],
+        full_psnr=metrics["full_psnr"],
         perfect_reconstruction=metrics["perfect_reconstruction"],
         composite_ssim=metrics["composite_ssim"],
         lpips=metrics["lpips"],
@@ -121,6 +123,7 @@ def run_day1_baseline(config: ExperimentConfig) -> ExperimentResult:
         clip_iqa=metrics["clip_iqa"],
         musiq=metrics["musiq"],
         learned_metric_status=metrics["learned_metric_status"],
+        metric_group_status=metrics["metric_group_status"],
         runtime_seconds=float(time.perf_counter() - started_at),
         image_shape=list(ground_truth.shape),
         artifacts=artifact_paths,
