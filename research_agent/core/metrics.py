@@ -42,7 +42,7 @@ def _validate_metric_inputs(
         raise ValueError("inputs must have shape [H,W,C] or [H,W,T,C]")
     if any(int(size) <= 0 for size in prediction.shape):
         raise ValueError("all tensor dimensions must be positive")
-    if observed_mask.shape != prediction.shape[:2] or observed_mask.dtype != np.bool_:
+    if observed_mask.shape not in (prediction.shape[:2], prediction.shape) or observed_mask.dtype != np.bool_:
         raise ValueError("observed_mask must be bool and match image height and width")
     if observed_mask.all():
         raise ValueError("at least one missing pixel is required for missing-region metrics")
@@ -253,7 +253,7 @@ def learned_image_quality_metrics(
     ground_truth: np.ndarray,
     observed_mask: np.ndarray,
     device: str = "auto",
-    include_full_reference_metrics: bool = True,
+    include_full_reference_metrics: bool = False,
     include_no_reference_metrics: bool = False,
 ) -> Tuple[Dict[str, Optional[float]], Dict[str, Any]]:
     """Evaluate LPIPS, MANIQA, CLIP-IQA, and MUSIQ on the completed image.
@@ -346,10 +346,15 @@ def evaluate_reconstruction_metrics(
     observed_mask: np.ndarray,
     *,
     device: str = "auto",
-    include_full_reference_metrics: bool = True,
+    include_full_reference_metrics: bool = False,
     include_no_reference_metrics: bool = False,
 ) -> Dict[str, Any]:
     """Return the complete metric payload used by every experiment path."""
+
+    from .audio_metrics import active_audio_metadata, audio_nmse
+    audio = active_audio_metadata()
+    if audio is not None:
+        return audio_nmse(prediction, ground_truth, observed_mask, audio)
 
     missing_psnr = missing_region_psnr(prediction, ground_truth, observed_mask)
     full_psnr = full_image_psnr(prediction, ground_truth, observed_mask)

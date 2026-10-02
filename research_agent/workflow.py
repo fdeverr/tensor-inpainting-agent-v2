@@ -48,19 +48,23 @@ class Day3WorkflowConfig:
     seed: int = 42
     image_size: Optional[int] = 128
     mat_key: Optional[str] = None
+    observation_mask_path: Optional[str] = None
+    data_type: Optional[str] = None
+    historical_algorithm_reference: Optional[List[Dict[str, Any]]] = None
+    valid_element_count: Optional[int] = None
     model_name: str = "tucker"
     max_steps: int = 200
     validation_interval: int = 10
     patience: int = 20
     device: str = "auto"
     candidates: Optional[List[Dict[str, Any]]] = field(default=None)
-    full_reference_metrics: bool = True
+    full_reference_metrics: bool = False
     no_reference_metrics: bool = False
 
     def validate(self) -> None:
         if not Path(self.image_path).is_file():
             raise ValueError("image_path does not point to a file: %s" % self.image_path)
-        if self.mask_type not in {"random", "block"}:
+        if self.mask_type not in {"random", "block", "slices", "sildes"}:
             raise ValueError("mask_type must be random or block")
         if not 0.0 < self.missing_rate < 1.0:
             raise ValueError("missing_rate must be strictly between 0 and 1")
@@ -269,6 +273,9 @@ class Day3Workflow:
                     "seed": self.config.seed,
                     "image_size": self.config.image_size,
                     "mat_key": self.config.mat_key,
+                    "observation_mask_path": self.config.observation_mask_path,
+                    "data_type": self.config.data_type,
+                    "valid_element_count": self.config.valid_element_count,
                 },
             )
             self.state["artifacts"].update(analysis.data["artifacts"])
@@ -427,6 +434,7 @@ class Day3Workflow:
             )
             self.state["artifacts"]["tensor_metrics"] = str(tensor_metrics_path)
             metric_keys = (
+                "missing_nmse", "evaluation_metric", "audio_metric_status",
                 "missing_mse",
                 "missing_psnr",
                 "full_psnr",
@@ -440,10 +448,10 @@ class Day3Workflow:
                 "metric_group_status",
             )
             self.state["results"]["interpolation_metrics"] = {
-                key: baseline_evaluation.data[key] for key in metric_keys
+                key: baseline_evaluation.data[key] for key in metric_keys if key in baseline_evaluation.data
             }
             self.state["results"]["tensor_metrics"] = {
-                key: tensor_evaluation.data[key] for key in metric_keys
+                key: tensor_evaluation.data[key] for key in metric_keys if key in tensor_evaluation.data
             }
             self._run_additional_baselines(ground_truth_path)
             self._transition("TRAINED", "EVALUATED")

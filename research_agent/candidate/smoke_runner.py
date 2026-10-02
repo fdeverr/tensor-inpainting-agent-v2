@@ -95,6 +95,12 @@ def _main() -> int:
         train_mask = torch.ones(image_shape[:2], dtype=torch.bool)
         train_mask[4:8, 5:10] = False
         loss_terms = model.loss_terms(prediction, observed, train_mask)
+        element_mask = torch.rand(image_shape) > 0.4
+        element_mask[..., 0] = False
+        element_terms = model.loss_terms(prediction, observed, element_mask)
+        expected_data_loss = torch.square(prediction - observed)[element_mask].mean()
+        if not torch.allclose(element_terms["data_loss"], expected_data_loss):
+            raise ValueError("elementwise mask must preserve the fixed observed-only MSE")
         if not isinstance(loss_terms, dict) or "data_loss" not in loss_terms:
             raise TypeError("loss_terms must return a dict containing data_loss")
         total_loss = sum(loss_terms.values())

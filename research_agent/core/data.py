@@ -235,6 +235,20 @@ def load_rgb_image(path: str, max_size: Optional[int] = None) -> np.ndarray:
     return data
 
 
+def load_tensor_prediction(path: str) -> np.ndarray:
+    """Read saved predictions without rescaling errors or clipping model outputs."""
+    source = Path(path)
+    if source.suffix.lower() == ".npy":
+        data = np.load(source, allow_pickle=False)
+    elif source.suffix.lower() == ".mat":
+        data, _, _ = _load_mat(source, None)
+    else:
+        return load_tensor_data(path)
+    data = np.asarray(data, dtype=np.float32)
+    validate_tensor_array(data)
+    return data
+
+
 def to_rgb_preview(data: np.ndarray) -> np.ndarray:
     """Create an RGB preview without changing the underlying tensor data."""
 
@@ -304,6 +318,13 @@ def save_mat_companion(path: str, data: np.ndarray, key: str = "data") -> Option
 def save_mask(path: str, observed_mask: np.ndarray) -> None:
     """Save an observation mask with white=observed and black=missing."""
 
+    destination = Path(path)
+    if destination.suffix.lower() == ".npy":
+        if observed_mask.dtype != np.bool_ or observed_mask.ndim not in (2, 3, 4):
+            raise ValueError("mask must be a 2-D, 3-D or 4-D boolean array")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        np.save(destination, observed_mask, allow_pickle=False)
+        return
     if observed_mask.ndim != 2 or observed_mask.dtype != np.bool_:
         raise ValueError("observed_mask must be a bool array with shape [H, W]")
     destination = Path(path)
@@ -318,9 +339,14 @@ def load_observation_mask(path: str) -> np.ndarray:
     source = Path(path)
     if not source.is_file():
         raise ValueError("mask file does not exist: %s" % source)
-    with Image.open(source) as mask_image:
-        mask = np.asarray(mask_image.convert("L"), dtype=np.uint8) >= 128
-    if mask.ndim != 2 or not mask.any() or mask.all():
+    if source.suffix.lower() == ".npy":
+        mask = np.load(source, allow_pickle=False)
+        if mask.dtype != np.bool_:
+            raise ValueError("NPY mask must be boolean")
+    else:
+        with Image.open(source) as mask_image:
+            mask = np.asarray(mask_image.convert("L"), dtype=np.uint8) >= 128
+    if mask.ndim not in (2, 3, 4) or not mask.any() or mask.all():
         raise ValueError("mask must contain both observed and missing pixels")
     return mask.astype(np.bool_)
 
@@ -333,7 +359,7 @@ def apply_observation_mask(
     """Hide missing spatial samples across every channel/frame feature."""
 
     validate_tensor_array(data)
-    if observed_mask.shape != data.shape[:2] or observed_mask.dtype != np.bool_:
+    if observed_mask.shape not in (data.shape[:2], data.shape) or observed_mask.dtype != np.bool_:
         raise ValueError("observed_mask must be bool and match tensor height and width")
     if not 0.0 <= missing_fill_value <= 1.0:
         raise ValueError("missing_fill_value must be in [0, 1]")

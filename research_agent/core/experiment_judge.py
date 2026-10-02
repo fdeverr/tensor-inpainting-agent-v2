@@ -19,11 +19,51 @@ def judge_candidate(
     candidate_final: Dict[str, Any],
     minimum_psnr_delta: float = 0.2,
     ssim_tolerance: float = 0.002,
+    minimum_nmse_delta: float = 0.0,
 ) -> Dict[str, Any]:
     """Apply the fixed promotion gate; the LLM never decides acceptance."""
 
     baseline_metrics = baseline_final["metrics"]
     candidate_metrics = candidate_final["metrics"]
+    if "missing_nmse" in baseline_metrics or "missing_nmse" in candidate_metrics:
+        baseline_nmse = baseline_metrics.get("missing_nmse")
+        candidate_nmse = candidate_metrics.get("missing_nmse")
+        defined = all(isinstance(value, (int, float)) and math.isfinite(value)
+                      for value in (baseline_nmse, candidate_nmse))
+        reduction = baseline_nmse - candidate_nmse if defined else None
+        failures = []
+        if not defined:
+            failures.append("missing waveform NMSE is undefined; no promotion")
+        elif reduction <= minimum_nmse_delta:
+            failures.append("missing waveform NMSE reduction must exceed the promotion threshold")
+        total_loss = candidate_final.get("final_total_loss")
+        unstable = isinstance(total_loss, (int, float)) and (not math.isfinite(total_loss) or total_loss > 1.0)
+        if unstable:
+            failures.append("candidate selected checkpoint has a numerically unstable training loss")
+        baseline_runtime = _total_runtime(baseline_tuning, baseline_final)
+        candidate_runtime = _total_runtime(candidate_tuning, candidate_final)
+        return {
+            "decision": "reject" if failures else "accept", "accepted": not failures,
+            "primary_metric": "missing_nmse", "nmse_delta": reduction,
+            "nmse_delta_interpretation": "incumbent_minus_candidate; positive_is_improvement",
+            "psnr_delta": None, "ssim_delta": None, "lpips_delta": None,
+            "runtime_ratio": candidate_runtime / baseline_runtime if baseline_runtime > 0 else None,
+            "thresholds": {"minimum_nmse_delta": minimum_nmse_delta}, "gate_failures": failures,
+            "training_behavior": {
+                "baseline_best_step": baseline_tuning["best"]["best_step"],
+                "candidate_best_step": candidate_tuning["best"]["best_step"],
+                "candidate_selected_checkpoint_unstable": unstable,
+            },
+            "suspected_causes": failures,
+            "next_round_constraints": ["Reduce missing original-waveform NMSE under the same frozen mask, seed and training budget; do not use PSNR/SSIM for audio."],
+            "budget_audit": {
+                "trial_count_equality_required": False,
+                "baseline_trial_count": baseline_tuning["trial_count"],
+                "candidate_trial_count": candidate_tuning["trial_count"],
+                "baseline_total_runtime_seconds": baseline_runtime,
+                "candidate_total_runtime_seconds": candidate_runtime,
+            },
+        }
     baseline_psnr = baseline_metrics.get("missing_psnr")
     candidate_psnr = candidate_metrics.get("missing_psnr")
     psnr_delta = (

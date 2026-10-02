@@ -67,12 +67,12 @@ class BaseTensorInpaintingModel(nn.Module, ABC):
             raise ValueError("prediction shape does not match model image_shape")
         if observed.shape != prediction.shape:
             raise ValueError("observed image shape must match prediction")
-        if train_mask.shape != prediction.shape[:2] or train_mask.dtype != torch.bool:
+        if tuple(train_mask.shape) not in (tuple(prediction.shape[:2]), tuple(prediction.shape)) or train_mask.dtype != torch.bool:
             raise ValueError("train_mask must be bool with shape [H, W]")
         if not bool(train_mask.any()):
             raise ValueError("train_mask must contain at least one training pixel")
 
-        expanded_mask = train_mask[(...,) + (None,) * (prediction.ndim - 2)].expand_as(
+        expanded_mask = train_mask[(...,) + (None,) * (prediction.ndim - train_mask.ndim)].expand_as(
             prediction
         )
         data_loss = torch.square(prediction - observed)[expanded_mask].mean()

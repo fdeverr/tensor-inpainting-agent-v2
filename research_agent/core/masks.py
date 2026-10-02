@@ -68,7 +68,52 @@ def generate_observation_mask(
         return _random_mask(height, width, target_missing, rng)
     if mask_type == "block":
         return _block_mask(height, width, target_missing, rng)
+    if mask_type in {"slices", "sildes"}:
+        count = min(height - 1, max(1, int(round(height * missing_rate))))
+        if height < 2:
+            raise ValueError("slice axis must contain at least two entries")
+        mask = np.ones((height, width), dtype=np.bool_)
+        mask[rng.choice(height, count, replace=False), :] = False
+        return mask
     raise ValueError("unsupported mask_type %r; expected 'random' or 'block'" % mask_type)
+
+
+def generate_tensor_mask(shape, missing_rate, mask_type, seed, slice_axis=0):
+    """Elementwise random, contiguous N-D block, or whole-slice missingness.
+
+    True means observed. Slice budgets are rounded to whole slices and the
+    caller must report the actual rate rather than pretending it is exact.
+    """
+    shape = tuple(int(x) for x in shape)
+    if not shape or min(shape) < 1 or math.prod(shape) < 2 or not 0 < missing_rate < 1:
+        raise ValueError("invalid tensor shape or missing rate")
+    rng = np.random.default_rng(seed)
+    if mask_type in {"slices", "sildes"}:
+        if not 0 <= slice_axis < len(shape) or shape[slice_axis] < 2:
+            raise ValueError("slice axis must contain at least two entries")
+        count = min(shape[slice_axis] - 1, max(1, round(shape[slice_axis] * missing_rate)))
+        mask = np.ones(shape, dtype=np.bool_)
+        selection = [slice(None)] * len(shape)
+        selection[slice_axis] = rng.choice(shape[slice_axis], count, replace=False)
+        mask[tuple(selection)] = False
+        return mask
+    count = min(math.prod(shape) - 1, max(1, round(math.prod(shape) * missing_rate)))
+    mask = np.ones(math.prod(shape), dtype=np.bool_)
+    if mask_type == "random":
+        indices = rng.choice(mask.size, count, replace=False)
+    elif mask_type == "block":
+        scores = np.zeros(shape, dtype=np.float32)
+        for axis, length in enumerate(shape):
+            center = rng.uniform(0.25, 0.75) * (length - 1)
+            distances = np.abs(np.arange(length) - center) / max(length, 1)
+            view = [1] * len(shape)
+            view[axis] = length
+            scores = np.maximum(scores, distances.reshape(view))
+        indices = np.argpartition(scores.ravel(), count - 1)[:count]
+    else:
+        raise ValueError("mask_type must be random, block, slices, or sildes")
+    mask[indices] = False
+    return mask.reshape(shape)
 
 
 def split_observed_mask(
@@ -83,7 +128,7 @@ def split_observed_mask(
     is exact, seeded, and never exposes hidden ground truth to tuning.
     """
 
-    if observed_mask.ndim != 2 or observed_mask.dtype != np.bool_:
+    if observed_mask.ndim not in (2, 3, 4) or observed_mask.dtype != np.bool_:
         raise ValueError("observed_mask must be a bool array with shape [H, W]")
     if not 0.0 < validation_ratio < 1.0:
         raise ValueError("validation_ratio must be strictly between 0 and 1")
@@ -99,7 +144,7 @@ def split_observed_mask(
         max(1, int(round(observed_indices.size * validation_ratio))),
     )
     rng = np.random.default_rng(seed)
-    if strategy == "mask_matched" and _has_compact_missing_region(observed_mask):
+    if strategy == "mask_matched" and observed_mask.ndim == 2 and _has_compact_missing_region(observed_mask):
         validation_indices = _compact_observed_holdout(
             observed_mask,
             validation_count,

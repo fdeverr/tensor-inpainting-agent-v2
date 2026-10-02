@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 from html import escape
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +13,101 @@ def _number(value: Optional[float], digits: int = 4) -> str:
     if value is None:
         return "N/A"
     return ("%%.%df" % digits) % float(value)
+
+
+BUILTIN_FRAMEWORKS = {
+    "nearest_neighbor_manhattan": "Manhattan 最近邻插值：对每个缺失位置寻找曼哈顿距离最近的可见像素，复制其特征值；无需训练。",
+    "matrix": "低秩矩阵分解：将张量展开为 H × (W·F)，用两个可学习因子 U、V 的矩阵乘积重建，再恢复原始形状并加特征偏置。",
+    "mode3": "Mode-3 分解：学习空间系数 A[H,W,R] 与特征因子 E[F,R]，沿秩维收缩得到完整张量，再加特征偏置。",
+    "cp": "CP 分解：学习高度、宽度、特征三个因子，将 R 个秩一张量相加得到重建，再加特征偏置。",
+    "nonnegative_cp": "非负 CP 分解：用非负参数化约束因子，以秩一张量的求和构造非负重建。",
+    "tucker": "Tucker 分解：学习核心张量 G 和高度、宽度、特征因子 U、V、E；通过 G ×₁ U ×₂ V ×₃ E 重建，再加特征偏置。",
+    "nonnegative_tucker": "非负 Tucker 分解：对核心和各模态因子采用 softplus 非负参数化，通过核心与三组因子的收缩生成重建。",
+    "hierarchical_tucker": "层次 Tucker 分解：以高度、宽度叶因子和空间转移张量组织空间低秩表示，再通过根核心与特征因子组合重建。",
+    "btd": "块项分解：每个块使用核心张量和高度、宽度、特征因子，重建各块后相加并加入特征偏置。",
+    "tsvd": "t-SVD 风格低秩模型：在特征轴的频域学习低秩因子，频域矩阵乘积后通过逆实数 FFT 恢复张量，再加特征偏置。",
+    "tt": "Tensor Train 分解：学习三个链式核心，沿相邻核心之间的秩维收缩，得到完整张量并加入特征偏置。",
+    "tensor_ring": "Tensor Ring 分解：学习高度、宽度、特征三个环状核心，闭合收缩环上的秩维，得到重建并加入特征偏置。",
+    "siren": "SIREN 隐式神经表示：归一化二维坐标 → 正弦激活的全连接隐藏层 → 线性特征输出 → 恢复图像/张量形状。",
+}
+
+
+def _best_algorithm_lines(
+    final_state: Dict[str, Any], day4: Dict[str, Any],
+    day6: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Describe the actual winner, not the last proposed (possibly rejected) model."""
+    winner = final_state["best_available"]
+    algorithm = winner["algorithm"]
+    audio = "missing_nmse" in winner.get("metrics", {})
+    dataset_mode = bool(final_state.get("config", {}).get("evolution_cases"))
+    lines = ["## 最佳算法与模型框架", "", "- 最佳算法：`%s`" % algorithm,
+             "- 选择依据：每轮在该类全部样本上比较 incumbent 与 candidate，按平均缺失波形 NMSE 和完整性门槛决定是否接受；输出最后的进化 incumbent。" if dataset_mode and audio else
+             "- 选择依据：每轮在该类全部样本上比较 incumbent 与 candidate，按平均 Missing-region PSNR、平均 SSIM 和完整性门槛决定是否接受；输出最后的进化 incumbent。" if dataset_mode else
+             "- 选择依据：选择缺失原始波形 NMSE 最低者；进化候选须通过 NMSE Judge。" if audio else
+             "- 选择依据：在允许作为最终输出的方法中，选择 Missing-region PSNR 最高者；进化候选须先通过固定 Judge。",
+             "- 参数量：`%s`" % winner.get("parameter_count", "N/A"), ""]
+    evolved = (day6 or {}).get("best_evolved") or {}
+    if algorithm == evolved.get("algorithm") and winner.get("role") == "candidate":
+        description = evolved.get("model_description", {})
+        accepted = [r for r in (day6 or {}).get("rounds", [])
+                    if r.get("judgment", {}).get("accepted")]
+        record = accepted[-1] if accepted else {}
+        proposal = description.get("proposal") or record
+        lines += ["### 模型设计", "",
+                  "- 架构族：`%s`" % proposal.get("architecture_family", "未记录"),
+                  "- 基础方法：`%s`（进化后的具体实现以冠军代码为准）" % day4["selected_model"],
+                  "- 设计思路：%s" % proposal.get("idea", "未记录"),
+                  "- 变异说明：%s" % proposal.get("single_change", "未记录")]
+        for component in proposal.get("components", []):
+            lines.append("- 组件 `%s`：%s；预期作用：%s"
+                         % (component.get("id", "?"), component.get("change", "未记录"),
+                            component.get("expected_role", "未记录")))
+        lines += ["", "以上设计说明来自候选提案，不等同于消融验证结论；实际启用的组件由最佳配置中的开关决定。"]
+        config = description.get("selected_config", {})
+        source = description.get("source_path")
+        code = description.get("source_code")
+        if source:
+            lines += ["", "冠军模型实现：`%s`" % source]
+        if code:
+            try:
+                tree = ast.parse(code)
+                forward_sections = [
+                    (node.name, ast.get_source_segment(code, method))
+                    for node in tree.body if isinstance(node, ast.ClassDef)
+                    for method in node.body
+                    if isinstance(method, ast.FunctionDef) and method.name == "forward"
+                ]
+            except SyntaxError:
+                forward_sections = []
+            if forward_sections:
+                lines += ["", "### 前向重建框架", "",
+                          "以下摘录冠军代码中的实际 forward；内部模块的初始化与具体实现见下方完整代码。"]
+                for name, segment in forward_sections:
+                    lines += ["", "`%s`：" % name, "", "```python", segment or "", "```"]
+            lines += ["", "<details>", "<summary>冠军模型完整实现</summary>",
+                      "", "```python", code.rstrip(), "```", "", "</details>"]
+    else:
+        lines += [BUILTIN_FRAMEWORKS.get(algorithm, "该算法的框架说明未记录，请查阅模型实现。")]
+        if algorithm == "siren":
+            config = day4.get("results", {}).get("siren_comparison", {}).get("training", {})
+        elif winner.get("role") == "tensor_baseline":
+            config = day4.get("results", {}).get("training", {})
+            if day6 and day6.get("rounds"):
+                config = day6["rounds"][0].get("baseline_tuning", {}).get("best", config)
+        else:
+            config = {}
+    selected = {key: config[key] for key in
+                ("hyperparameters", "learning_rate", "best_step", "fitted_steps") if key in config}
+    if selected:
+        lines += ["", "### 最佳配置", "", "```json",
+                  json.dumps(selected, ensure_ascii=False, indent=2), "```"]
+    if algorithm != "nearest_neighbor_manhattan":
+        lines += ["", "训练与输出流程：波形张量预测 → 可见采样点损失反向传播 → 缺失原始波形 GT NMSE 选择 checkpoint → 直接复用 → 恢复已观测采样点。" if audio else
+                  "训练与输出流程：完整张量预测 → 全部可见像素上的损失反向传播 → 缺失区 GT MSE 选择最佳 checkpoint → 直接复用该 checkpoint 的预测 → 恢复已观测像素，输出完整补全结果。",
+                  "GT 用于参数/检查点选择，不进入梯度损失；音频效果仅用缺失原始波形 NMSE 评价。" if audio else
+                  "GT 用于参数/检查点选择，不进入梯度损失；PSNR、SSIM 用于效果评估。"]
+    return lines + [""]
 
 
 def build_method_results(
@@ -325,6 +422,9 @@ def render_research_report(
     if screening.get("status") == "completed":
         lines.extend(
             [
+                ("- LLM 推荐方法：`%s`" % screening["selector_recommended_methods"] if
+                 screening.get("selector_recommended_methods") else
+                 "- 规则回退首选：`%s`" % screening.get("selector_recommendation", "N/A")),
                 "- 数值预赛候选：`%s`" % screening.get("shortlist", []),
                 "- 预赛选择范围：`%s`"
                 % screening.get("selection_scope", "unknown"),
@@ -335,7 +435,37 @@ def render_research_report(
                 ),
             ]
         )
-    lines.extend([""] + _comparison_image_lines(final_state))
+        if screening.get("selection_scope") == "all_valid_samples_of_modality":
+            audio_screen = screening.get("selection_metric") == "mean_missing_nmse"
+            lines.extend(["", "### 基础方法整类轻量预赛", "",
+                          "代表样本用于等量调参；各方法最佳配置随后冻结，在同类全部样本上独立拟合。"
+                          "只有全部样本成功的方法才能胜出。", ""])
+            if audio_screen:
+                lines.extend(["| 方法 | 成功/总数 | 平均 NMSE ↓ | 状态 |",
+                              "|---|---:|---:|---|"])
+            else:
+                lines.extend(["| 方法 | 成功/总数 | 平均 PSNR ↑ | 平均 SSIM ↑ | 状态 |",
+                              "|---|---:|---:|---:|---|"])
+            for result in screening.get("results", []):
+                summary = (result.get("dataset_evaluation") or {}).get("summary", {})
+                name = result["method"]
+                if name == screening.get("winner"):
+                    name = "**%s**" % name
+                count = "%s/%s" % (summary.get("completed_count", 0),
+                                    summary.get("expected_count", "?"))
+                if audio_screen:
+                    lines.append("| %s | %s | %s | %s |" % (
+                        name, count, _number(summary.get("mean_missing_nmse"), 6),
+                        result.get("status", "unknown")))
+                else:
+                    psnr = ("∞" if summary.get("complete") and summary.get("perfect_count") else
+                            _number(summary.get("mean_missing_psnr")))
+                    lines.append("| %s | %s | %s | %s | %s |" % (
+                        name, count, psnr, _number(summary.get("mean_composite_ssim")),
+                        result.get("status", "unknown")))
+            lines.append("")
+    lines.extend([""] + _best_algorithm_lines(final_state, day4, day6))
+    lines.extend(_comparison_image_lines(final_state))
     lines.extend(
         [
             "",
@@ -381,6 +511,11 @@ def render_research_report(
     columns = [("missing_psnr", "Missing-region PSNR ↑"),
                ("full_psnr", "Full-image PSNR ↑"),
                ("composite_ssim", "Composite SSIM ↑")]
+    audio = any("missing_nmse" in item["metrics"] for item in final_state["method_results"])
+    if audio:
+        columns = [("missing_nmse", "Missing waveform NMSE ↓")]
+    if final_state.get("config", {}).get("evolution_cases"):
+        lines.extend(["", "下表为结构搜索样本上的诊断指标；每轮整类评分、逐样本结果和最终整类版本比较见外层 recovery 报告。", ""])
     if show_lpips:
         columns += full_reference_optional
     if show_no_reference:
@@ -391,13 +526,13 @@ def render_research_report(
     for item in final_state["method_results"]:
         runtime = "N/A" if item["runtime_seconds"] is None else _number(item["runtime_seconds"]) + " s"
         cells = [item["algorithm"], item["role"]]
-        cells += [_number(item["metrics"].get(key)) for key, _ in columns]
+        cells += [("N/A" if item["metrics"].get(key) is None else "%.6g" % item["metrics"][key]) if audio else _number(item["metrics"].get(key)) for key, _ in columns]
         cells += [runtime, str(item["parameter_count"]), "是" if item["eligible_for_final_output"] else "否"]
         lines.append("| " + " | ".join(cells) + " |")
     if show_lpips or show_no_reference:
         lines.extend([
             "",
-            "全参考组包含 MSE、PSNR、SSIM 与 LPIPS；无参考组包含 MANIQA、CLIP-IQA 与 MUSIQ。神经指标仅适用于 RGB `[H,W,3]`，MSI/视频会明确跳过；`N/A` 的具体原因记录在 state JSON 的 `learned_metric_status` 中。",
+            "MSE、PSNR、SSIM 始终计算；LPIPS 属于可选全参考指标，默认关闭。无参考组包含 MANIQA、CLIP-IQA 与 MUSIQ。神经指标仅适用于 RGB `[H,W,3]`，MSI/视频会明确跳过；`N/A` 的具体原因记录在 state JSON 的 `learned_metric_status` 中。",
         ])
     if day6:
         judgment = day6["rounds"][-1]["judgment"]
@@ -430,14 +565,17 @@ def render_research_report(
                     judgment["budget_audit"].get("llm_requested_max_steps", "N/A"),
                     judgment["budget_audit"].get("user_max_steps_ceiling", "N/A"),
                 ),
-                "- Missing-region PSNR 差值：%s dB"
-                % _number(judgment["psnr_delta"]),
+                ("- Missing waveform NMSE 降低量：%s" % _number(judgment["nmse_delta"])) if audio else
+                "- Missing-region PSNR 差值：%s dB" % _number(judgment["psnr_delta"]),
+                "音频仅使用原始幅值波形的缺失区 NMSE 评价，不计算 PSNR/SSIM。" if audio else
                 "- Composite SSIM 差值：%s" % _number(judgment["ssim_delta"]),
                 "- 总运行时间比：%s" % _number(judgment["runtime_ratio"]),
                 "- 决策：`%s`" % judgment["decision"],
                 "- 停止原因：`%s`" % day6["stop_reason"],
                 "",
-                "模型梯度始终只由全部可见像素计算；缺失区 Ground Truth MSE 直接选择结构、学习率、早停点和最终输出。该结果属于单图 oracle 搜索，不代表未见数据泛化性。",
+                ("模型梯度始终只由全部可见像素计算；研发样本 GT 用于结构/超参数与 checkpoint 搜索，各样本缺失区 GT 指标用于每轮整类算法选择。这是 oracle 开发评测，不代表未见数据泛化性。"
+                 if final_state.get("config", {}).get("evolution_cases") else
+                 "模型梯度始终只由全部可见像素计算；缺失区 Ground Truth MSE 直接选择结构、学习率、早停点和最终输出。该结果属于单图 oracle 搜索，不代表未见数据泛化性。"),
                 "每轮只允许一个算法或 loss 变异点；接受后更新当前最优并继续，而不是提前终止。",
             ]
         )
@@ -457,14 +595,6 @@ def render_research_report(
             % (
                 day6.get("artifacts", {}).get("run_practice", {}).get(
                     "practice_markdown", "not generated"
-                )
-                if day6
-                else "not generated"
-            ),
-            "- 跨运行可复用经验文档：`%s`"
-            % (
-                day6.get("artifacts", {}).get("global_experience", {}).get(
-                    "experience_markdown", "not generated"
                 )
                 if day6
                 else "not generated"

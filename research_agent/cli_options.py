@@ -30,7 +30,7 @@ def add_optional_evaluation(parser: argparse.ArgumentParser, option: str) -> Non
         "siren-comparison": "independent SIREN implicit-neural baseline",
     }
     destination = option.replace("-", "_")
-    enabled_by_default = option in {"full-reference-metrics", "siren-comparison"}
+    enabled_by_default = option == "siren-comparison"
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--" + option, dest=destination, action="store_true",

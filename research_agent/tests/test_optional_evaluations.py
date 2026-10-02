@@ -61,7 +61,7 @@ def test_cli_evaluation_switches_use_intended_defaults_and_allow_overrides(modul
     for option in options:
         destination = option.replace("-", "_")
         assert getattr(defaults, destination) is (
-            option in {"full-reference-metrics", "siren-comparison"}
+            option == "siren-comparison"
         )
         assert getattr(parser.parse_args(required + ["--" + option]), destination) is True
         assert getattr(parser.parse_args(required + ["--skip-" + option]), destination) is False
@@ -69,7 +69,7 @@ def test_cli_evaluation_switches_use_intended_defaults_and_allow_overrides(modul
             parser.parse_args(required + ["--" + option, "--skip-" + option])
 
 
-def test_default_metrics_include_learned_models(monkeypatch):
+def test_explicit_lpips_metrics_include_learned_models(monkeypatch):
     def learned_scores(*args, **kwargs):
         assert kwargs["include_full_reference_metrics"] is True
         assert kwargs["include_no_reference_metrics"] is False
@@ -87,7 +87,9 @@ def test_default_metrics_include_learned_models(monkeypatch):
     reference = np.full((16, 16, 3), 0.5, dtype=np.float32)
     mask = np.ones((16, 16), dtype=bool)
     mask[4:12, 4:12] = False
-    result = evaluate_reconstruction_metrics(reference, reference, mask)
+    result = evaluate_reconstruction_metrics(
+        reference, reference, mask, include_full_reference_metrics=True
+    )
     assert result["composite_ssim"] == 1.0
     assert result["learned_metric_status"]["requested"] is True
     assert result["lpips"] == 0.0

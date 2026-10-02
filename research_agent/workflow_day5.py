@@ -18,7 +18,6 @@ from .candidate import (
 )
 from .candidate.generator import load_improver_context
 from .candidate.search_contract import evaluate_search_space_contract
-from .evolution_knowledge import GlobalExperienceStore, resolve_knowledge_root
 from .method_selector import llm_from_environment
 from .core.models.registry import MODEL_CLASSES
 from .visual_evaluator import (
@@ -52,6 +51,7 @@ class Day5WorkflowConfig:
     llm_mode: str = "auto"
     smoke_timeout_seconds: float = 10.0
     visual_assessment: bool = False
+    dataset_algorithm_reference: Optional[Dict[str, Any]] = None
 
     def validate(self) -> None:
         state_path = Path(self.base_run_dir) / "state.json"
@@ -133,14 +133,11 @@ class Day5Workflow:
         try:
             print("\n🧠 正在整理基线模型、图像特征和训练曲线供 LLM 分析…", flush=True)
             context = load_improver_context(self.config.base_run_dir)
-            global_experience = GlobalExperienceStore(
-                resolve_knowledge_root(
-                    self.config.candidate_root, self.config.knowledge_root
-                ),
-                context["base_method"],
-            )
+            if self.config.dataset_algorithm_reference:
+                context["algorithm_comparison_reference"]["whole_modality_algorithms"] = (
+                    self.config.dataset_algorithm_reference
+                )
             context["evolution_memory"] = {
-                "global_reusable_experience": global_experience.context(),
                 "current_run_practice": [],
             }
             context["mutation_visual_assessment_enabled"] = bool(
@@ -177,9 +174,6 @@ class Day5Workflow:
             )
             self.state["artifacts"]["initial_interpolation_visual_assessment"] = str(
                 initial_visual_path
-            )
-            self.state["artifacts"]["global_experience"] = (
-                global_experience.context()["documents"]
             )
             self.state["base_run_id"] = context["base_run_id"]
             self._save()

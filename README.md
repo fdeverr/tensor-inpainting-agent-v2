@@ -4,6 +4,10 @@
 
 ## 目录结构
 
+多维恢复新入口：`bash research_agent/scripts/run_recovery.sh --data-types audio`。支持 Image、MSI、Video、audio；LLM 推荐 3–5 个张量分解方法，经同类全部样本的轻量预赛选出进化起点，此后每轮进化也由全部样本决定是否接受。固定插值、SIREN 和适用张量基线参与整类对照。音频只使用缺失原始波形 NMSE（越低越好），不使用 PSNR/SSIM；其他类型保留原图像/张量指标。参数可直接编辑脚本顶部，详见 [Recovery 说明](research_agent/README.md)。
+
+包含数据的 ZIP 解压后有两个同级目录：`tensor_inpainting_agent/` 与 `Multi_dimensional_data/`；保持该布局即可使用脚本默认路径。`DATASET_MANIFEST.json` 记录原始数据校验值和完整性问题。
+
 ```text
 tensor_inpainting_agent/
 ├── agents/、core/、tools/、context/  # Agent 框架

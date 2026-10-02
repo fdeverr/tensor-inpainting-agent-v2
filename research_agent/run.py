@@ -25,9 +25,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--approved-root", default="research_agent/algorithms/approved")
     parser.add_argument(
         "--knowledge-root",
-        help="cross-run reusable experience root; defaults beside candidate-root",
+        help=argparse.SUPPRESS,  # Legacy no-op; retained for older launch commands.
     )
-    parser.add_argument("--mask-type", choices=("random", "block"), default="block")
+    parser.add_argument("--mask-type", choices=("random", "block", "slices", "sildes"), default="block")
     parser.add_argument("--missing-rate", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image-size", type=int, default=128)
@@ -221,11 +221,6 @@ def main() -> None:
         print(
             "  run_practice: %s"
             % state["artifacts"]["run_practice"]["practice_markdown"]
-        )
-    if "global_experience" in state["artifacts"]:
-        print(
-            "  global_experience: %s"
-            % state["artifacts"]["global_experience"]["experience_markdown"]
         )
 
 

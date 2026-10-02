@@ -44,7 +44,7 @@ class BenchmarkConfig:
     siren_patience: int = 5
     device: str = "auto"
     llm_mode: str = "off"
-    full_reference_metrics: bool = True
+    full_reference_metrics: bool = False
     no_reference_metrics: bool = False
     selection_visual_assessment: bool = False
     mutation_visual_assessment: bool = False
@@ -56,7 +56,7 @@ class BenchmarkConfig:
         missing = [path for path in self.image_paths if not Path(path).is_file()]
         if missing:
             raise ValueError("benchmark images do not exist: %s" % missing)
-        if not self.mask_types or any(item not in {"random", "block"} for item in self.mask_types):
+        if not self.mask_types or any(item not in {"random", "block", "slices", "sildes"} for item in self.mask_types):
             raise ValueError("mask_types may contain only random and block")
         if not self.missing_rates or any(not 0.0 < rate < 1.0 for rate in self.missing_rates):
             raise ValueError("missing_rates must be in (0, 1)")
@@ -217,7 +217,7 @@ def _benchmark_markdown(state: Dict[str, Any]) -> str:
         ("full_psnr", "Full-image PSNR ↑"),
         ("composite_ssim", "SSIM ↑"),
     ]
-    if state["config"].get("full_reference_metrics", True):
+    if state["config"].get("full_reference_metrics", False):
         metric_columns.append(("lpips", "LPIPS ↓"))
     if state["config"].get("no_reference_metrics", False):
         metric_columns.extend(
@@ -306,7 +306,7 @@ def _benchmark_markdown(state: Dict[str, Any]) -> str:
         [
             "",
             "> 注意：少量图片上的 quick benchmark 只用于端到端回归，不足以支持泛化结论。",
-            "> 默认全参考组包含 PSNR、SSIM、LPIPS；MANIQA、CLIP-IQA、MUSIQ 属于默认关闭的无参考组。N/A 表示指标不可用或对应权重加载失败。",
+            "> 默认计算 PSNR、SSIM；LPIPS 可选且默认关闭；MANIQA、CLIP-IQA、MUSIQ 属于默认关闭的无参考组。N/A 表示指标不可用或对应权重加载失败。",
             "",
         ]
     )

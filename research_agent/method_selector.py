@@ -28,6 +28,59 @@ LLM_SAFE_SOURCE_METADATA_FIELDS = {
 METHOD_SELECTION_VISUAL_SOURCE = "visual:manhattan_interpolation_structure"
 
 
+def _comparison_evidence(reference: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Expose measured scores, never tensors, filesystem paths, or checkpoints."""
+    rows = []
+    if not isinstance(reference, dict):
+        return rows
+    for key in ("fixed_baselines", "historical_champions"):
+        for index, record in enumerate(reference.get(key, [])):
+            if not isinstance(record, dict):
+                continue
+            rows.append({
+                "source": "cohort:%s:%d" % (key, index),
+                "algorithm": record.get("algorithm"),
+                "archive_id": record.get("archive_id"),
+                "summary": {name: value for name, value in
+                            (record.get("summary") or {}).items() if name in {
+                                "complete", "expected_count", "completed_count",
+                                "mean_missing_psnr", "mean_composite_ssim",
+                                "mean_missing_nmse", "perfect_count"}},
+                "samples": [{"sample_index": item.get("sample_index"),
+                             "status": item.get("status"),
+                             "metrics": {name: value for name, value in
+                                         (item.get("metrics") or {}).items() if name in {
+                                             "missing_psnr", "composite_ssim", "missing_nmse"}}}
+                            for item in record.get("samples", [])],
+            })
+    return rows
+
+
+def _strongest_fixed_tensor_baseline(reference: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Protect the strongest measured tensor baseline from an N=3 omission."""
+    candidates = []
+    for row in _comparison_evidence(reference):
+        if not row["source"].startswith("cohort:fixed_baselines:"):
+            continue
+        if row["algorithm"] not in HYPERPARAMETER_CONTRACTS:
+            continue
+        summary = row["summary"]
+        if not summary.get("complete"):
+            continue
+        if summary.get("mean_missing_nmse") is not None:
+            key = (0, float(summary["mean_missing_nmse"]), row["algorithm"])
+        else:
+            psnr = summary.get("mean_missing_psnr")
+            if psnr is None and not summary.get("perfect_count"):
+                continue
+            key = (1, -int(summary.get("perfect_count", 0)),
+                   -float(psnr) if psnr is not None else -math.inf,
+                   -float(summary.get("mean_composite_ssim") or 0.0),
+                   row["algorithm"])
+        candidates.append((key, row["algorithm"]))
+    return min(candidates)[1] if candidates else None
+
+
 def llm_safe_image_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     """Remove raw-source paths and full-input value statistics from LLM context."""
 
@@ -70,6 +123,11 @@ class MethodPlan(BaseModel):
         "tt",
         "tensor_ring",
     ]
+    shortlist: List[Literal[
+        "matrix", "mode3", "cp", "nonnegative_cp", "tucker", "btd",
+        "tsvd", "nonnegative_tucker", "hierarchical_tucker", "tt",
+        "tensor_ring",
+    ]] = Field(default_factory=list, max_length=5)
     reason: str = Field(min_length=20, max_length=1200)
     evidence: List[EvidenceReference] = Field(min_length=1, max_length=6)
     confidence: float = Field(ge=0.0, le=1.0)
@@ -84,6 +142,13 @@ class MethodPlan(BaseModel):
     def require_nonempty_hyperparameters(cls, value: Dict[str, Any]) -> Dict[str, Any]:
         if not value:
             raise ValueError("suggested_hyperparameters cannot be empty")
+        return value
+
+    @field_validator("shortlist")
+    @classmethod
+    def require_distinct_shortlist(cls, value: List[str]) -> List[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("shortlist methods must be distinct")
         return value
 
 
@@ -109,12 +174,14 @@ def _validate_sources(
     plan: MethodPlan,
     retrieval: Dict[str, Any],
     visual_assessment: Optional[Dict[str, Any]] = None,
+    comparison_reference: Optional[Dict[str, Any]] = None,
 ) -> None:
     allowed = {
         item["source"] for item in retrieval["evidence"]
     } | {rule["source"] for rule in retrieval["active_rules"]}
     if visual_assessment and visual_assessment.get("status") == "completed":
         allowed.add(METHOD_SELECTION_VISUAL_SOURCE)
+    allowed.update(row["source"] for row in _comparison_evidence(comparison_reference))
     unknown = [item.source for item in plan.evidence if item.source not in allowed]
     if unknown:
         raise ValueError("MethodPlan cited unknown evidence sources: %s" % unknown) #| 是集合的并集运算符，表示合并两个集合中的所有元素。
@@ -499,6 +566,8 @@ class MethodSelector:
         profile: Dict[str, Any],
         retrieval: Dict[str, Any],
         visual_assessment: Optional[Dict[str, Any]] = None,
+        shortlist_size: int = 3,
+        comparison_reference: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, str]]:
         allowed_sources = [
             item["source"] for item in retrieval["evidence"]
@@ -509,17 +578,25 @@ class MethodSelector:
         )
         if completed_visual:
             allowed_sources.append(METHOD_SELECTION_VISUAL_SOURCE)
+        comparison_rows = _comparison_evidence(comparison_reference)
+        empirical_anchor = _strongest_fixed_tensor_baseline(comparison_reference)
+        allowed_sources.extend(row["source"] for row in comparison_rows)
         schema = MethodPlan.model_json_schema()
         user_payload = {
             "fixed_prompt": (
                 "请根据当前图像的缺失模式、统计特征、插值结果和张量分解经验文档，"
-                "提供一个张量分解首选建议。该建议只用于组建候选短名单，"
-                "最终家族由同预算数值预赛决定。"
+                "按推荐顺序提供恰好 %d 个不同的张量分解方法作为候选短名单。"
+                "method 必须等于 shortlist 第一项；最终家族由同预算数值预赛决定。"
+                % shortlist_size
             ),
+            "shortlist_size": shortlist_size,
             "image_profile": llm_safe_image_profile(profile),
             "interpolation": {
                 "available": True,
-                "metrics_available_during_selection": False,
+                "metrics_available_during_selection": any(
+                    "interpolation" in str(row.get("algorithm", "")) or
+                    "nearest_neighbor" in str(row.get("algorithm", ""))
+                    for row in comparison_rows),
                 "visual_description_available": completed_visual,
                 "visual_evidence_source": (
                     METHOD_SELECTION_VISUAL_SOURCE if completed_visual else None
@@ -532,6 +609,8 @@ class MethodSelector:
             ),
             "active_rules": retrieval["active_rules"],
             "evidence_chunks": retrieval["evidence"],
+            "measured_whole_modality_comparisons": comparison_rows,
+            "required_empirical_anchor": empirical_anchor,
             "allowed_evidence_sources": allowed_sources,
             "hyperparameter_contract": {
                 "rule": (
@@ -550,7 +629,8 @@ class MethodSelector:
                 "role": "system",
                 "content": (
                     "You are a tensor-decomposition method selector. Return one JSON "
-                    "object only. Recommend exactly one shortlist seed from matrix, mode3, cp, "
+                    "object only. Recommend exactly %d distinct tensor methods in ranked "
+                    "shortlist, and set method to its first entry. Choose from matrix, mode3, cp, "
                     "nonnegative_cp, tucker, btd, tsvd, nonnegative_tucker, "
                     "hierarchical_tucker, tt, or tensor_ring. Here mode3 means "
                     "X = A ×₃ E; btd is Block-Term "
@@ -560,10 +640,16 @@ class MethodSelector:
                     "as a coarse prior for the decomposition family and low/medium/high rank "
                     "regime. Translate that regime into two or three bounded candidates; "
                     "do not assume the interpolation is ground truth. "
-                    "Never request or infer missing-region ground truth or final metrics."
+                    "Do not request raw ground truth or invent unprovided metrics."
+                    " If measured_whole_modality_comparisons is nonempty, use its "
+                    "scores as empirical guidance and cite its source when relevant. "
+                    "Prefer including strong complete methods unless there is a "
+                    "concrete diversity or applicability reason not to."
+                    " If required_empirical_anchor is present, include it in shortlist "
+                    "so the strongest measured tensor baseline cannot be omitted."
                     " Your recommendation is not the final winner; a deterministic "
                     "equal-budget numerical screening stage makes that decision."
-                ),
+                ) % shortlist_size,
             },
             {
                 "role": "user",
@@ -589,8 +675,13 @@ class MethodSelector:
         profile: Dict[str, Any],
         retrieval: Dict[str, Any],
         visual_assessment: Optional[Dict[str, Any]] = None,
+        shortlist_size: Optional[int] = None,
+        comparison_reference: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        messages = self._prompt(profile, retrieval, visual_assessment)
+        if shortlist_size is not None and not 3 <= shortlist_size <= 5:
+            raise ValueError("shortlist_size must be in [3, 5]")
+        messages = self._prompt(profile, retrieval, visual_assessment,
+                                shortlist_size or 3, comparison_reference)
         raw_outputs = []
         validation_errors = []
         attempt_count = 0
@@ -627,8 +718,23 @@ class MethodSelector:
                     )
                     raw_outputs.append(raw)
                     plan = MethodPlan.model_validate(_json_from_text(raw))
-                    _validate_sources(plan, retrieval, visual_assessment)
+                    _validate_sources(plan, retrieval, visual_assessment,
+                                      comparison_reference)
                     _validate_hyperparameter_contract(plan, profile)
+                    if shortlist_size is not None and (
+                        len(plan.shortlist) != shortlist_size
+                        or plan.shortlist[0] != plan.method
+                    ):
+                        raise ValueError(
+                            "LLM shortlist must contain exactly %d distinct methods "
+                            "and start with method" % shortlist_size
+                        )
+                    empirical_anchor = _strongest_fixed_tensor_baseline(
+                        comparison_reference)
+                    if (shortlist_size is not None and empirical_anchor
+                            and empirical_anchor not in plan.shortlist):
+                        raise ValueError("LLM shortlist omitted strongest measured tensor baseline: %s"
+                                         % empirical_anchor)
                     plan.selection_mode = "llm" if attempt == 0 else "llm_repaired"
                     return {
                         "plan": plan,

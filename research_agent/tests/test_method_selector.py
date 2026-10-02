@@ -162,6 +162,74 @@ def test_valid_llm_method_plan_is_accepted_stably():
     assert llm.calls[0]["kwargs"]["temperature"] == 0.0
 
 
+def test_llm_returns_complete_ranked_shortlist_for_screening():
+    retrieval = _retrieval()
+    payload = json.loads(_valid_output(retrieval["evidence"][0]["source"]))
+    payload["shortlist"] = ["tucker", "hierarchical_tucker", "cp"]
+    llm = FakeLLM([json.dumps(payload)])
+
+    result = MethodSelector(llm).select(_profile(), retrieval, shortlist_size=3)
+
+    assert result["plan"].shortlist == payload["shortlist"]
+    request = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert request["shortlist_size"] == 3
+
+
+def test_duplicate_or_short_llm_list_is_repaired():
+    retrieval = _retrieval()
+    payload = json.loads(_valid_output(retrieval["evidence"][0]["source"]))
+    duplicate = {**payload, "shortlist": ["tucker", "tucker", "cp"]}
+    repaired = {**payload, "shortlist": ["tucker", "hierarchical_tucker", "cp"]}
+    llm = FakeLLM([json.dumps(duplicate), json.dumps(repaired)])
+
+    result = MethodSelector(llm).select(_profile(), retrieval, shortlist_size=3)
+
+    assert result["plan"].shortlist == repaired["shortlist"]
+    assert result["plan"].selection_mode == "llm_repaired"
+    assert len(result["validation_errors"]) == 1
+
+
+def test_llm_shortlist_sees_measured_baselines_without_raw_paths():
+    retrieval = _retrieval()
+    reference = {"fixed_baselines": [{
+        "algorithm": "hierarchical_tucker", "summary": {"complete": True,
+            "mean_missing_psnr": 31.0, "mean_composite_ssim": 0.91},
+        "samples": [{"sample_index": 0, "sample": "/secret/private.mat",
+                     "metrics": {"missing_psnr": 31.0},
+                     "training": {"artifacts": {"checkpoint": "/secret/model.pt"}}}],
+    }]}
+    messages = MethodSelector._prompt(
+        _profile(), retrieval, shortlist_size=3, comparison_reference=reference)
+    serialized = messages[1]["content"]
+    payload = json.loads(serialized)
+
+    row = payload["measured_whole_modality_comparisons"][0]
+    assert row["algorithm"] == "hierarchical_tucker"
+    assert row["summary"]["mean_missing_psnr"] == 31.0
+    assert row["samples"][0]["metrics"] == {"missing_psnr": 31.0}
+    assert row["source"] in payload["allowed_evidence_sources"]
+    assert payload["required_empirical_anchor"] == "hierarchical_tucker"
+    assert "/secret" not in serialized
+
+    llm_plan = json.loads(_valid_output(retrieval["evidence"][0]["source"]))
+    llm_plan["shortlist"] = ["hierarchical_tucker", "tucker", "cp"]
+    llm_plan["method"] = "hierarchical_tucker"
+    llm_plan["suggested_hyperparameters"] = manual_method_plan(
+        "hierarchical_tucker", _profile()).suggested_hyperparameters
+    llm_plan["evidence"][0]["source"] = row["source"]
+    chosen = MethodSelector(FakeLLM([json.dumps(llm_plan)])).select(
+        _profile(), retrieval, shortlist_size=3, comparison_reference=reference)
+    assert chosen["plan"].method == "hierarchical_tucker"
+
+    omitted = {**llm_plan, "method": "tucker", "shortlist": ["tucker", "cp", "tt"]}
+    omitted["suggested_hyperparameters"] = json.loads(
+        _valid_output(retrieval["evidence"][0]["source"]))["suggested_hyperparameters"]
+    repaired = MethodSelector(FakeLLM([json.dumps(omitted), json.dumps(llm_plan)])).select(
+        _profile(), retrieval, shortlist_size=3, comparison_reference=reference)
+    assert repaired["plan"].selection_mode == "llm_repaired"
+    assert "omitted strongest measured" in repaired["validation_errors"][0]
+
+
 def test_valid_tt_method_plan_is_accepted():
     retrieval = LocalKnowledgeRetriever().retrieve(
         profile=_profile(),

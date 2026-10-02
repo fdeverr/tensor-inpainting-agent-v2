@@ -60,7 +60,7 @@ INTERPOLATION_OBJECTIVE_KEYS = {
     "candidate_relative_to_interpolation",
     "initial_interpolation_visual_assessment",
 }
-REFERENCE_METRIC_KEYS = {"missing_psnr", "composite_ssim", "lpips"}
+REFERENCE_METRIC_KEYS = {"missing_psnr", "composite_ssim", "lpips", "missing_nmse"}
 
 EXPLANATORY_TEXT_LIMITS = {
     "mutation_goal": 800,
@@ -191,6 +191,10 @@ def _algorithm_comparison_reference(state: Dict[str, Any]) -> Dict[str, Any]:
         ),
         reverse=True,
     )
+    audio = any("missing_nmse" in row["metrics"] for row in rows)
+    if audio:
+        from ..core.audio_metrics import metric_score
+        ranked_rows = sorted(rows, key=lambda item: metric_score(item["metrics"]), reverse=True)
     winner = ranked_rows[0]["algorithm"] if ranked_rows else None
     base_psnr = tensor_metrics.get("missing_psnr")
     best_psnr = (
@@ -202,20 +206,32 @@ def _algorithm_comparison_reference(state: Dict[str, Any]) -> Dict[str, Any]:
         else None
     )
 
+    # The complete 3–5-method screen stays in Day 4 artifacts and the report.
+    # Mutation context needs only the selected tensor family's screen evidence;
+    # independent fixed comparison baselines remain available in the cohort panel.
     screening = results.get("method_screening") or {}
     screening_rows = []
+    selected_method = screening.get("winner")
     for item in screening.get("results", []):
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or item.get("method") != selected_method:
             continue
-        screening_rows.append(
-            {
-                "method": item.get("method"),
-                "best_validation_mse": item.get("best_validation_mse"),
-                "trial_count": item.get("trial_count"),
-            }
-        )
+        selected_row = {
+            "method": item["method"],
+            "best_validation_mse": item.get("best_validation_mse"),
+            "trial_count": item.get("trial_count"),
+        }
+        dataset_evaluation = item.get("dataset_evaluation") or {}
+        if dataset_evaluation:
+            selected_row["whole_modality_summary"] = dataset_evaluation.get("summary")
+            selected_row["samples"] = [
+                {"sample_index": index, "status": sample.get("status"),
+                 "metrics": _reference_metrics(sample.get("metrics")),
+                 "training": sample.get("training"), "error": sample.get("error")}
+                for index, sample in enumerate(dataset_evaluation.get("results", []))
+            ]
+        screening_rows.append(selected_row)
 
-    return {
+    reference = {
         "purpose": (
             "Provide explicit performance anchors and gap signals for candidate design; "
             "the fixed incumbent-versus-candidate Judge remains the promotion authority."
@@ -234,10 +250,18 @@ def _algorithm_comparison_reference(state: Dict[str, Any]) -> Dict[str, Any]:
         "tensor_family_screening": {
             "ground_truth_used": bool(screening.get("ground_truth_used", False)),
             "selection_metric": screening.get("selection_metric"),
-            "winner": screening.get("winner"),
+            "winner": selected_method,
             "results": screening_rows,
         },
     }
+    if audio:
+        reference["selection_metric"] = "missing_nmse"
+        reference["metric_direction"] = "lower_is_better"
+        reference.pop("selected_tensor_gap_to_best_missing_psnr_db")
+        base_nmse = tensor_metrics.get("missing_nmse")
+        best_nmse = ranked_rows[0]["metrics"].get("missing_nmse") if ranked_rows else None
+        reference["selected_tensor_nmse_above_best"] = base_nmse - best_nmse if base_nmse is not None and best_nmse is not None else None
+    return reference
 
 
 BASE_CLASS_NAMES = {
@@ -434,10 +458,13 @@ def load_improver_context(base_run_dir: str) -> Dict[str, Any]:
         "base_metrics": {
             key: value
             for key, value in base_metrics.items()
-            if key in {"missing_psnr", "composite_ssim", "lpips"}
+            if key in REFERENCE_METRIC_KEYS
             and (key != "lpips" or value is not None)
         },
-        "algorithm_comparison_reference": _algorithm_comparison_reference(state),
+        "algorithm_comparison_reference": {
+            **_algorithm_comparison_reference(state),
+            "historical_algorithms": state.get("config", {}).get("historical_algorithm_reference") or [],
+        },
         "model_interface_source": (
             Path(__file__).resolve().parents[1] / "core/models/base.py"
         ).read_text(encoding="utf-8"),
@@ -579,19 +606,26 @@ class CandidateGenerator:
                     "the new hypothesis explicitly modifies or restores them."
                 ),
                 "knowledge_rule": (
-                    "Use global reusable experience from previous runs together with only "
-                    "the current run's (framework, goal, method, result) practice tuples. "
+                    "Use only the current run's (framework, goal, method, result) "
+                    "practice tuples and the explicit algorithm comparison evidence. "
                     "Never treat another run's raw practice log as context. Do not repeat a failed idea unless the new "
                     "idea explicitly addresses its documented applicability or failure condition."
                 ),
                 "algorithm_comparison_rule": (
                     "Use algorithm_comparison_reference as an explicit directional benchmark. "
+                    "In recovery runs, whole_modality_algorithms contains fixed baselines, "
+                    "historical champions, and the Day 4 selected incumbent evaluated before "
+                    "candidate generation on every same-type sample; "
+                    "latest_evolution_round contains the current incumbent/candidate scores and "
+                    "per-sample training-curve digests. Compare cohort means, hard samples, "
+                    "optimization plateaus, instability, and reference gaps before proposing "
+                    "the next change; explain which sample-level evidence motivates it. "
                     "Identify which reference mechanism appears to close the largest quality gap, "
                     "then propose the smallest testable change that could transfer that advantage "
                     "into the locked tensor framework. Aggregate reference scores are development "
                     "feedback, not proof of mechanism or an untouched test result. Never request or "
-                    "infer raw hidden-region ground-truth values. The fixed current-incumbent Judge "
-                    "still decides promotion."
+                    "infer raw hidden-region ground-truth values. The deterministic "
+                    "whole-modality Judge, when enabled, decides promotion."
                 ),
                 "attribution_rule": (
                     "Do not claim that a component caused an improvement before ablation. Later "
@@ -633,7 +667,7 @@ class CandidateGenerator:
                     "lower LPIPS is better and a negative candidate-minus-incumbent delta is an "
                     "improvement. Use it to diagnose perceptual tradeoffs, but do not change the "
                     "fixed promotion gate or make LPIPS the primary objective. "
-                    "Use interpolation, SIREN, tensor-family screening, and other exposed references "
+                    "Use interpolation, SIREN, the selected tensor-family screening result, and other exposed references "
                     "to diagnose concrete performance gaps and promising inductive biases. Do not "
                     "copy a reference blindly or let it replace the current-incumbent promotion "
                     "target. Do not construct a Pareto front or optimize no-reference metrics. "
@@ -684,6 +718,7 @@ class CandidateGenerator:
                 ],
                 "resource_rules": [
                     "All modules are initialized from scratch; the base masked data term and shared Trainer remain fixed, while a proposed loss component may add a differentiable term through loss_terms().",
+                    "Tensor axes are semantic: audio uses [time_frame,sample_in_frame,channel], MSI uses bands, and video uses time. For entirely missing rows/bands/frames, an independent unconstrained factor has no observed supervision; consider cross-slice coupling or differentiable priors rather than claiming rank alone identifies hidden slices.",
                     (
                         "The implementation must support arbitrary H and W and both "
                         "[H,W,C] and [H,W,T,C] image_shape values."
@@ -787,7 +822,9 @@ class CandidateGenerator:
                     (
                         "If loss_terms is overridden, preserve its exact positional "
                         "signature and begin with terms = super().loss_terms(prediction, "
-                        "observed, train_mask)."
+                        "observed, train_mask). train_mask can be spatial [H,W] or "
+                        "elementwise with prediction.shape; always use super().loss_terms "
+                        "for the masked data loss and never assume a spatial-only mask."
                     ),
                 ],
                 "implementation_surface": [
@@ -840,6 +877,17 @@ class CandidateGenerator:
         }
         if not context.get("mutation_visual_assessment_enabled", False):
             prompt_payload["evolution_protocol"].pop("visual_feedback_rule", None)
+        if "missing_nmse" in base_context.get("base_metrics", {}):
+            protocol = prompt_payload["evolution_protocol"]
+            protocol.pop("psnr_feedback_rule", None)
+            protocol["optimization_objective_rule"] = (
+                "Audio uses only missing original-waveform NMSE (lower is better). "
+                "Reduce candidate NMSE relative to the current incumbent under the "
+                "frozen protocol and NMSE reduction threshold. Do not compute, invent "
+                "or optimize PSNR, SSIM, LPIPS or image quality scores for audio. "
+                "Use interpolation, tensor, SIREN and historical NMSE references "
+                "to identify gaps; only the deterministic Judge may promote."
+            )
         return [
             {
                 "role": "system",
@@ -1006,8 +1054,9 @@ class CandidateGenerator:
                         "a (framework, goal, method, result) practice tuple. Return one JSON object "
                         "with exactly two fields: experience and confidence. The experience "
                         "must say under what kind of framework the method tends to help or fail, "
-                        "and abstract its directional effect on missing-region PSNR and image quality, "
-                        "including LPIPS as a lower-is-better perceptual diagnostic when present, "
+                        "and abstract its effect on the task's declared primary metric; audio "
+                        "uses only missing original-waveform NMSE (lower is better). Include "
+                        "perceptual or structural effects only when actually evaluated, "
                         "using ablation evidence to distinguish individual component contribution "
                         "from additive, synergistic, antagonistic, or ineffective interaction, "
                         "and distinguish confirmed parameterized pruning from a logical switch-off, "
@@ -1024,8 +1073,9 @@ class CandidateGenerator:
                             "task": (
                                 "Infer a concise cross-round lesson from "
                                 "(framework, goal, method, result). "
-                                "Describe what the mechanism tends to do to missing-region PSNR "
-                                "and visual/structural quality without copying run metadata. When "
+                                "Describe effects on the declared evaluation metric: audio uses "
+                                "missing original-waveform NMSE only (lower is better); other types "
+                                "use their image/tensor metrics. Do not invent unavailable scores. When "
                                 "ablation is present, state which component or interaction mattered; "
                                 "do not attribute the full result to every component. When removal "
                                 "is present, state whether pruning was structurally confirmed."
@@ -1081,6 +1131,13 @@ class CandidateGenerator:
                 if confirmed is True
                 else "删除已执行，但尚不能由净参数量确认结构剪枝；"
             )
+        if "missing_nmse_reduction" in deltas:
+            reduction = deltas["missing_nmse_reduction"]
+            effect = "尚无可定义的NMSE改善" if reduction is None else "降低缺失波形NMSE" if reduction > 0 else "未降低缺失波形NMSE"
+            return ExperienceExtraction(
+                experience="在音频波形恢复中，%s；%s%s实验证据：%s；该经验仅由NMSE评价，不包含图像结构或感知质量结论。" % (method.rstrip("。."), attribution_text, removal_text, effect),
+                confidence="medium" if accepted else "low",
+            ).model_dump()
         psnr_effect = directional_effect(psnr_delta, "缺失区域PSNR")
         structure_effect = directional_effect(ssim_delta, "图像结构相似度")
         perceptual_effect = ""

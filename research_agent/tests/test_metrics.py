@@ -100,7 +100,7 @@ def test_learned_iqa_metrics_use_pyiqa_names_and_composite_image(monkeypatch):
     assert metrics["learned_metric_status"]["errors"] == {}
 
 
-def test_default_metric_group_loads_lpips_only(monkeypatch):
+def test_default_metric_group_does_not_load_lpips(monkeypatch):
     ground_truth = np.full((8, 8, 3), 0.5, dtype=np.float32)
     observed_mask = np.ones((8, 8), dtype=np.bool_)
     observed_mask[2:6, 2:6] = False
@@ -127,8 +127,9 @@ def test_default_metric_group_loads_lpips_only(monkeypatch):
         device="cpu",
     )
 
-    assert created == ["lpips"]
-    assert metrics["lpips"] == 0.25
+    assert created == []
+    assert metrics["lpips"] is None
+    assert metrics["learned_metric_status"]["requested"] is False
     assert all(
         metrics[name] is None for name in ("maniqa", "clip_iqa", "musiq")
     )

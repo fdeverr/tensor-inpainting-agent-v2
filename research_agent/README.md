@@ -1,6 +1,6 @@
 # Tensor Inpainting Agent
 
-一个基于 Tensor Inpainting Agent Framework 的多维张量补全研究 Agent：它支持彩图、MSI 与视频，分析缺失数据、检索方法经验、从 11 种张量分解基线中自动或手动选择，再由 LLM 设计新候选，并在单张图像上用缺失区 Ground Truth 直接选择结构、超参数和最佳 checkpoint。
+一个基于 Tensor Inpainting Agent Framework 的多维张量恢复研究 Agent：它支持彩图、MSI、视频与分帧音频波形，分析缺失数据、检索方法经验、从 11 种张量分解基线中自动或手动选择，再由 LLM 设计新候选，并用缺失区 Ground Truth 直接选择结构、超参数和最佳 checkpoint。
 
 项目目标不是宣称 SOTA，而是展示一条**可验证、可证伪、可复现、可审计**的自主算法研究闭环。
 
@@ -34,6 +34,135 @@ Tensor Inpainting Agent Framework 编排层
 Tensor Inpainting Agent Framework 在这里提供 Tool、ToolRegistry、LLM 适配和 TraceLogger。项目保留它的编排与可观测性能力，但不修改框架源码；所有图像补全算法都位于独立目录中。这样可以展示 Agent 工程能力，同时保持实验内核可独立测试，也方便以后替换模型服务或 Agent 框架。
 
 ## Quick start（Linux）
+
+### Multi-Dimensional Data Recovery
+
+新入口 `python -m research_agent.run_recovery` 与原单样本入口并存。**正式进化前**，每种所选数据类型的固定插值、适用张量基线、可选 SIREN 与历史冠军先在全部有效样本上评测一次；LLM 可见其压缩后的整类指标，并推荐 3–5 个分解方法。入围方法先在代表样本上做等量轻量调参，再冻结配置跑同类全部样本，按整类平均选出基础方法；Day 4 确定实际 incumbent 后，还会用其已选配置跑完整类。首轮及后续轮次的 LLM 能看到对比算法和真实 incumbent 的逐样本指标、训练曲线摘要。每种类型只选一个样本搜索候选结构和超参数；但**每一轮进化**都会在该类型全部有效样本上，用冻结的同一候选结构/超参数和 `--evaluation-steps` 预算逐样本独立拟合。候选必须在全部样本上成功，并以整类平均指标通过 Judge，才能成为下一轮 incumbent；每个样本的指标、训练曲线摘要和整类均值都会反馈到下一轮，完整曲线保存在各样本的 `final_fit_history.json`。最终输出的是最后胜出的进化算法，而非研发样本上单独得分最高的算法。不会把一张图的权重直接迁移到其他样本，也不会在每个评测样本上重新生成代码或搜索超参数。计算量会随基线数、有效样本数和进化轮数增长。
+
+推荐用专用 Bash 入口，默认数据目录是项目同一级的 `Multi_dimensional_data`，读取 `research_agent/.env`。每次可以只选一类，也可以选多类；不传 `--data-types` 才会运行全部四类。类型名称区分大小写，未选中的类型不会训练、进化或更新其算法档案与经验库（启动时仍会扫描数据目录生成完整清单）。
+
+```bash
+# 本次只进行 MSI 的完整进化与同类数据集评测
+bash research_agent/scripts/run_recovery.sh --data-types MSI --llm-mode required
+
+# 本次只进行 Video，整帧缺失
+bash research_agent/scripts/run_recovery.sh --data-types Video --mask-type slices --missing-rate 0.4
+
+# 也可以同时选两类
+bash research_agent/scripts/run_recovery.sh --data-types Image audio
+
+# 只重新评测 MSI 历史算法，不进化
+bash research_agent/scripts/run_recovery.sh --data-types MSI --evaluate-only
+
+# 查看脚本选项；PYTHON_BIN 可指定已安装依赖的虚拟环境解释器
+bash research_agent/scripts/run_recovery.sh --help
+```
+
+脚本从任意工作目录启动都可以，选项与下方 Python 入口一致；相对输出/输入路径按项目根目录解析。Image/MSI/Video 默认 PSNR/SSIM，音频仅 NMSE；只有显式传入 `--lpips` 才额外计算 Image 的 LPIPS。
+
+`run_recovery.sh` 顶部的“直接修改这里的实验参数”区可以直接编辑，不需要每次输入长命令。比如只跑 MSI，研发训练最多 3000 步、每 20 步验证一次、连续 30 次验证未改善后早停：
+
+```bash
+DATA_TYPES=("MSI")
+EVOLUTION_STEPS="3000"
+VALIDATION_INTERVAL="20"
+PATIENCE="30"
+EVALUATION_STEPS="2000"
+EVALUATION_VALIDATION_INTERVAL="20"
+EVALUATION_PATIENCE="0"
+```
+
+编辑后执行 `bash research_agent/scripts/run_recovery.sh` 即可。命令行仍可逐项覆盖（同时支持 `--name value` 与 `--name=value`）：
+
+```bash
+bash research_agent/scripts/run_recovery.sh --data-types MSI \
+  --evolution-steps 3000 --validation-interval 20 --patience 30 \
+  --evaluation-steps 2000 --evaluation-validation-interval 20 --evaluation-patience 15
+```
+
+`PATIENCE` 的单位是**验证次数**，不是训练步数；基于 GT 缺失区误差选择 checkpoint，不重新切分观测训练/验证集。研发、基线预赛和 SIREN 各有独立 patience。数据集评测的 `EVALUATION_PATIENCE=0` 默认关闭早停，正整数启用早停；新旧算法始终使用同一评测上限、验证间隔与早停规则，具体最佳 checkpoint 步数可能不同。评测学习率和模型结构保留归档冠军配置，不再次搜索。
+
+`METHOD_MAX_STEPS_CEILING`、`FAIR_MAX_STEPS`、`SIREN_MAX_STEPS` 为空时跟随 `EVOLUTION_STEPS`；`SCREENING_MAX_STEPS` 为空时为 `min(200, EVOLUTION_STEPS)`，可填正整数独立设置。前三者分别控制方法选择扩展硬上限、候选公平比较硬上限和 SIREN 预算。顶部还开放了学习率粗搜/精搜、消融预赛、基线预赛、晋级阈值、知识检索和持久化路径。布尔变量使用 `on/off`；命令行开关使用 `--lpips/--no-lpips`、`--siren-comparison/--no-siren-comparison` 和 `--fair-learning-rate-refinement/--no-fair-learning-rate-refinement`，旧 `--skip-siren-comparison` 仍有效。
+
+已对齐 `run_ai.sh` 的全部实验超参数/开关，支持原 `--name on|off` 语法、无值开关和 `--name=value`。新增的 `PROMPT` 可追加各类型的算法研发要求。兼容名称对应如下（两种命令行名称共用同一配置，最后传入者优先）：
+
+| `run_ai.sh` 名称 | Recovery 对应 |
+|---|---|
+| `--method-max-steps` / 顶部 `METHOD_MAX_STEPS` | `--evolution-steps` / `EVOLUTION_STEPS` |
+| `--max-improvement-rounds` / `MAX_IMPROVEMENT_ROUNDS` | `--improvement-rounds` / `IMPROVEMENT_ROUNDS` |
+| `--full-reference-metrics` / `FULL_REFERENCE_METRICS` | `--lpips` / `LPIPS` |
+| `--image-size original` | 保留原尺寸，同 `--image-size 0` |
+| `--image`（单样本输入，不是超参数） | `--dataset-root` + `--representative TYPE=FILE` |
+| `--mat-key`（单样本变量选择，不是超参数） | Recovery 固定读取 `Ohsi` GT，不自动选择旧缺失数据 |
+
+顶部的 `METHOD_MAX_STEPS`、`MAX_IMPROVEMENT_ROUNDS`、`FULL_REFERENCE_METRICS` 默认为空，此时跟随右列配置；填值后覆盖右列脚本默认值。`NO_REFERENCE_METRICS`（MANIQA/CLIP-IQA/MUSIQ）、`SELECTION_VISUAL_ASSESSMENT`、`MUTATION_VISUAL_ASSESSMENT` 也已接通。LPIPS、无参考图像指标及两类视觉观察**仅应用于 Image**，不把 MSI、Video、audio 投影成任意 RGB 图像进行误导性评价；PSNR/SSIM 仅对 Image/MSI/Video 计算，音频仅 NMSE。高级可选指标/视觉模型仍需要相应依赖及模型配置，默认关闭。Recovery 没有 `smoke/full/original` 模式参数，其预算直接由顶部参数区控制。
+
+```bash
+# 只检查 GT、分类和文件完整性，不训练、不调用 LLM
+python -m research_agent.run_recovery \
+  --dataset-root ../Multi_dimensional_data --inventory-only
+
+# 四类各一个研发样本，切片缺失率 40%，再评测同类所有有效样本
+python -m research_agent.run_recovery \
+  --dataset-root ../Multi_dimensional_data \
+  --mask-type slices --missing-rate 0.4 --llm-mode required
+
+# 只重新评测已经归档的算法，不进化、不调用 LLM
+python -m research_agent.run_recovery \
+  --dataset-root ../Multi_dimensional_data \
+  --data-types MSI --mask-type random --missing-rate 0.6 --evaluate-only
+
+# 快速调试；显式指定研发样本时可重复 --representative
+python -m research_agent.run_recovery \
+  --dataset-root ../Multi_dimensional_data --data-types Image \
+  --representative Image=F16_random_missing_0.10.mat \
+  --image-size 64 --evolution-steps 100 --evaluation-steps 100 \
+  --improvement-rounds 1 --tuning-trials 1 --llm-mode off --skip-siren-comparison
+```
+
+输入数据不会被修改。MAT 仅读取 `Ohsi`（GT），忽略旧 `Nhsi`、mask 与文件名中的缺失率。当前数据集的视频轴序 `[H,W,C,T]` 会显式转换为模型的 `[H,W,T,C]`。RGB/MSI/Video 默认把空间最长边调整为 128，`--image-size 0` 保留原始空间分辨率；这项设置会记录在评测协议中。音频不会被空间缩放。
+
+| 类型 | 模型张量 | `slices` 默认缺失对象 |
+|---|---|---|
+| Image | `[H,W,3]` | 完整图像行 |
+| MSI | `[H,W,B]` | 完整波段 |
+| Video | `[H,W,T,C]` | 完整帧（全部空间位置与通道） |
+| audio | `[时间帧,帧内采样,声道]` | 原始波形的一段连续时间，所有声道共同缺失 |
+
+`sildes` 是 `slices` 的兼容别名。非音频的切片随机选取完整轴切片，缺失率按整数切片数取整，报告记录实际缺失率；音频为连续时间段。`random` 对非音频逐元素遮挡，对音频按时间采样点、共同遮挡各声道；`block` 对非音频生成紧凑 N 维块，对音频生成连续时间段。支持完整张量布尔 mask，梯度与缺失区指标都按实际元素计算，而不把波段/帧缺失投影成二维空间缺块。
+
+WAV 保留采样率和声道；波形分帧是可逆 reshape，不使用 GT 的隐藏相位进行恢复。最后一帧补零位置始终已知，不进入缺失区误差，输出 WAV 裁掉 padding。**音频不计算 PSNR/SSIM，只使用缺失波形 NMSE，越低越好**：先撤销幅值归一化和分帧，再在人工缺失采样点（所有声道）计算 `sum((prediction-GT)^2) / sum(GT^2)`，不减均值、不使用偏移到 `[0,1]` 后的能量。它衡量波形恢复误差，不声称等同于主观听觉质量。
+
+音频 checkpoint、候选比较、LLM 参考面板、当前运行实践、最终报告和整类冠军均按 NMSE 协议处理。`MINIMUM_NMSE_DELTA` / `--minimum-nmse-delta` 控制候选晋级所需的绝对 NMSE 降低量，默认 0 且须严格改善；音频不使用 PSNR 增益或 SSIM 容差门槛。数据集先计算每条音频的 NMSE，再取算术均值，所有有效样本均有可定义结果的版本才参与冠军排序。训练的可见样本 MSE/loss 及内部归一化误差仍可作为优化诊断保存，但不是额外的音频评价指标。
+
+缺失区 GT 能量为 0 时，完全恢复约定 NMSE=0；非零误差记为 `null`（未定义），明确记录原因，不能靠排除该样本获得有效均值或冠军。LPIPS 默认关闭，`--lpips` 仅对 Image 开启。
+
+包含数据的分发 ZIP 解压后保留两个同级目录：`tensor_inpainting_agent/`（项目）和 `Multi_dimensional_data/`（原始数据），这样 `run_recovery.sh` 的默认数据路径可直接使用。数据原样保存，包括旧 `Nhsi`/mask；实际运行仍只从 GT 重新造 mask。包内 `DATASET_MANIFEST.json` 记录逐文件 SHA256、大小及数据完整性问题。当前损坏的 `kodim_random_missing_0.10.mat` 和 `gt_counting.wav` 也原样保留，但运行时排除，不修补或默默计入有效样本。
+
+每次无显式选择时，研发样本根据同类已归档运行次数轮换。历史冠军和固定基线在进化前用当前全部有效样本的 GT、mask、种子和 `--evaluation-steps` 重新评测；逐样本指标与训练摘要会提供给每轮 LLM，但不提供隐藏 GT 内容。每轮候选的整类评测固定算法和配置、统一预生成的 mask、各样本固定随机种子与评测预算，只使用 GT 选 checkpoint；逐样本指标、训练曲线摘要和整类平均值决定进化方向。不沿用历史运行分数冒充同条件比较。可能不适配新尺寸的算法会明确记录失败，不会悄悄调整结构参数。
+
+如果不同历史版本的代码、配置和当前评测条件完全相同，本轮会共享一次拟合，并标注复用来源，避免重复训练同一个算法；这不是跨缺失率、mask 或预算复用旧分数。
+
+持久化目录：
+
+```text
+research_agent/algorithms/history/<Image|MSI|Video|audio>/<run_id>/
+  champion.json             # 每次完整研发运行的实际冠军（基线也保存）
+  model.py                  # 可训练冠军的代码快照；插值无需模型文件
+  algorithm.py              # 冠军是插值时保存其实现快照
+  best_config.json          # 当次最佳结构/学习率配置
+  development_report.md     # 最佳算法与模型框架报告快照
+research_agent/algorithms/history/<类型>/evaluations/<评测run_id>.json
+research_agent/algorithms/history/<类型>/latest_evaluation.json
+```
+
+冠军按版本归档，不覆盖旧代码；加载会验证代码和模型库指纹，代码被改动或底层模型库不一致时拒绝冒充原版本。可以用 `--history-root` 指向另一个档案库。跨运行全局经验知识库已暂时停用，不再读取或追加；旧文件保留以便日后恢复。当前运行实践仍供同次进化的后续轮次使用。
+
+最终 recovery 报告在每个数据类型开头用论文式对比表展示结果：数据集为行，算法为分组列，Image/MSI/Video 每个算法下分别列 PSNR、SSIM，audio 只列 NMSE；全类平均单独成行。各指标最优值加粗、次优值加下划线，算法多时分成多张表，名次仍按全部算法统一计算。失败项显示空缺并列出原因；未完整评测的算法不展示部分样本均值。报告随后展示每轮整类平均与逐样本评测、进化前固定基线与历史版本比较、同类数据集最优版本。四类数据均在同一批 GT、mask、种子与评测预算下比较插值、SIREN（可关闭）及全部内置张量分解基线；Video 用 Manhattan 最近邻插值，audio 用沿原始波形时间轴的线性插值（跨分帧边界）。固定基线不归档为进化冠军。报告不混合四类数据计算总平均。全部样本已参与算法选择，因此这里是 oracle 开发评测，不是独立盲测。
+
+数据完整性问题会列入报告，并以 `COMPLETED_WITH_FAILURES` 返回非零退出码（仅针对所选数据类型的损坏文件或评测失败）。目前目录中的 `kodim_random_missing_0.10.mat` 无法读出完整 GT，`gt_counting.wav` 有截断警告，默认排除而不是补造 GT；需要修复源文件后才能纳入全量评测。
+
+### 原单样本流程
 
 在 `tensor_inpainting_agent` 仓库根目录安装依赖并准备 `.env` 后，可使用统一脚本运行：
 
@@ -115,9 +244,9 @@ chmod +x research_agent/scripts/run_ai.sh
 
 统一脚本默认使用 `--llm-mode required --device cuda`，并从 `research_agent/.env` 加载 LLM 配置。传入 `--llm-mode off` 时不再依赖 `.env`，并使用确定性选择器和 TV 候选模板；`auto` 会在环境变量完整时创建 LLM 客户端，否则回退到确定性规则。
 
-多模态视觉观察默认关闭，并拆分为两个可独立组合的消融选项。脚本参数 `--selection-visual-assessment on`（Python 入口使用 `--selection-visual-assessment`）会在 Day 4 的 Manhattan 插值完成后只把插值恢复图交给视觉模型。视觉结果只用于候选家族召回和 low/medium/high 粗粒度秩先验，不再直接决定唯一分解。候选短名单会先进行同预算数值预赛，胜出家族再做更完整的秩调参。该信息不会自动进入算法变异历史。
+多模态视觉观察默认关闭，并拆分为两个可独立组合的消融选项。脚本参数 `--selection-visual-assessment on`（Python 入口使用 `--selection-visual-assessment`）会在 Day 4 的 Manhattan 插值完成后只把插值恢复图交给视觉模型。视觉结果作为 LLM 推荐短名单时的粗粒度结构和秩先验；LLM 不可用时也可辅助规则回退，不直接决定唯一分解。候选短名单会先进行同预算数值预赛，胜出家族再做更完整的秩调参。该信息不会自动进入算法变异历史。
 
-默认短名单大小为 3，每个家族预赛 2 个 trial、最多 400 步，预赛在连续 10 次 GT 选择分数无改善后早停。当前主工作流不再划分可见像素训练/验证集，因此 CLI 不再提供验证比例和验证形状参数。
+默认短名单大小为 3（可设为 3–5），每个家族预赛 2 个 trial；单样本入口默认最多 400 步，recovery 入口默认最多 `min(200, EVOLUTION_STEPS)` 步。预赛在连续 10 次 GT 选择分数无改善后早停。当前主工作流不再划分可见像素训练/验证集，因此 CLI 不再提供验证比例和验证形状参数。
 
 家族胜出后不再把学习率当作一个固定值。第一阶段对结构配置与学习率做有界粗搜，第二阶段固定粗搜胜出结构，在胜出学习率两侧追加 `÷3` 和 `×3` 精搜。每个组合都在全部可见像素上训练，并持续跟踪缺失区 GT MSE 上的最佳值和 `best_step`。GT 只用于选择，不进入模型的梯度损失。
 
@@ -137,7 +266,9 @@ LLM 的进化以“相对当前 incumbent 提升 Missing-region PSNR”为主目
 
 OpenAI 系接口默认走 `/v1/chat/completions`，兼容 DeepSeek、Qwen、Kimi、智谱、Ollama 等第三方服务。改为 OpenAI 官方新的 Responses 接口时设置 `LLM_API_STYLE=responses`，此时改走 `/v1/responses`；多模态模型如需单独指定，用 `VISION_API_STYLE` 覆盖。注意 `/v1/responses` 目前仅 OpenAI 官方及少数厂商提供，第三方兼容端点只有 `/v1/chat/completions`，设置错误会直接返回 404。该选项对 Anthropic 与 Gemini 服务无效。
 
-评价指标分为两组。全参考组包含 MSE、Missing-region/Full-image PSNR、Composite SSIM 和 LPIPS，默认开启；其中 PSNR/SSIM 是 Judge 与报告所需的核心指标，始终计算，`--full-reference-metrics off`（Python 入口为 `--skip-full-reference-metrics`）只关闭较重的 LPIPS。无参考组包含 MANIQA、CLIP-IQA 和 MUSIQ，默认关闭，可用 `--no-reference-metrics on`（Python 入口为 `--no-reference-metrics`）开启。四个神经指标均通过 PyIQA 对恢复已观测像素后的完整复合图像计算，并且仅支持 RGB；MSI/视频会记录为跳过。首次运行可能下载预训练权重，单项失败记为 `N/A`，不会中断其他指标。
+评价指标分为两组。默认只计算核心全参考指标 MSE、Missing-region/Full-image PSNR、Composite SSIM；PSNR/SSIM 是 Judge 与报告所需的核心指标，始终计算。LPIPS 默认关闭，可用 Bash 的 `--full-reference-metrics on`（Python 入口为 `--full-reference-metrics`）开启，用 `--full-reference-metrics off`（Python 入口为 `--skip-full-reference-metrics`）关闭。无参考组包含 MANIQA、CLIP-IQA 和 MUSIQ，默认关闭，可用 `--no-reference-metrics on`（Python 入口为 `--no-reference-metrics`）开启。四个神经指标均通过 PyIQA 对恢复已观测像素后的完整复合图像计算，并且仅支持 RGB；MSI/视频会记录为跳过。首次运行可能下载预训练权重，单项失败记为 `N/A`，不会中断其他指标。
+
+最终报告的“最佳算法与模型框架”介绍实际冠军的模型结构、参数量和最佳配置。进化冠军使用对应候选的设计说明、组件记录及保存的模型代码快照；最后一轮未晋升的候选不会冒充冠军。插值或内置基线胜出时，报告介绍该基线本身的框架。
 
 ### 指标协议
 
@@ -247,12 +378,12 @@ composite SSIM delta >= -0.002
 - 当前运行实践：`outputs/<day6-run-id>/knowledge/practice.md` 和 `practice.jsonl`。每条严格保存为（当前框架与条件、目标、方法、结果）四元组，只供同一次运行中的后续轮次使用。
 - 可选前置方法选择观察（开启 `selection-visual-assessment` 时）：`outputs/<day4-run-id>/method_selection_visual.json`；只观察 Manhattan 插值恢复图，为分解家族和粗粒度秩范围提供一次性先验。
 - 分解家族数值预赛：`outputs/<day4-run-id>/method_screening.json`；记录短名单、同预算 trial、mask-matched 验证分数与最终胜者。
+- 完整的 3–5 方法预赛仍留在报告和 `method_screening.json`；传给后续进化 LLM 的 `tensor_family_screening` 只保留胜出张量方法的分数和逐样本训练摘要。独立的插值、SIREN、固定张量基线与历史算法对比信息照常保留，不因筛选上下文精简而停止计算或从报告删除。
+- `BASE_MODEL=auto` 时，LLM 按顺序推荐 3–5 个不同的张量分解方法，组成完整短名单；整类固定基线中成绩最好的张量方法必须包含在内，避免 N=3 漏掉已知强方法。只有 LLM 不可用或两次输出无效时，才由知识检索规则和固定回退补齐。recovery 中每个入围方法先在代表样本上以相同试验次数和步数做轻量调参，再冻结各自最佳配置，在同类全部有效样本上以相同 mask、种子和轻量预算独立拟合；仅全量成功的方法参与排序，图像/MSI/视频按平均缺失区 PSNR（SSIM 辅助）、音频按平均 NMSE 选出进化起点。单样本入口仍按代表样本预赛。`BASE_MODEL` 手工指定时跳过自动预赛。recovery 报告区分 LLM 推荐、入围名单和整类预赛胜出者。
 - SIREN 基线：`outputs/<day4-run-id>/siren_baseline/`；包含调参、checkpoint、补全数据、预览和指标。
 - 首轮变异不额外做插值视觉对比，但会读取插值、SIREN、选中张量基线和张量家族预赛的结构化数值参考。`outputs/<day5-run-id>/initial_interpolation_visual.json` 记录“使用结构化算法参考、跳过首轮插值视觉对比”的审计状态。
 - 可选每轮变异视觉观察（开启 `mutation-visual-assessment` 时）：`outputs/<day6-run-id>/round-XX/visual_assessment.json`；关键结论同时写入当前运行实践，并参与下一轮变异目标与 idea 的生成。
-- 全局可复用经验：`algorithms/evolution_knowledge/<base-method>/reusable_experience.md` 和 `reusable_experience.jsonl`。跨运行持续追加，新的独立运行会读取它。
-- 全局经验由 LLM 根据“当前框架、目标、方法、结果”四元组提炼。每条仍只保存一段可跨轮复用的 `experience` 和 `confidence`；不保存运行号、轮次、候选 ID、证据分段或下一轮指令。完全重复的经验不会再次追加。
-- 旧版可能产生的全局 `practice.*`/`experience.*` 不再读取或追加，避免把历史运行轨迹混入新运行上下文。
+- 跨运行全局经验知识库暂时停用：不读取、不写入，旧文件不删除。每轮实践及提炼的经验仍记录在本轮输出中，只供本次运行的后续轮次参考。
 
 ## 一次真实研究轨迹
 
@@ -368,4 +499,4 @@ pytest -q
 
 2～3 分钟录屏提纲见 [`DEMO_SCRIPT.md`](notes/DEMO_SCRIPT.md)。
 
-每轮算法进化会将当前运行已完成的实践四元组传给下一轮，并附带当前框架的训练诊断、当前最优候选代码以及同一基础分解方法的跨轮经验。成功和失败结果都会保留；关闭视觉观察和学习式指标不影响这些记忆。当前运行记录保存在 `knowledge/practice.jsonl` 与 `knowledge/practice.md`，全局经验按基础分解方法独立累计。
+每轮算法进化会将当前运行已完成的实践四元组传给下一轮，并附带当前框架的训练诊断和当前最优候选代码。成功和失败结果都会保留；关闭视觉观察和学习式指标不影响当前运行实践。当前运行记录保存在 `knowledge/practice.jsonl` 与 `knowledge/practice.md`；跨运行全局经验知识库暂时停用。

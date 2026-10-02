@@ -118,10 +118,6 @@ def main() -> None:
         "  run_practice: %s"
         % state["artifacts"]["run_practice"]["practice_markdown"]
     )
-    print(
-        "  global_experience: %s"
-        % state["artifacts"]["global_experience"]["experience_markdown"]
-    )
 
 
 if __name__ == "__main__":

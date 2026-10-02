@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mask-type",
-        choices=("random", "block"),
+        choices=("random", "block", "slices", "sildes"),
         default="block",
     )
     parser.add_argument("--missing-rate", type=float, default=0.4)

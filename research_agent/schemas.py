@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
-SUPPORTED_MASK_TYPES = {"random", "block"}
+SUPPORTED_MASK_TYPES = {"random", "block", "slices", "sildes"}
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ class ExperimentConfig:
     image_size: Optional[int] = 128
     mat_key: Optional[str] = None
     missing_fill_value: float = 0.0
-    full_reference_metrics: bool = True
+    full_reference_metrics: bool = False
     no_reference_metrics: bool = False
 
     def validate(self) -> None:
@@ -155,7 +155,7 @@ class Day2ExperimentConfig:
     image_size: Optional[int] = 128
     mat_key: Optional[str] = None
     missing_fill_value: float = 0.0
-    full_reference_metrics: bool = True
+    full_reference_metrics: bool = False
     no_reference_metrics: bool = False
 
     def validate(self) -> None:

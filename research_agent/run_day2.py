@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     parser.add_argument("--output-dir", default="research_agent/outputs")
-    parser.add_argument("--mask-type", choices=("random", "block"), default="block")
+    parser.add_argument("--mask-type", choices=("random", "block", "slices", "sildes"), default="block")
     parser.add_argument("--missing-rate", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image-size", type=int, default=128)

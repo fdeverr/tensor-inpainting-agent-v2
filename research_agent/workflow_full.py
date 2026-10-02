@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import shutil
+import copy
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .agent_tools.framework import TraceLogger
+from .core.audio_metrics import audio_metric_context, audio_metadata_for_gt, metric_score
+from .dataset_evolution import compact_case_feedback, evaluate_across_cases
 from .reporting import build_method_results, write_research_report
 from .schemas import SUPPORTED_TENSOR_MODEL_NAMES
 from .workflow import _make_run_id, _write_json
@@ -17,7 +20,7 @@ from .workflow_day5 import Day5WorkflowConfig, run_day5_workflow
 from .workflow_day6 import Day6WorkflowConfig, run_day6_workflow
 
 
-DEFAULT_RESEARCH_PROMPT = "请分析彩图、MSI 或视频张量及其缺失模式，选择合适的张量分解，并在公平实验下提出、验证和改进一个补全算法。"
+DEFAULT_RESEARCH_PROMPT = "请分析彩图、MSI、视频或音频波形张量及其缺失模式，选择合适的张量分解，并在公平实验下提出、验证和改进一个补全算法。"
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,15 @@ class FullWorkflowConfig:
     seed: int = 42
     image_size: Optional[int] = 128
     mat_key: Optional[str] = None
+    observation_mask_path: Optional[str] = None
+    data_type: Optional[str] = None
+    evolution_cases: Optional[List[Dict[str, Any]]] = None
+    dataset_evaluation_steps: int = 1000
+    dataset_evaluation_validation_interval: int = 10
+    dataset_evaluation_patience: int = 0
+    historical_algorithm_reference: Optional[List[Dict[str, Any]]] = None
+    dataset_algorithm_reference: Optional[Dict[str, Any]] = None
+    valid_element_count: Optional[int] = None
     base_model: str = "auto"
     method_max_steps: int = 1500
     method_max_steps_ceiling: int = 6000
@@ -52,9 +64,10 @@ class FullWorkflowConfig:
     llm_mode: str = "auto"
     retrieval_top_k: int = 8
     minimum_psnr_delta: float = 0.2
+    minimum_nmse_delta: float = 0.0
     ssim_tolerance: float = 0.002
     smoke_timeout_seconds: float = 10.0
-    full_reference_metrics: bool = True
+    full_reference_metrics: bool = False
     no_reference_metrics: bool = False
     selection_visual_assessment: bool = False
     mutation_visual_assessment: bool = False
@@ -71,9 +84,11 @@ class FullWorkflowConfig:
     def validate(self) -> None:
         if not Path(self.image_path).is_file():
             raise ValueError("image_path does not point to a file: %s" % self.image_path)
+        if self.evolution_cases and (self.dataset_evaluation_steps < 1 or self.dataset_evaluation_validation_interval < 1 or self.dataset_evaluation_patience < 0):
+            raise ValueError("invalid whole-dataset evaluation budget")
         if not isinstance(self.prompt, str) or not self.prompt.strip():
             raise ValueError("prompt must be non-empty")
-        if self.mask_type not in {"random", "block"}:
+        if self.mask_type not in {"random", "block", "slices", "sildes"}:
             raise ValueError("mask_type must be random or block")
         if not 0.0 < self.missing_rate < 1.0:
             raise ValueError("missing_rate must be in (0, 1)")
@@ -128,6 +143,8 @@ class FullWorkflowConfig:
             )
         if not 1 <= self.max_improvement_rounds <= 100:
             raise ValueError("max_improvement_rounds must be in [1, 100]")
+        if self.minimum_nmse_delta < 0:
+            raise ValueError("minimum_nmse_delta must be nonnegative")
         if not isinstance(self.full_reference_metrics, bool):
             raise ValueError("full_reference_metrics must be a bool")
         if not isinstance(self.no_reference_metrics, bool):
@@ -136,8 +153,8 @@ class FullWorkflowConfig:
             raise ValueError("selection_visual_assessment must be a bool")
         if not isinstance(self.mutation_visual_assessment, bool):
             raise ValueError("mutation_visual_assessment must be a bool")
-        if not 2 <= self.method_shortlist_size <= 5:
-            raise ValueError("method_shortlist_size must be in [2, 5]")
+        if not 3 <= self.method_shortlist_size <= 5:
+            raise ValueError("method_shortlist_size must be in [3, 5]")
         if not 1 <= self.screening_trials <= 3:
             raise ValueError("screening_trials must be in [1, 3]")
         if self.screening_max_steps < 1:
@@ -157,8 +174,7 @@ class FullWorkflowConfig:
 
 
 def _score(metrics: Dict[str, Any]) -> float:
-    psnr = metrics.get("missing_psnr")
-    return float("inf") if psnr is None else float(psnr)
+    return metric_score(metrics)
 
 
 def _export_comparison_images(
@@ -281,6 +297,10 @@ class FullResearchWorkflow:
                     seed=self.config.seed,
                     image_size=self.config.image_size,
                     mat_key=self.config.mat_key,
+                    observation_mask_path=self.config.observation_mask_path,
+                    data_type=self.config.data_type,
+                    historical_algorithm_reference=self.config.historical_algorithm_reference,
+                    valid_element_count=self.config.valid_element_count,
                     model_name=self.config.base_model,
                     max_steps=self.config.method_max_steps,
                     max_steps_ceiling=self.config.method_max_steps_ceiling,
@@ -297,6 +317,8 @@ class FullResearchWorkflow:
                         self.config.selection_visual_assessment
                     ),
                     method_shortlist_size=self.config.method_shortlist_size,
+                    screening_cases=self.config.evolution_cases,
+                    dataset_algorithm_reference=self.config.dataset_algorithm_reference,
                     screening_trials=self.config.screening_trials,
                     screening_max_steps=self.config.screening_max_steps,
                     screening_patience=self.config.screening_patience,
@@ -310,6 +332,30 @@ class FullResearchWorkflow:
                 )
             )
             self._child_completed("day4", day4)
+
+            dataset_reference = copy.deepcopy(self.config.dataset_algorithm_reference)
+            if self.config.evolution_cases:
+                selected = day4["results"]["selected_trial"]
+                selected_incumbent = evaluate_across_cases(
+                    day4["selected_model"], None, selected,
+                    self.config.evolution_cases,
+                    self.run_dir / "pre_candidate_incumbent_dataset",
+                    self.config.dataset_evaluation_steps,
+                    self.config.dataset_evaluation_validation_interval,
+                    self.config.dataset_evaluation_patience,
+                    self.config.device,
+                )
+                dataset_reference = dataset_reference or {}
+                dataset_reference["selected_incumbent_before_evolution"] = {
+                    "algorithm": day4["selected_model"],
+                    "configuration_source": "Day 4 selected configuration; Day 6 may retune the incumbent",
+                    "summary": selected_incumbent["summary"],
+                    "samples": compact_case_feedback(selected_incumbent),
+                }
+                reference_path = self.run_dir / "pre_candidate_incumbent_dataset.json"
+                _write_json(reference_path, selected_incumbent)
+                self.state["artifacts"]["pre_candidate_incumbent_dataset"] = str(reference_path)
+                self._save()
 
             # ── 阶段 2：候选生成与验证（Day 5 工作流）────────────────────
             # 输入：day4 的 run 目录（base_run_dir，作为改进起点）
@@ -329,6 +375,7 @@ class FullResearchWorkflow:
                     llm_mode=self.config.llm_mode,
                     smoke_timeout_seconds=self.config.smoke_timeout_seconds,
                     visual_assessment=self.config.mutation_visual_assessment,
+                    dataset_algorithm_reference=dataset_reference,
                 )
             )
             self._child_completed("day5", day5)
@@ -375,16 +422,19 @@ class FullResearchWorkflow:
                         no_reference_metrics=self.config.no_reference_metrics,
                         visual_assessment=self.config.mutation_visual_assessment,
                         minimum_psnr_delta=self.config.minimum_psnr_delta,
+                        minimum_nmse_delta=self.config.minimum_nmse_delta,
                         ssim_tolerance=self.config.ssim_tolerance,
                         smoke_timeout_seconds=self.config.smoke_timeout_seconds,
+                        evolution_cases=self.config.evolution_cases,
+                        dataset_evaluation_steps=self.config.dataset_evaluation_steps,
+                        dataset_evaluation_validation_interval=self.config.dataset_evaluation_validation_interval,
+                        dataset_evaluation_patience=self.config.dataset_evaluation_patience,
+                        dataset_algorithm_reference=dataset_reference,
                     )
                 )
                 self._child_completed("day6", day6)
                 self.state["artifacts"]["run_practice"] = day6["artifacts"][
                     "run_practice"
-                ]
-                self.state["artifacts"]["global_experience"] = day6["artifacts"][
-                    "global_experience"
                 ]
             else:
                 print(
@@ -393,7 +443,7 @@ class FullResearchWorkflow:
                 )
 
             # ── 阶段 4：汇总 → 选冠军 → 出报告 ──────────────────────────
-            # 作用：标准化结果 → 以缺失区 PSNR 选冠军 → 复制冠军图 → 生成 report.md
+            # 单样本按本图指标选输出；Recovery 输出每轮整类 Judge 的最终 incumbent。
             self.state["method_results"] = build_method_results(day4, day6)
             comparison_images = _export_comparison_images(
                 self.run_dir,
@@ -414,7 +464,13 @@ class FullResearchWorkflow:
                 for item in self.state["method_results"]
                 if item["eligible_for_final_output"]
             ]
-            winner = max(eligible, key=lambda item: _score(item["metrics"]))
+            if self.config.evolution_cases:
+                # Recovery evolves one final algorithm per modality. A strong
+                # development-only interpolation/SIREN score must not replace it.
+                role = "candidate" if day6 and day6.get("best_evolved") else "tensor_baseline"
+                winner = next(item for item in eligible if item["role"] == role)
+            else:
+                winner = max(eligible, key=lambda item: _score(item["metrics"]))
             best_data_path = self.run_dir / "best_completion.npy"
             best_mat_path = self.run_dir / "best_completion.mat"
             best_preview_path = self.run_dir / "best_completion.png"
@@ -430,6 +486,10 @@ class FullResearchWorkflow:
                 "reconstruction": str(best_data_path),
                 "preview": str(best_preview_path),
             }
+            if self.config.evolution_cases and day6:
+                self.state["best_available"]["whole_modality_summary"] = (
+                    day6["overall_comparison"].get("whole_modality_summary")
+                )
             if winner_mat:
                 self.state["best_available"]["reconstruction_mat"] = str(
                     best_mat_path
@@ -470,4 +530,5 @@ class FullResearchWorkflow:
 
 
 def run_full_workflow(config: FullWorkflowConfig) -> Dict[str, Any]:
-    return FullResearchWorkflow(config).run()
+    with audio_metric_context(audio_metadata_for_gt(config.image_path)):
+        return FullResearchWorkflow(config).run()

@@ -20,12 +20,20 @@ def nearest_neighbor_fill(
 
     if observed_image.ndim not in (3, 4):
         raise ValueError("observed_image must have shape [H,W,C] or [H,W,T,C]")
-    if observed_mask.shape != observed_image.shape[:2] or observed_mask.dtype != np.bool_:
+    if observed_mask.shape not in (observed_image.shape[:2], observed_image.shape) or observed_mask.dtype != np.bool_:
         raise ValueError("observed_mask must be bool and match image height and width")
     if not observed_mask.any():
         raise ValueError("nearest-neighbor filling requires at least one observed pixel")
     if not np.isfinite(observed_image).all():
         raise ValueError("observed_image contains NaN or Inf")
+
+    if observed_mask.ndim > 2:
+        from scipy.ndimage import distance_transform_cdt
+        indices = distance_transform_cdt(
+            ~observed_mask, metric="taxicab", return_distances=False,
+            return_indices=True,
+        )
+        return observed_image[tuple(indices)].copy()
 
     reconstructed = observed_image.copy()
     visited = observed_mask.copy()

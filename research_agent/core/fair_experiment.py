@@ -13,8 +13,9 @@ import numpy as np
 import torch
 
 from ..schemas import TrainingConfig
-from .data import load_tensor_data, save_image, save_mat_companion, save_tensor_data
+from .data import load_tensor_data, load_tensor_prediction, save_image, save_mat_companion, save_tensor_data
 from .metrics import evaluate_reconstruction_metrics
+from .audio_metrics import active_audio_metadata, trial_selection_loss
 from .trainer import ModelBuilder, train_tensor_model
 
 
@@ -280,8 +281,12 @@ def tune_model_on_observed_pixels(
             "stopped_early": output.stopped_early,
             "history": output.history,
         }
-        if output.best_validation_mse < selected_score:
-            selected_score = output.best_validation_mse
+        if active_audio_metadata() is not None:
+            record.pop("best_missing_psnr")
+            record["best_missing_nmse"] = output.best_missing_nmse
+        score = trial_selection_loss(record)
+        if selected_output is None or score < selected_score:
+            selected_score = score
             selected_output = output
         return record
 
@@ -290,7 +295,7 @@ def tune_model_on_observed_pixels(
             execute_trial(hyperparameters, learning_rate, "coarse")
         )
 
-    best = min(trials, key=lambda item: item["best_validation_mse"])
+    best = min(trials, key=trial_selection_loss)
     fine_trial_count = 0
     if refine_learning_rate:
         fine_rates = (
@@ -307,7 +312,7 @@ def tune_model_on_observed_pixels(
                 execute_trial(best["hyperparameters"], learning_rate, "fine")
             )
             fine_trial_count += 1
-        best = min(trials, key=lambda item: item["best_validation_mse"])
+        best = min(trials, key=trial_selection_loss)
     if selected_output_dir is not None:
         if selected_output is None:
             raise RuntimeError("tuning did not retain a selected training output")
@@ -319,7 +324,7 @@ def tune_model_on_observed_pixels(
         )
     return {
         "model_name": model_name,
-        "selection_metric": "missing_region_ground_truth_mse",
+        "selection_metric": "missing_original_waveform_nmse" if active_audio_metadata() is not None else "missing_region_ground_truth_mse",
         "selection_scope": "missing_region_ground_truth",
         "ground_truth_used": True,
         "training_pixels": "all_observed_pixels",
@@ -343,7 +348,7 @@ def final_fit_and_evaluate(
     training_config: TrainingConfig,
     seed: int,
     output_dir: str,
-    include_full_reference_metrics: bool = True,
+    include_full_reference_metrics: bool = False,
     include_no_reference_metrics: bool = False,
 ) -> Dict[str, Any]:
     """Evaluate the trained winner directly, fitting only when no artifact exists."""
@@ -366,7 +371,7 @@ def final_fit_and_evaluate(
             % (model_name, int(selected_trial["best_step"])),
             flush=True,
         )
-        raw_reconstruction = load_tensor_data(selected_raw_path, max_size=None)
+        raw_reconstruction = load_tensor_prediction(selected_raw_path)
         history = selected_trial["history"]
         best_step = int(selected_trial["best_step"])
         best_mse = float(selected_trial["best_validation_mse"])
@@ -487,5 +492,9 @@ def final_fit_and_evaluate(
         "reused_without_retraining": reuse_selected,
         "artifacts": artifacts,
     }
+    if "missing_nmse" in metrics:
+        result.pop("selection_missing_psnr")
+        result["selection_missing_nmse"] = selected_trial.get("best_missing_nmse", metrics["missing_nmse"])
+        result["selection_metric"] = "missing_original_waveform_nmse"
     _write_json(metrics_path, result)
     return result

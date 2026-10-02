@@ -8,6 +8,11 @@ from typing import Any, Dict, List, Optional
 
 
 METRIC_SEMANTICS: Dict[str, Dict[str, str]] = {
+    "missing_nmse": {
+        "name": "Missing-waveform NMSE", "unit": "unitless", "direction": "lower_is_better",
+        "scope": "missing original-amplitude waveform samples, all channels, excluding padding",
+        "physical_meaning": "Squared waveform reconstruction error divided by reference waveform energy; no mean subtraction.",
+    },
     "full_psnr": {
         "name": "Full-image PSNR",
         "unit": "dB",
@@ -77,6 +82,10 @@ def describe_metrics(
 
     described: Dict[str, Dict[str, Any]] = {}
     for name, semantics in METRIC_SEMANTICS.items():
+        if "missing_nmse" in metrics and name != "missing_nmse":
+            continue
+        if name == "missing_nmse" and name not in metrics:
+            continue
         if name == "full_psnr" and not include_full_psnr:
             continue
         described[name] = {"value": metrics.get(name), **semantics}
@@ -131,8 +140,17 @@ def _write_jsonl(path: Path, records: List[Dict[str, Any]]) -> None:
 class GlobalExperienceStore:
     """Persistent compact principles reused across independent runs."""
 
-    def __init__(self, root: str | Path, base_method: str) -> None:
-        self.directory = Path(root) / base_method
+    def __init__(self, root: str | Path, base_method: str,
+                 data_type: Optional[str] = None, conditions: Optional[Dict[str, Any]] = None) -> None:
+        aliases = {"color_image": "Image", "msi": "MSI", "video": "Video", "audio": "audio"}
+        if data_type is not None and data_type not in aliases:
+            raise ValueError("unsupported experience data_type")
+        if Path(base_method).name != base_method:
+            raise ValueError("invalid base_method")
+        self.conditions = conditions or {}
+        self.data_type = data_type
+        self.base_method = base_method
+        self.directory = Path(root) / aliases[data_type] / base_method if data_type else Path(root) / base_method
         self.directory.mkdir(parents=True, exist_ok=True)
         self.experience_jsonl = self.directory / "reusable_experience.jsonl"
         self.experience_markdown = self.directory / "reusable_experience.md"
@@ -142,10 +160,10 @@ class GlobalExperienceStore:
         self._write_markdown(records)
 
     @staticmethod
-    def _compact_records(records: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    def _compact_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Normalize legacy verbose records into the two-field compact schema."""
 
-        compact: List[Dict[str, str]] = []
+        compact: List[Dict[str, Any]] = []
         seen = set()
         for record in records:
             lesson = record.get("experience") or record.get("reusable_principle")
@@ -155,17 +173,23 @@ class GlobalExperienceStore:
             confidence = record.get("confidence", "low")
             if confidence not in {"low", "medium", "high"}:
                 confidence = "low"
-            if lesson in seen:
+            metadata = {key: record[key] for key in (
+                "data_type", "base_method", "mask_type", "requested_missing_rate",
+                "actual_missing_rate", "source_run_id"
+            ) if key in record} if record.get("data_type") else {}
+            identity = (lesson, metadata.get("data_type"), metadata.get("mask_type"),
+                        metadata.get("actual_missing_rate"), metadata.get("source_run_id"))
+            if identity in seen:
                 continue
-            seen.add(lesson)
-            compact.append({"experience": lesson, "confidence": confidence})
+            seen.add(identity)
+            compact.append({"experience": lesson, "confidence": confidence, **metadata})
         return compact
 
-    def _write_markdown(self, records: List[Dict[str, str]]) -> None:
+    def _write_markdown(self, records: List[Dict[str, Any]]) -> None:
         lines = [
             "# %s 可复用算法变异经验" % self.directory.name,
             "",
-            "本文件跨运行累积，只保存一般性经验和置信度。",
+            "本文件跨运行累积；有类型标注的经验仅适用于记录的数据类型、缺失模式和缺失率。旧版无标注经验不会自动混入分类库。",
             "",
         ]
         for record in records:
@@ -175,12 +199,18 @@ class GlobalExperienceStore:
                     "  - 置信度：`%s`" % record["confidence"],
                 ]
             )
+            if record.get("data_type"):
+                lines.append("  - 适用条件：`%s / %s / 缺失率 %s`；来源：`%s`" % (
+                    record["data_type"], record.get("mask_type"), record.get("actual_missing_rate"),
+                    record.get("source_run_id", "unknown")))
         self.experience_markdown.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def context(self, limit: int = 50) -> Dict[str, Any]:
         records = _read_jsonl(self.experience_jsonl)
         return {
-            "base_method": self.directory.name,
+            "base_method": self.base_method,
+            "data_type": self.data_type,
+            "current_conditions": self.conditions,
             "record_count": len(records),
             "reusable_experience": records[-limit:],
             "documents": {
@@ -195,12 +225,16 @@ class GlobalExperienceStore:
     ) -> Dict[str, str]:
         """Append one unique two-field lesson and discard run-specific metadata."""
 
-        record = self._compact_records([experience])
+        payload = dict(experience)
+        if self.data_type:
+            payload.update({"data_type": self.data_type, "base_method": self.base_method,
+                            **self.conditions})
+        record = self._compact_records([payload])
         if not record:
             raise ValueError("experience must contain a non-empty general lesson")
         new_record = record[0]
         records = self._compact_records(_read_jsonl(self.experience_jsonl))
-        if all(item["experience"] != new_record["experience"] for item in records):
+        if new_record not in records:
             records.append(new_record)
             _write_jsonl(self.experience_jsonl, records)
             self._write_markdown(records)

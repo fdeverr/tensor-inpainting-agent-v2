@@ -18,6 +18,7 @@ from ..core.data import (
     apply_observation_mask,
     load_observation_mask,
     load_tensor_data,
+    load_tensor_prediction,
     save_image,
     save_mat_companion,
     save_mask,
@@ -27,9 +28,10 @@ from ..core.data import (
 from ..core.interpolation import nearest_neighbor_fill
 from ..core.masks import generate_observation_mask
 from ..core.metrics import evaluate_reconstruction_metrics
+from ..core.audio_metrics import active_audio_metadata, metric_score, trial_selection_loss
 from ..core.models import get_default_hyperparameters
 from ..core.models.registry import MODEL_CLASSES
-from ..core.trainer import fit_tensor_model_on_all_observations, train_tensor_model
+from ..core.trainer import fit_tensor_model_on_all_observations, train_tensor_model, observed_feature_mean
 from ..schemas import SUPPORTED_MASK_TYPES, SUPPORTED_MODEL_NAMES, TrainingConfig
 from .framework import Tool, ToolErrorCode, ToolParameter, ToolResponse
 
@@ -124,6 +126,9 @@ def _persist_selected_training_output(
         "reused_without_retraining": True,
         "artifacts": artifacts,
     }
+    if active_audio_metadata() is not None:
+        result.pop("selection_missing_psnr")
+        result["selection_missing_nmse"] = output.best_missing_nmse
     _write_json(result_path, {key: value for key, value in result.items() if key != "artifacts"})
     return result
 
@@ -131,7 +136,7 @@ def _persist_selected_training_output(
 def _load_observed_pair(corrupted_path: str, mask_path: str) -> tuple:
     corrupted = load_tensor_data(corrupted_path, max_size=None)
     observed_mask = load_observation_mask(mask_path)
-    if corrupted.shape[:2] != observed_mask.shape:
+    if observed_mask.shape not in (corrupted.shape[:2], corrupted.shape):
         raise ValueError("corrupted tensor and mask shapes do not match")
     return corrupted, observed_mask
 
@@ -155,7 +160,7 @@ def _metric_payload(
     ground_truth: np.ndarray,
     observed_mask: np.ndarray,
     device: str = "auto",
-    include_full_reference_metrics: bool = True,
+    include_full_reference_metrics: bool = False,
     include_no_reference_metrics: bool = False,
 ) -> Dict[str, Any]:
     return evaluate_reconstruction_metrics(
@@ -211,7 +216,7 @@ def _visible_structure_statistics(
     sampled_indices = np.unique(
         np.linspace(0, feature_count - 1, min(feature_count, 16), dtype=int)
     )
-    sampled_pixels = visible_pixels[:, sampled_indices]
+    sampled_pixels = visible_pixels[:, sampled_indices].astype(np.float64)
     if sampled_pixels.shape[1] == 1:
         correlation_matrix = np.ones((1, 1), dtype=np.float64)
     elif np.all(sampled_pixels.std(axis=0) > 1e-8):
@@ -337,6 +342,9 @@ class AnalyzeImageTool(ResearchTool):
             ToolParameter(name="mask_type", type="string", description="random 或 block"),
             ToolParameter(name="missing_rate", type="number", description="目标缺失率"),
             ToolParameter(name="seed", type="integer", description="随机种子"),
+            ToolParameter(name="observation_mask_path", type="string", description="可选预生成 NPY/PNG mask", required=False),
+            ToolParameter(name="data_type", type="string", description="显式张量语义：color_image/msi/video/audio", required=False),
+            ToolParameter(name="valid_element_count", type="integer", description="有效元素数，排除音频 padding", required=False),
             ToolParameter(
                 name="image_size",
                 type="integer",
@@ -358,6 +366,8 @@ class AnalyzeImageTool(ResearchTool):
             image_path = _required_string(parameters, "image_path")
             run_dir = Path(_required_string(parameters, "run_dir"))
             mask_type = _required_string(parameters, "mask_type")
+            if mask_type == "sildes":
+                mask_type = "slices"
             if mask_type not in SUPPORTED_MASK_TYPES:
                 raise ValueError("mask_type must be random or block")
             missing_rate = float(parameters["missing_rate"])
@@ -379,20 +389,30 @@ class AnalyzeImageTool(ResearchTool):
                 return_metadata=True,
             )
             height, width = ground_truth.shape[:2]
-            observed_mask = generate_observation_mask(
-                height=height,
-                width=width,
-                missing_rate=missing_rate,
-                mask_type=mask_type,
-                seed=seed,
-            )
+            if parameters.get("observation_mask_path"):
+                observed_mask = load_observation_mask(parameters["observation_mask_path"])
+                if observed_mask.shape not in (ground_truth.shape[:2], ground_truth.shape):
+                    raise ValueError("supplied mask does not match loaded tensor; disable resizing")
+            else:
+                observed_mask = generate_observation_mask(
+                    height=height, width=width, missing_rate=missing_rate,
+                    mask_type=mask_type, seed=seed,
+                )
+            valid_count = parameters.get("valid_element_count")
+            valid_count = observed_mask.size if valid_count is None else valid_count
+            if not 0 < valid_count <= observed_mask.size or (~observed_mask).sum() >= valid_count:
+                raise ValueError("invalid valid_element_count")
+            if parameters.get("data_type"):
+                if parameters["data_type"] not in {"color_image", "msi", "video", "audio"}:
+                    raise ValueError("unsupported data_type")
+                source_metadata["data_type"] = parameters["data_type"]
             corrupted = apply_observation_mask(ground_truth, observed_mask)
             run_dir.mkdir(parents=True, exist_ok=True)
             ground_truth_path = run_dir / "evaluation_ground_truth.npy"
             corrupted_path = run_dir / "corrupted.npy"
             corrupted_mat_path = run_dir / "corrupted.mat"
             corrupted_preview_path = run_dir / "corrupted_preview.png"
-            mask_path = run_dir / "mask.png"
+            mask_path = run_dir / ("mask.png" if observed_mask.ndim == 2 else "mask.npy")
             profile_path = run_dir / "image_profile.json"
             save_tensor_data(str(ground_truth_path), ground_truth)
             save_tensor_data(str(corrupted_path), corrupted)
@@ -400,13 +420,19 @@ class AnalyzeImageTool(ResearchTool):
             save_image(str(corrupted_preview_path), corrupted)
             save_mask(str(mask_path), observed_mask)
 
-            visible_pixels = ground_truth.reshape(height, width, -1)[observed_mask]
+            analysis_mask = observed_mask
+            analysis_tensor = ground_truth
+            if observed_mask.ndim > 2:
+                means = observed_feature_mean(corrupted, observed_mask)
+                analysis_tensor = np.where(observed_mask, corrupted, means)
+                analysis_mask = observed_mask.reshape(height, width, -1).any(axis=-1)
+            visible_pixels = analysis_tensor.reshape(height, width, -1)[analysis_mask]
             component_count, largest_hole_ratio = _missing_component_statistics(
-                observed_mask
+                analysis_mask
             )
             structure_statistics = _visible_structure_statistics(
-                ground_truth,
-                observed_mask,
+                analysis_tensor,
+                analysis_mask,
             )
             profile = {
                 "run_id": run_id,
@@ -417,8 +443,8 @@ class AnalyzeImageTool(ResearchTool):
                 "source_metadata": source_metadata,
                 "mask_type": mask_type,
                 "requested_missing_rate": missing_rate,
-                "actual_missing_rate": float((~observed_mask).mean()),
-                "observed_pixels": int(observed_mask.sum()),
+                "actual_missing_rate": float((~observed_mask).sum() / valid_count),
+                "observed_pixels": int(valid_count - (~observed_mask).sum()),
                 "missing_pixels": int((~observed_mask).sum()),
                 "missing_component_count": component_count,
                 "largest_missing_component_image_ratio": largest_hole_ratio,
@@ -427,6 +453,16 @@ class AnalyzeImageTool(ResearchTool):
                 "visible_channel_std": visible_pixels.std(axis=0).tolist(),
                 **structure_statistics,
                 "analysis_scope": "visible_pixels_only",
+                "mask_shape": list(observed_mask.shape),
+                "mask_scope": "elementwise" if observed_mask.ndim > 2 else "shared_spatial",
+                "tensor_axes": {
+                    "color_image": ["height", "width", "channel"],
+                    "msi": ["height", "width", "band"],
+                    "video": ["height", "width", "time", "channel"],
+                    "audio": ["time_frame", "sample_in_frame", "channel"],
+                }[source_metadata["data_type"]],
+                "valid_element_count": int(valid_count),
+                "structure_statistics_imputation": observed_mask.ndim > 2,
             }
             _write_json(profile_path, profile)
             artifacts = {
@@ -672,8 +708,12 @@ class TuneTensorModelTool(ResearchTool):
                         }
                     ],
                 }
-                if output.best_validation_mse < selected_score:
-                    selected_score = output.best_validation_mse
+                if active_audio_metadata() is not None:
+                    record.pop("best_missing_psnr")
+                    record["best_missing_nmse"] = output.best_missing_nmse
+                score = trial_selection_loss(record)
+                if selected_output is None or score < selected_score:
+                    selected_score = score
                     selected_output = output
                 return record
 
@@ -696,7 +736,7 @@ class TuneTensorModelTool(ResearchTool):
                     )
                 )
 
-            best_trial = min(trials, key=lambda trial: trial["best_validation_mse"])
+            best_trial = min(trials, key=trial_selection_loss)
             coarse_trial_count = len(trials)
             fine_trial_count = 0
             if refine_learning_rate:
@@ -728,7 +768,7 @@ class TuneTensorModelTool(ResearchTool):
                     )
                     fine_trial_count += 1
                 best_trial = min(
-                    trials, key=lambda trial: trial["best_validation_mse"]
+                    trials, key=trial_selection_loss
                 )
             expansion_history = []
             while (
@@ -796,6 +836,9 @@ class TuneTensorModelTool(ResearchTool):
                 best_trial["best_validation_mse"] = output.best_validation_mse
                 best_trial["best_missing_gt_mse"] = output.best_validation_mse
                 best_trial["best_missing_psnr"] = output.best_missing_psnr
+                if active_audio_metadata() is not None:
+                    best_trial.pop("best_missing_psnr")
+                    best_trial["best_missing_nmse"] = output.best_missing_nmse
                 best_trial["runtime_seconds"] += output.runtime_seconds
                 best_trial["parameter_count"] = output.parameter_count
                 best_trial["device"] = output.device
@@ -810,9 +853,9 @@ class TuneTensorModelTool(ResearchTool):
                     }
                 )
                 selected_output = output
-                selected_score = output.best_validation_mse
+                selected_score = trial_selection_loss(best_trial)
                 best_trial = min(
-                    trials, key=lambda trial: trial["best_validation_mse"]
+                    trials, key=trial_selection_loss
                 )
             if selected_output is None:
                 raise RuntimeError("tuning did not retain a selected training output")
@@ -830,7 +873,7 @@ class TuneTensorModelTool(ResearchTool):
             best_trial["artifacts"] = selected_result["artifacts"]
             result = {
                 "run_id": run_id,
-                "selection_metric": "missing_region_ground_truth_mse",
+                "selection_metric": "missing_original_waveform_nmse" if active_audio_metadata() is not None else "missing_region_ground_truth_mse",
                 "selection_scope": "missing_region_ground_truth",
                 "ground_truth_used": True,
                 "training_pixels": "all_observed_pixels",
@@ -1047,9 +1090,9 @@ class EvaluateReconstructionTool(ResearchTool):
             ToolParameter(
                 name="full_reference_metrics",
                 type="boolean",
-                description="是否计算全参考 LPIPS；PSNR/SSIM 始终计算",
+                description="是否计算全参考 LPIPS；音频只使用 NMSE，其他类型计算 PSNR/SSIM",
                 required=False,
-                default=True,
+                default=False,
             ),
             ToolParameter(
                 name="no_reference_metrics",
@@ -1064,9 +1107,8 @@ class EvaluateReconstructionTool(ResearchTool):
         try:
             run_id = _required_string(parameters, "run_id")
             algorithm_name = _required_string(parameters, "algorithm_name")
-            reconstruction = load_tensor_data(
+            reconstruction = load_tensor_prediction(
                 _required_string(parameters, "reconstruction_path"),
-                max_size=None,
             )
             ground_truth = load_tensor_data(
                 _required_string(parameters, "ground_truth_path"),
@@ -1077,7 +1119,7 @@ class EvaluateReconstructionTool(ResearchTool):
             )
             if reconstruction.shape != ground_truth.shape:
                 raise ValueError("reconstruction and ground truth shapes do not match")
-            if observed_mask.shape != ground_truth.shape[:2]:
+            if observed_mask.shape not in (ground_truth.shape[:2], ground_truth.shape):
                 raise ValueError("mask and tensor spatial shapes do not match")
             metrics = _metric_payload(
                 reconstruction,
@@ -1085,7 +1127,7 @@ class EvaluateReconstructionTool(ResearchTool):
                 observed_mask,
                 device=str(parameters.get("device", "auto")),
                 include_full_reference_metrics=bool(
-                    parameters.get("full_reference_metrics", True)
+                    parameters.get("full_reference_metrics", False)
                 ),
                 include_no_reference_metrics=bool(
                     parameters.get("no_reference_metrics", False)
@@ -1099,11 +1141,13 @@ class EvaluateReconstructionTool(ResearchTool):
             }
             output_path = Path(_required_string(parameters, "output_path"))
             _write_json(output_path, result)
-            psnr_text = (
-                "infinite" if metrics["full_psnr"] is None else "%.4f" % metrics["full_psnr"]
+            evaluation_text = (
+                "%s 评估完成：Missing NMSE=%s。" % (algorithm_name, metrics["missing_nmse"])
+                if "missing_nmse" in metrics else
+                "%s 评估完成：PSNR=%s dB。" % (algorithm_name, "infinite" if metrics["full_psnr"] is None else "%.4f" % metrics["full_psnr"])
             )
             return ToolResponse.success(
-                text="%s 评估完成：PSNR=%s dB。" % (algorithm_name, psnr_text),
+                text=evaluation_text,
                 data={
                     **result,
                     "artifacts": {"metrics": str(output_path)},
@@ -1121,7 +1165,7 @@ class CompareExperimentsTool(ResearchTool):
     def __init__(self) -> None:
         super().__init__(
             name="compare_experiments",
-            description="读取两个最终指标 JSON，以缺失区域 PSNR 为主、SSIM 为辅选择胜者。",
+            description="读取指标 JSON；音频仅按缺失波形 NMSE 选优，其他类型按缺失 PSNR、SSIM 比较。",
         )
 
     def get_parameters(self) -> List[ToolParameter]:
@@ -1141,6 +1185,21 @@ class CompareExperimentsTool(ResearchTool):
                 raise ValueError("both metric files must exist")
             baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
             candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+
+            if "missing_nmse" in baseline or "missing_nmse" in candidate:
+                if "missing_nmse" not in baseline or "missing_nmse" not in candidate:
+                    raise ValueError("cannot mix audio NMSE and image metrics")
+                baseline_score, candidate_score = metric_score(baseline), metric_score(candidate)
+                winner = "candidate" if candidate_score > baseline_score else "baseline" if candidate_score < baseline_score else "tie"
+                result = {"run_id": run_id, "winner": winner, "primary_metric": "missing_nmse",
+                          "baseline_algorithm": baseline.get("algorithm_name"),
+                          "candidate_algorithm": candidate.get("algorithm_name"),
+                          "candidate_nmse_reduction": (candidate_score - baseline_score) if math.isfinite(candidate_score) and math.isfinite(baseline_score) else None,
+                          "promotion_allowed": winner == "candidate"}
+                output_path = Path(_required_string(parameters, "output_path"))
+                _write_json(output_path, result)
+                return ToolResponse.success(text="NMSE 比较完成：winner=%s。" % winner,
+                                            data={**result, "artifacts": {"comparison": str(output_path)}})
 
             baseline_psnr = baseline.get("missing_psnr")
             candidate_psnr = candidate.get("missing_psnr")

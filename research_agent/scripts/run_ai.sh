@@ -18,7 +18,7 @@ usage() {
   --image PATH                    输入彩图或 MAT 数据路径
   --mat-key NAME                  MAT 变量名；省略时自动选择
   --image-size N|original         最长边缩放到 N；original 保留原始尺寸
-  --mask-type block|random        缺失掩码类型
+  --mask-type block|random|slices 缺失掩码类型（兼容 sildes）
   --missing-rate FLOAT            缺失比例，范围 (0, 1)
   --seed N                        随机种子
   --base-model METHOD            auto|matrix|mode3|cp|nonnegative_cp|tucker|btd|tsvd|nonnegative_tucker|hierarchical_tucker|tt|tensor_ring
@@ -33,7 +33,7 @@ usage() {
   --fair-learning-rate-refinement-factor F  学习率精搜缩放倍数
   --max-improvement-rounds N      单点变异轮数，范围 1–100，默认 5
   --device auto|cpu|cuda          运行设备
-  --full-reference-metrics on|off 是否计算全参考 LPIPS（PSNR/SSIM 始终计算）
+  --full-reference-metrics on|off 是否计算 LPIPS（默认 off；PSNR/SSIM 始终计算）
   --no-reference-metrics on|off   是否计算 MANIQA/CLIP-IQA/MUSIQ
   --selection-visual-assessment on|off  是否在分解选择前观察插值恢复图
   --mutation-visual-assessment on|off   是否让视觉信息参与候选变异
@@ -61,7 +61,6 @@ usage() {
   --output-dir PATH
   --candidate-root PATH
   --approved-root PATH
-  --knowledge-root PATH           跨运行可复用经验库目录
 
 示例：
   # 使用 smoke 预设
@@ -135,7 +134,7 @@ TUNING_NEAR_LIMIT_RATIO="0.9"
 TUNING_EXPANSION_FACTOR="2.0"
 DEVICE="cuda"
 BASE_MODEL="auto"
-FULL_REFERENCE_METRICS="on"
+FULL_REFERENCE_METRICS="off"
 NO_REFERENCE_METRICS="off"
 SELECTION_VISUAL_ASSESSMENT="off"
 MUTATION_VISUAL_ASSESSMENT="off"
@@ -157,7 +156,6 @@ PROMPT=""
 OUTPUT_DIR="research_agent/outputs"
 CANDIDATE_ROOT="research_agent/algorithms/candidates"
 APPROVED_ROOT="research_agent/algorithms/approved"
-KNOWLEDGE_ROOT=""
 
 case "$1" in
     -h|--help)
@@ -267,7 +265,6 @@ while [[ $# -gt 0 ]]; do
         --output-dir) OUTPUT_DIR="$VALUE" ;;
         --candidate-root) CANDIDATE_ROOT="$VALUE" ;;
         --approved-root) APPROVED_ROOT="$VALUE" ;;
-        --knowledge-root) KNOWLEDGE_ROOT="$VALUE" ;;
         *) die "未知选项: ${OPTION}（使用 --help 查看支持的选项）。" ;;
     esac
 done
@@ -414,9 +411,6 @@ fi
 if [[ -n "$MAT_KEY" ]]; then
     RUN_ARGS+=(--mat-key "$MAT_KEY")
 fi
-if [[ -n "$KNOWLEDGE_ROOT" ]]; then
-    RUN_ARGS+=(--knowledge-root "$KNOWLEDGE_ROOT")
-fi
 if [[ "$FULL_REFERENCE_METRICS" == "off" ]]; then
     RUN_ARGS+=(--skip-full-reference-metrics)
 else
@@ -465,7 +459,7 @@ echo "  分解预赛早停耐心: ${SCREENING_PATIENCE} 次验证"
 echo "  GT 评分间隔/早停: ${VALIDATION_INTERVAL}/${PATIENCE}"
 echo "  SIREN（步数/trials/验证间隔/早停）: ${SIREN_MAX_STEPS}/${SIREN_TUNING_TRIALS}/${SIREN_VALIDATION_INTERVAL}/${SIREN_PATIENCE}"
 echo "  设备/LLM 模式: ${DEVICE}/${LLM_MODE}"
-echo "  全参考指标（含 LPIPS）: ${FULL_REFERENCE_METRICS}"
+echo "  PSNR / SSIM: 始终计算；可选 LPIPS: ${FULL_REFERENCE_METRICS}"
 echo "  无参考指标: ${NO_REFERENCE_METRICS}"
 echo "  选择前多模态观察: ${SELECTION_VISUAL_ASSESSMENT}"
 echo "  变异阶段多模态参与: ${MUTATION_VISUAL_ASSESSMENT}"

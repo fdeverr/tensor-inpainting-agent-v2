@@ -40,7 +40,7 @@ class AlgorithmRunnerTool(ResearchTool):
                 type="boolean",
                 description="是否计算全参考 LPIPS；PSNR/SSIM 始终计算",
                 required=False,
-                default=True,
+                default=False,
             ),
             ToolParameter(
                 name="no_reference_metrics",
@@ -96,7 +96,7 @@ class AlgorithmRunnerTool(ResearchTool):
                 seed=int(parameters.get("seed", 42)),
                 output_dir=_required_string(parameters, "output_dir"),
                 include_full_reference_metrics=bool(
-                    parameters.get("full_reference_metrics", True)
+                    parameters.get("full_reference_metrics", False)
                 ),
                 include_no_reference_metrics=bool(
                     parameters.get("no_reference_metrics", False)

@@ -13,7 +13,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a small end-to-end benchmark grid.")
     parser.add_argument("--images", nargs="+", required=True)
     parser.add_argument("--mat-key", help="MAT variable name shared by MAT inputs")
-    parser.add_argument("--mask-types", nargs="+", choices=("random", "block"), default=["random", "block"])
+    parser.add_argument("--mask-types", nargs="+", choices=("random", "block", "slices", "sildes"), default=["random", "block"])
     parser.add_argument("--missing-rates", nargs="+", type=float, default=[0.4])
     parser.add_argument("--output-dir", default="research_agent/outputs")
     parser.add_argument("--candidate-root", default="research_agent/algorithms/candidates")

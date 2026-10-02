@@ -235,7 +235,13 @@ def test_algorithm_comparison_reference_exposes_ranked_baselines_and_screening()
                         "best_validation_mse": 0.01,
                         "trial_count": 2,
                         "best_trial": {"large": "payload"},
-                    }
+                    },
+                    {
+                        "method": "hierarchical_tucker",
+                        "best_validation_mse": 0.001,
+                        "trial_count": 2,
+                        "best_trial": {"losing_training_curve": [1, 2, 3]},
+                    },
                 ],
             },
         },
@@ -259,6 +265,33 @@ def test_algorithm_comparison_reference_exposes_ranked_baselines_and_screening()
         }
     ]
     assert reference["evaluation_feedback_reused_for_evolution"] is True
+    assert "hierarchical_tucker" not in json.dumps(reference["tensor_family_screening"])
+
+
+def test_only_screening_winner_contributes_cohort_scores_and_training_digest():
+    def result(method, psnr):
+        return {"method": method, "best_validation_mse": 0.01,
+                "trial_count": 2, "dataset_evaluation": {
+                    "summary": {"complete": True, "mean_missing_psnr": psnr},
+                    "results": [{"source": "/private/sample.mat", "status": "completed",
+                                 "metrics": {"missing_psnr": psnr, "full_psnr": 99.0},
+                                 "training": {"curve_summary": {"record_count": 4}}}],
+                }}
+
+    state = {"selected_model": "tucker", "results": {
+        "tensor_metrics": {"missing_psnr": 22.0},
+        "method_screening": {"winner": "tucker", "ground_truth_used": True,
+            "selection_metric": "mean_missing_psnr_then_ssim",
+            "results": [result("tucker", 22.0), result("cp", 30.0)]},
+    }}
+    reference = _algorithm_comparison_reference(state)
+    screen = reference["tensor_family_screening"]
+
+    assert [row["method"] for row in screen["results"]] == ["tucker"]
+    assert screen["results"][0]["whole_modality_summary"]["mean_missing_psnr"] == 22.0
+    assert screen["results"][0]["samples"][0]["training"]["curve_summary"]["record_count"] == 4
+    assert "full_psnr" not in screen["results"][0]["samples"][0]["metrics"]
+    assert "/private/sample.mat" not in json.dumps(screen)
 
 
 def test_candidate_prompt_matches_the_executable_model_contract():

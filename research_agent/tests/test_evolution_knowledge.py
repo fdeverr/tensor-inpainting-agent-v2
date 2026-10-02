@@ -499,11 +499,7 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
     assert len(
         (workflow.run_dir / "knowledge" / "practice.jsonl").read_text().splitlines()
     ) == 3
-    assert len(
-        (tmp_path / "knowledge" / "tucker" / "reusable_experience.jsonl")
-        .read_text()
-        .splitlines()
-    ) == 2
+    assert not (tmp_path / "knowledge").exists()  # Cross-run knowledge is disabled.
 
     assert len(generation_contexts) == 2
     assert all(
@@ -516,6 +512,7 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
     third_memory = third_context["evolution_memory"]["current_run_practice"]
     assert second_memory["round_count"] == 1
     assert third_memory["round_count"] == 2
+    assert "global_reusable_experience" not in third_context["evolution_memory"]
     assert all(
         set(item) == {"framework", "goal", "method", "result"}
         for item in third_memory["current_run_practice"]

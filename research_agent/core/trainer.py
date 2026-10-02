@@ -16,12 +16,26 @@ import torch
 from ..schemas import TrainingConfig
 from .masks import split_observed_mask
 from .models import create_model
+from .audio_metrics import active_audio_metadata, restore_waveform
 
 
 ModelBuilder = Callable[
     [Tuple[int, ...], Sequence[float], Dict[str, Any]],
     torch.nn.Module,
 ]
+
+
+def observed_feature_mean(data: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Visible-only initialization; entirely missing features use visible global mean."""
+    if mask.ndim == 2:
+        return data[mask].mean(axis=0)
+    flat_data = data.reshape(*data.shape[:2], -1)
+    flat_mask = mask.reshape(flat_data.shape)
+    counts = flat_mask.sum(axis=(0, 1))
+    sums = np.where(flat_mask, flat_data, 0).sum(axis=(0, 1))
+    means = np.full(sums.shape, float(data[mask].mean()), dtype=np.float32)
+    np.divide(sums, counts, out=means, where=counts > 0)
+    return means.reshape(data.shape[2:])
 
 
 def _duration_text(seconds: float) -> str:
@@ -161,6 +175,7 @@ class TrainingOutput:
     train_mask: np.ndarray
     validation_mask: np.ndarray
     state_dict: Dict[str, torch.Tensor]
+    best_missing_nmse: Optional[float] = None
 
 
 @dataclass
@@ -210,7 +225,7 @@ def _validate_training_arrays(
         raise ValueError("observed_image must have shape [H,W,C] or [H,W,T,C]")
     if not np.issubdtype(observed_image.dtype, np.floating):
         raise ValueError("observed_image must be floating point")
-    if observed_mask.shape != observed_image.shape[:2] or observed_mask.dtype != np.bool_:
+    if observed_mask.shape not in (observed_image.shape[:2], observed_image.shape) or observed_mask.dtype != np.bool_:
         raise ValueError("observed_mask must be bool and match image height and width")
     if not observed_mask.any():
         raise ValueError("at least one observed pixel is required")
@@ -233,7 +248,7 @@ def _validation_mse(
     validation_mask: torch.Tensor,
 ) -> torch.Tensor:
     expanded_mask = validation_mask[
-        (...,) + (None,) * (prediction.ndim - 2)
+        (...,) + (None,) * (prediction.ndim - validation_mask.ndim)
     ].expand_as(prediction)
     return torch.square(prediction - observed)[expanded_mask].mean()
 
@@ -277,7 +292,7 @@ def train_tensor_model(
         selection_metric = "%s_held_out_observed_mse" % config.validation_strategy
 
     # Initialization statistics use training pixels only, not validation pixels.
-    initial_channel_mean = observed_image[train_mask_np].mean(axis=0)
+    initial_channel_mean = observed_feature_mean(observed_image, train_mask_np)
     model = _build_model(
         model_name=model_name,
         image_shape=tuple(observed_image.shape),
@@ -299,6 +314,16 @@ def train_tensor_model(
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
     best_validation_mse = float("inf")
+    audio = active_audio_metadata() if ground_truth is not None else None
+    nmse_factor = None
+    if audio is not None:
+        waveform = restore_waveform(ground_truth, audio)
+        missing = (~observed_mask).reshape(-1, audio["channels"])[:audio["sample_count"]]
+        energy = float(np.square(waveform[missing]).sum())
+        scale = (audio["original_max"] - audio["original_min"]) if audio["normalization"] == "min_max" else 0.0 if audio["normalization"] == "constant_to_zero" else 1.0
+        nmse_factor = scale * scale * int(missing.sum()) / energy if energy > 0 else None
+        selection_metric = "missing_original_waveform_nmse"
+    best_selection_score = float("inf")
     best_step = 0
     best_state = None
     checks_without_improvement = 0
@@ -349,7 +374,7 @@ def train_tensor_model(
             )
         missing_psnr = (
             None
-            if ground_truth is None or validation_mse <= 0.0
+            if audio is not None or ground_truth is None or validation_mse <= 0.0
             else float(10.0 * math.log10(1.0 / validation_mse))
         )
         history.append(
@@ -364,7 +389,16 @@ def train_tensor_model(
             }
         )
 
-        if validation_mse < best_validation_mse - config.early_stopping_min_delta:
+        selection_score = validation_mse
+        if audio is not None:
+            history[-1].pop("missing_gt_psnr")
+            value = validation_mse * nmse_factor if nmse_factor is not None else 0.0 if validation_mse == 0 else None
+            history[-1]["missing_gt_nmse"] = value
+            if value is not None:
+                selection_score = value
+
+        if selection_score < best_selection_score - config.early_stopping_min_delta:
+            best_selection_score = selection_score
             best_validation_mse = validation_mse
             best_step = step
             best_state = copy.deepcopy(model.state_dict())
@@ -375,7 +409,7 @@ def train_tensor_model(
         progress.update(
             step=step,
             train_loss=float(total_loss.detach().item()),
-            validation_loss=validation_mse,
+            validation_loss=selection_score,
         )
 
         if checks_without_improvement >= config.early_stopping_patience:
@@ -385,7 +419,7 @@ def train_tensor_model(
     progress.finish(
         step=step,
         train_loss=float(total_loss.detach().item()),
-        validation_loss=validation_mse,
+        validation_loss=selection_score,
         status=("早停，best=%d" % best_step) if stopped_early else ("完成，best=%d" % best_step),
     )
 
@@ -407,7 +441,7 @@ def train_tensor_model(
         best_validation_mse=best_validation_mse,
         best_missing_psnr=(
             None
-            if ground_truth is None or best_validation_mse <= 0.0
+            if audio is not None or ground_truth is None or best_validation_mse <= 0.0
             else float(10.0 * math.log10(1.0 / best_validation_mse))
         ),
         selection_metric=selection_metric,
@@ -419,6 +453,7 @@ def train_tensor_model(
         train_mask=train_mask_np,
         validation_mask=validation_mask_np,
         state_dict=checkpoint_state,
+        best_missing_nmse=(best_validation_mse * nmse_factor if nmse_factor is not None else 0.0 if audio is not None and best_validation_mse == 0 else None),
     )
 
 
@@ -447,7 +482,7 @@ def fit_tensor_model_on_all_observations(
 
     set_reproducibility(seed, config.deterministic)
     device = resolve_device(config.device)
-    initial_channel_mean = observed_image[observed_mask].mean(axis=0)
+    initial_channel_mean = observed_feature_mean(observed_image, observed_mask)
     model = _build_model(
         model_name=model_name,
         image_shape=tuple(observed_image.shape),

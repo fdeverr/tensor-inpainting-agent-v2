@@ -198,7 +198,7 @@ def test_numerical_screening_can_override_the_selector_seed():
     workflow = object.__new__(Day4Workflow)
     workflow.config = SimpleNamespace(
         model_name="auto",
-        method_shortlist_size=2,
+        method_shortlist_size=3,
         max_steps=20,
         screening_max_steps=10,
         screening_patience=2,
@@ -219,7 +219,7 @@ def test_numerical_screening_can_override_the_selector_seed():
             }
         },
     }
-    scores = {"tucker": 0.03, "cp": 0.01}
+    scores = {"tucker": 0.03, "cp": 0.01, "tsvd": 0.04}
 
     def fake_call(tool_name, parameters):
         assert tool_name == "tune_tensor_model"
@@ -239,10 +239,118 @@ def test_numerical_screening_can_override_the_selector_seed():
         {"status": "skipped"},
     )
 
-    assert screening["shortlist"] == ["tucker", "cp"]
+    assert screening["shortlist"] == ["tucker", "cp", "tsvd"]
     assert screening["winner"] == "cp"
     assert plan["method"] == "cp"
     assert plan["selection_mode"] == "numerical_screening"
+
+
+def test_llm_shortlist_is_screened_on_every_same_type_sample(tmp_path, monkeypatch):
+    from research_agent import workflow_day4
+
+    workflow = object.__new__(Day4Workflow)
+    cases = [{"source": "/data/a.mat", "data_type": "Image"},
+             {"source": "/data/b.mat", "data_type": "Image"}]
+    workflow.config = SimpleNamespace(
+        model_name="auto", method_shortlist_size=3, max_steps=20,
+        screening_max_steps=8, screening_patience=2, screening_trials=1,
+        seed=7, validation_interval=2, device="cpu", screening_cases=cases,
+    )
+    workflow.run_id = "cohort-screening"
+    workflow.run_dir = tmp_path
+    workflow.state = {"artifacts": {"corrupted": "corrupted.npy", "mask": "mask.npy"},
+                      "results": {"image_profile": {"image_shape": [32, 32, 3],
+                                                    "image_aspect_ratio": 1.0}}}
+    local_losses = {"tucker": 0.01, "cp": 0.02, "hierarchical_tucker": 0.03}
+    seen = []
+
+    def fake_tune(tool_name, parameters):
+        assert tool_name == "tune_tensor_model"
+        assert parameters["max_steps"] == 8 and parameters["patience"] == 2
+        method = parameters["model_name"]
+        return SimpleNamespace(data={"best": {
+            "best_validation_mse": local_losses[method],
+            "hyperparameters": parameters["candidates"][0]["hyperparameters"],
+            "learning_rate": parameters["candidates"][0]["learning_rate"],
+            "best_step": 3}, "trial_count": 1})
+
+    def fake_cohort(name, builder, trial, evaluated_cases, output, steps, interval, patience, device):
+        seen.append((name, list(evaluated_cases), steps, interval, patience, device))
+        mean = {"tucker": 18.0, "cp": 20.0, "hierarchical_tucker": 24.0}[name]
+        return {"summary": {"complete": True, "expected_count": 2, "completed_count": 2,
+                            "perfect_count": 0, "mean_finite_missing_psnr": mean,
+                            "mean_missing_psnr": mean, "mean_composite_ssim": 0.8},
+                "results": [{"source": case["source"], "status": "completed",
+                             "metrics": {"missing_psnr": mean, "composite_ssim": 0.8}}
+                            for case in evaluated_cases]}
+
+    workflow._call_tool = fake_tune
+    monkeypatch.setattr(workflow_day4, "evaluate_across_cases", fake_cohort)
+    selector_plan = manual_method_plan("tucker", workflow.state["results"]["image_profile"]).model_dump()
+    selector_plan.update(selection_mode="llm",
+                         shortlist=["tucker", "cp", "hierarchical_tucker"])
+
+    plan, screening = workflow._screen_method_shortlist(
+        selector_plan, {"active_rules": [{"prefer": "tsvd", "weight": 99}], "evidence": []},
+        {"status": "skipped"})
+
+    assert screening["shortlist"] == selector_plan["shortlist"]
+    assert screening["selection_scope"] == "all_valid_samples_of_modality"
+    assert screening["winner"] == plan["method"] == "hierarchical_tucker"
+    assert len(seen) == 3 and all(x[1:] == (cases, 8, 2, 2, "cpu") for x in seen)
+
+
+def test_fallback_shortlist_keeps_strongest_measured_tensor_baseline():
+    reference = {"fixed_baselines": [
+        {"algorithm": "hierarchical_tucker", "summary": {
+            "complete": True, "mean_missing_psnr": 31.0, "perfect_count": 0}},
+        {"algorithm": "cp", "summary": {
+            "complete": True, "mean_missing_psnr": 25.0, "perfect_count": 0}},
+    ]}
+    shortlist = Day4Workflow._shortlist_methods(
+        {"method": "tucker", "selection_mode": "deterministic_fallback"},
+        {"active_rules": [], "evidence": []}, {"status": "skipped"}, 3, reference)
+    assert shortlist[0:2] == ["tucker", "hierarchical_tucker"]
+
+
+def test_audio_shortlist_uses_lower_whole_modality_nmse(tmp_path, monkeypatch):
+    from research_agent import workflow_day4
+
+    workflow = object.__new__(Day4Workflow)
+    cases = [{"source": "/data/a.wav", "data_type": "audio"},
+             {"source": "/data/b.wav", "data_type": "audio"}]
+    workflow.config = SimpleNamespace(
+        model_name="auto", method_shortlist_size=3, max_steps=10,
+        screening_max_steps=5, screening_patience=2, screening_trials=1,
+        seed=1, validation_interval=1, device="cpu", screening_cases=cases)
+    workflow.run_id = "audio-screening"
+    workflow.run_dir = tmp_path
+    workflow.state = {"artifacts": {"corrupted": "x.npy", "mask": "m.npy"},
+                      "results": {"image_profile": {"image_shape": [8, 8, 1],
+                                                    "image_aspect_ratio": 1.0}}}
+    workflow._call_tool = lambda _name, params: SimpleNamespace(data={
+        "best": {"best_validation_mse": 0.01,
+                 "hyperparameters": params["candidates"][0]["hyperparameters"],
+                 "learning_rate": params["candidates"][0]["learning_rate"]},
+        "trial_count": 1})
+
+    def fake_cohort(name, _builder, _trial, evaluated_cases, *_args):
+        mean = {"tucker": 0.4, "cp": 0.2, "hierarchical_tucker": 0.3}[name]
+        return {"summary": {"complete": True, "expected_count": 2,
+                            "completed_count": 2, "mean_missing_nmse": mean},
+                "results": [{"source": case["source"], "status": "completed",
+                             "metrics": {"missing_nmse": mean}}
+                            for case in evaluated_cases]}
+
+    monkeypatch.setattr(workflow_day4, "evaluate_across_cases", fake_cohort)
+    selector_plan = manual_method_plan("tucker", workflow.state["results"]["image_profile"]).model_dump()
+    selector_plan.update(selection_mode="llm",
+                         shortlist=["tucker", "cp", "hierarchical_tucker"])
+    plan, screening = workflow._screen_method_shortlist(
+        selector_plan, {"active_rules": [], "evidence": []}, {"status": "skipped"})
+
+    assert plan["method"] == screening["winner"] == "cp"
+    assert screening["selection_metric"] == "mean_missing_nmse"
 
 
 def test_day4_fallback_selects_and_trains_a_valid_method(tmp_path):
@@ -482,7 +590,8 @@ def test_day4_can_feed_one_shot_interpolation_visual_prior_to_selector(tmp_path)
         def __init__(self):
             self.visual_assessment = None
 
-        def select(self, profile, retrieval, visual_assessment=None):
+        def select(self, profile, retrieval, visual_assessment=None, shortlist_size=None,
+                   comparison_reference=None):
             self.visual_assessment = visual_assessment
             return {
                 "plan": manual_method_plan("tucker", profile),

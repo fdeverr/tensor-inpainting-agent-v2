@@ -10,10 +10,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .knowledge import LocalKnowledgeRetriever
+from .core.audio_metrics import active_audio_metadata, audio_metric_context, audio_metadata_for_gt, metric_score, trial_selection_loss
+from .dataset_evolution import evaluate_across_cases
 from .method_selector import (
     MethodSelector,
     _default_hyperparameters,
     _spatial_feature_shape,
+    _strongest_fixed_tensor_baseline,
     llm_from_environment,
     manual_method_plan,
 )
@@ -29,7 +32,7 @@ SELECTION_QUERY = (
     "Choose matrix, A mode-3 E, CP, Nonnegative CP, Tucker, BTD, t-SVD, "
     "Nonnegative Tucker, "
     "Hierarchical Tucker, Tensor Train, or Tensor Ring "
-    "decomposition for color image, MSI, or video tensor inpainting "
+    "decomposition for color image, MSI, video, or framed audio waveform tensor recovery "
     "using missing pattern, channel/feature correlation, local smoothness, high frequency, "
     "spatial anisotropy, rank guidance, limitations, and failure modes."
 )
@@ -48,6 +51,8 @@ class Day4WorkflowConfig(Day3WorkflowConfig):
     retrieval_top_k: int = 8
     selection_visual_assessment: bool = False
     method_shortlist_size: int = 3
+    screening_cases: Optional[List[Dict[str, Any]]] = None
+    dataset_algorithm_reference: Optional[Dict[str, Any]] = None
     screening_trials: int = 2
     screening_max_steps: int = 400
     screening_patience: int = 10
@@ -60,7 +65,7 @@ class Day4WorkflowConfig(Day3WorkflowConfig):
     def validate(self) -> None:
         if not Path(self.image_path).is_file():
             raise ValueError("image_path does not point to a file: %s" % self.image_path)
-        if self.mask_type not in {"random", "block"}:
+        if self.mask_type not in {"random", "block", "slices", "sildes"}:
             raise ValueError("mask_type must be random or block")
         if not 0.0 < self.missing_rate < 1.0:
             raise ValueError("missing_rate must be strictly between 0 and 1")
@@ -95,8 +100,8 @@ class Day4WorkflowConfig(Day3WorkflowConfig):
             raise ValueError("retrieval_top_k must be positive")
         if not isinstance(self.selection_visual_assessment, bool):
             raise ValueError("selection_visual_assessment must be a bool")
-        if not 2 <= self.method_shortlist_size <= 5:
-            raise ValueError("method_shortlist_size must be in [2, 5]")
+        if not 3 <= self.method_shortlist_size <= 5:
+            raise ValueError("method_shortlist_size must be in [3, 5]")
         if not 1 <= self.screening_trials <= 3:
             raise ValueError("screening_trials must be in [1, 3]")
         if self.screening_max_steps < 1:
@@ -476,6 +481,8 @@ class Day4Workflow(Day3Workflow):
                 profile=profile,
                 retrieval=retrieval,
                 visual_assessment=visual_assessment,
+                shortlist_size=self.config.method_shortlist_size,
+                comparison_reference=self.config.dataset_algorithm_reference,
             )
         else:
             selection = {
@@ -511,6 +518,8 @@ class Day4Workflow(Day3Workflow):
                 "screening_winner": screening.get("winner"),
                 "screening_metric": screening.get("selection_metric"),
                 "ground_truth_provided_to_selector": False,
+                "ground_truth_derived_baseline_metrics_provided_to_selector": bool(
+                    self.config.dataset_algorithm_reference),
                 "final_metrics_provided_to_selector": False,
                 "selection_visual_assessment_status": visual_assessment.get(
                     "status"
@@ -546,8 +555,14 @@ class Day4Workflow(Day3Workflow):
         retrieval: Dict[str, Any],
         visual_assessment: Dict[str, Any],
         limit: int,
+        comparison_reference: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
-        """Merge LLM, visual, and local-rule suggestions without granting veto power."""
+        """Use the LLM's complete ranked list, or fill a fallback from local evidence."""
+
+        if selector_plan.get("selection_mode") in {"llm", "llm_repaired"}:
+            llm_shortlist = selector_plan.get("shortlist", [])
+            if len(llm_shortlist) == limit:
+                return list(llm_shortlist)
 
         ranked: List[str] = []
 
@@ -556,6 +571,7 @@ class Day4Workflow(Day3Workflow):
                 ranked.append(str(method))
 
         add(selector_plan["method"])
+        add(_strongest_fixed_tensor_baseline(comparison_reference))
         if visual_assessment.get("status") == "completed":
             for method in visual_assessment.get("assessment", {}).get(
                 "preferred_methods", []
@@ -598,10 +614,13 @@ class Day4Workflow(Day3Workflow):
             retrieval,
             visual_assessment,
             self.config.method_shortlist_size,
+            getattr(self.config, "dataset_algorithm_reference", None),
         )
         method_plans: Dict[str, Dict[str, Any]] = {}
         screening_results = []
         shared_steps = min(self.config.max_steps, self.config.screening_max_steps)
+        shared_interval = min(self.config.validation_interval, shared_steps)
+        cases = getattr(self.config, "screening_cases", None)
         for method in shortlist:
             if method == selector_plan["method"]:
                 method_plan = dict(selector_plan)
@@ -624,9 +643,11 @@ class Day4Workflow(Day3Workflow):
             if not candidates:
                 raise RuntimeError("no bounded screening candidates for %s" % method)
             output_path = self.run_dir / "screening" / method / "tuning.json"
-            response = self._call_tool(
-                "tune_tensor_model",
-                {
+            record = {"method": method, "status": "failed", "artifact": str(output_path)}
+            try:
+                response = self._call_tool(
+                    "tune_tensor_model",
+                    {
                     "run_id": self.run_id,
                     "corrupted_path": self.state["artifacts"]["corrupted"],
                     "mask_path": self.state["artifacts"]["mask"],
@@ -638,45 +659,65 @@ class Day4Workflow(Day3Workflow):
                     "seed": self.config.seed,
                     "candidates": candidates[: self.config.screening_trials],
                     "max_steps": shared_steps,
-                    "validation_interval": min(
-                        self.config.validation_interval, shared_steps
-                    ),
+                    "validation_interval": shared_interval,
                     "patience": self.config.screening_patience,
                     "device": self.config.device,
-                },
-            )
-            screening_results.append(
-                {
-                    "method": method,
-                    "best_validation_mse": response.data["best"][
-                        "best_validation_mse"
-                    ],
-                    "best_trial": response.data["best"],
-                    "trial_count": response.data["trial_count"],
-                    "artifact": str(output_path),
-                }
-            )
+                    },
+                )
+                best = response.data["best"]
+                record.update(best_validation_mse=best["best_validation_mse"],
+                              best_trial=best, trial_count=response.data["trial_count"])
+                if cases:
+                    evaluation = evaluate_across_cases(
+                        method, None, best, cases,
+                        self.run_dir / "screening" / method / "whole_modality",
+                        shared_steps, shared_interval, self.config.screening_patience,
+                        self.config.device,
+                    )
+                    record["dataset_evaluation"] = evaluation
+                    record["status"] = ("completed" if evaluation["summary"]["complete"]
+                                        else "incomplete")
+                else:
+                    record["status"] = "completed"
+            except Exception as error:
+                record["error"] = "%s: %s" % (type(error).__name__, error)
+            screening_results.append(record)
 
-        winner = min(
-            screening_results,
-            key=lambda item: (item["best_validation_mse"], item["method"]),
-        )
+        eligible = [item for item in screening_results if item["status"] == "completed"]
+        if not eligible:
+            raise RuntimeError("no shortlist method completed the numerical screening on every sample")
+        if cases:
+            audio = cases[0]["data_type"] == "audio"
+            def rank(item):
+                summary = item["dataset_evaluation"]["summary"]
+                if audio:
+                    return (summary["mean_missing_nmse"], item["method"])
+                finite_psnr = summary.get("mean_finite_missing_psnr")
+                return (-summary.get("perfect_count", 0),
+                        -(finite_psnr if finite_psnr is not None else float("inf")),
+                        -summary["mean_composite_ssim"], item["method"])
+            winner = min(eligible, key=rank)
+            winner_summary = winner["dataset_evaluation"]["summary"]
+            shortlist_source = ("The LLM" if selector_plan.get("selection_mode") in
+                                {"llm", "llm_repaired"} else "Local fallback rules")
+            reason = ("%s won the equal-budget full-modality screening: %s. "
+                      "%s chose the shortlist; measured whole-modality results chose the winner."
+                      % (winner["method"], winner_summary, shortlist_source))
+        else:
+            winner = min(eligible, key=lambda item: (
+                trial_selection_loss(item["best_trial"]), item["method"]))
+            reason = ("%s won the equal-budget representative-sample screening "
+                      "with missing-region GT MSE %.8f. The selector only formed the shortlist."
+                      % (winner["method"], winner["best_validation_mse"]))
         winner_plan = dict(method_plans[winner["method"]])
         winner_plan.update(
             {
-                "reason": (
-                    "%s won the equal-budget per-image numerical screening "
-                    "with missing-region GT MSE %.8f. The selector and visual model "
-                    "only formed the shortlist."
-                    % (winner["method"], winner["best_validation_mse"])
-                ),
+                "reason": reason,
                 "evidence": [
                     {
                         "source": "numerical_screening:missing_region_ground_truth",
-                        "claim": (
-                            "%s achieved the lowest validation MSE among %s."
-                            % (winner["method"], shortlist)
-                        ),
+                        "claim": "%s ranked first in the shared-budget numerical screen of %s."
+                                 % (winner["method"], shortlist),
                     }
                 ],
                 "confidence": 1.0,
@@ -687,14 +728,16 @@ class Day4Workflow(Day3Workflow):
             "status": "completed",
             "shortlist": shortlist,
             "selector_recommendation": selector_plan["method"],
+            "selector_recommended_methods": selector_plan.get("shortlist", []),
             "winner": winner["method"],
-            "selection_metric": "missing_region_ground_truth_mse",
-            "selection_scope": "missing_region_ground_truth",
+            "selection_metric": ("mean_missing_nmse" if cases and cases[0]["data_type"] == "audio" else
+                                 "mean_missing_psnr_then_ssim" if cases else
+                                 "missing_original_waveform_nmse" if active_audio_metadata() is not None else
+                                 "missing_region_ground_truth_mse"),
+            "selection_scope": "all_valid_samples_of_modality" if cases else "missing_region_ground_truth",
             "shared_max_steps": shared_steps,
             "trials_per_method": self.config.screening_trials,
-            "validation_interval": min(
-                self.config.validation_interval, shared_steps
-            ),
+            "validation_interval": shared_interval,
             "early_stopping_patience": self.config.screening_patience,
             "ground_truth_used": True,
             "results": screening_results,
@@ -829,6 +872,7 @@ class Day4Workflow(Day3Workflow):
             },
         )
         metric_keys = (
+            "missing_nmse", "evaluation_metric", "audio_metric_status",
             "missing_mse",
             "missing_psnr",
             "full_psnr",
@@ -868,7 +912,7 @@ class Day4Workflow(Day3Workflow):
                     "device",
                 )
             },
-            "metrics": {key: evaluation.data[key] for key in metric_keys},
+            "metrics": {key: evaluation.data[key] for key in metric_keys if key in evaluation.data},
             "training_cache": {
                 "reused": cache_reused,
                 "fingerprint": fingerprint,
@@ -891,11 +935,7 @@ class Day4Workflow(Day3Workflow):
         ]
         baseline_winner = max(
             baseline_rows,
-            key=lambda item: (
-                float("inf")
-                if item["metrics"].get("missing_psnr") is None
-                else float(item["metrics"]["missing_psnr"])
-            ),
+            key=lambda item: metric_score(item["metrics"]),
         )
         baseline_comparison = {
             "selection_rule": (
@@ -905,6 +945,8 @@ class Day4Workflow(Day3Workflow):
             "winner": baseline_winner["algorithm"],
             "results": baseline_rows,
         }
+        if "missing_nmse" in baseline_winner["metrics"]:
+            baseline_comparison["selection_rule"] = "lowest missing original-waveform NMSE"
         baseline_comparison_path = self.run_dir / "baseline_comparison.json"
         _write_json(baseline_comparison_path, baseline_comparison)
         self.state["artifacts"]["baseline_comparison"] = str(
@@ -940,8 +982,5 @@ def run_day4_workflow(
     selector: Optional[MethodSelector] = None,
     visual_evaluator: Optional[MultimodalQualityEvaluator] = None,
 ) -> Dict[str, Any]:
-    return Day4Workflow(
-        config=config,
-        selector=selector,
-        visual_evaluator=visual_evaluator,
-    ).run()
+    with audio_metric_context(audio_metadata_for_gt(config.image_path)):
+        return Day4Workflow(config=config, selector=selector, visual_evaluator=visual_evaluator).run()

@@ -8,7 +8,7 @@ import json
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .ablation import (
     build_ablation_arms,
@@ -33,17 +33,17 @@ from .candidate.search_contract import (
 )
 from .core.data import load_observation_mask, load_tensor_data
 from .core.experiment_judge import judge_candidate
+from .core.audio_metrics import audio_metric_context, audio_metadata_for_gt, metric_score
 from .core.fair_experiment import (
     final_fit_and_evaluate,
     independent_trial_configurations,
     tune_model_on_observed_pixels,
 )
+from .dataset_evolution import compact_case_feedback, evaluate_across_cases, judge_across_cases
 from .core.models.registry import MODEL_CLASSES
 from .evolution_knowledge import (
-    GlobalExperienceStore,
     RunPracticeStore,
     describe_metrics,
-    resolve_knowledge_root,
 )
 from .method_selector import llm_from_environment
 from .schemas import TrainingConfig
@@ -73,13 +73,19 @@ class Day6WorkflowConfig:
     patience: int = 20
     device: str = "auto"
     minimum_psnr_delta: float = 0.2
+    minimum_nmse_delta: float = 0.0
     ssim_tolerance: float = 0.002
     smoke_timeout_seconds: float = 10.0
-    full_reference_metrics: bool = True
+    full_reference_metrics: bool = False
     no_reference_metrics: bool = False
     visual_assessment: bool = False
     ablation_screen_trials: int = 1
     ablation_screen_max_steps: int = 300
+    evolution_cases: Optional[List[Dict[str, Any]]] = None
+    dataset_evaluation_steps: int = 1000
+    dataset_evaluation_validation_interval: int = 10
+    dataset_evaluation_patience: int = 0
+    dataset_algorithm_reference: Optional[Dict[str, Any]] = None
 
     def validate(self) -> None:
         if not (Path(self.base_run_dir) / "state.json").is_file():
@@ -132,8 +138,13 @@ class Day6WorkflowConfig:
             raise ValueError("ablation_screen_trials must be in [1, 3]")
         if self.ablation_screen_max_steps < 1:
             raise ValueError("ablation_screen_max_steps must be positive")
-        if self.minimum_psnr_delta < 0.0 or self.ssim_tolerance < 0.0:
+        if self.minimum_psnr_delta < 0.0 or self.ssim_tolerance < 0.0 or self.minimum_nmse_delta < 0.0:
             raise ValueError("judge thresholds must be non-negative")
+        if self.evolution_cases:
+            if self.dataset_evaluation_steps < 1 or self.dataset_evaluation_validation_interval < 1 or self.dataset_evaluation_patience < 0:
+                raise ValueError("invalid whole-dataset evaluation budget")
+            if len({item["source"] for item in self.evolution_cases}) != len(self.evolution_cases):
+                raise ValueError("evolution cases must be unique")
 
 
 class Day6Workflow:
@@ -671,13 +682,17 @@ class Day6Workflow:
             observed_mask = load_observation_mask(artifacts["mask"])
             ground_truth_path = Path(self.config.base_run_dir) / "evaluation_ground_truth.npy"
             ground_truth = load_tensor_data(str(ground_truth_path), max_size=None)
-            if observed.shape != ground_truth.shape or observed_mask.shape != observed.shape[:2]:
+            if observed.shape != ground_truth.shape or observed_mask.shape not in (observed.shape[:2], observed.shape):
                 raise ValueError("base-run tensor artifacts have inconsistent shapes")
 
             base_method = self.base_state["selected_model"]
             learning_rate = float(self.config.learning_rate_candidates[0])
             seed = int(self.base_state["config"]["seed"])
             improver_context = load_improver_context(self.config.base_run_dir)
+            if self.config.dataset_algorithm_reference:
+                improver_context["algorithm_comparison_reference"]["whole_modality_algorithms"] = (
+                    self.config.dataset_algorithm_reference
+                )
             improver_context["mutation_visual_assessment_enabled"] = bool(
                 self.config.visual_assessment
             )
@@ -694,19 +709,10 @@ class Day6Workflow:
             self.state["artifacts"]["algorithm_comparison_reference"] = str(
                 comparison_reference_path
             )
-            global_experience = GlobalExperienceStore(
-                resolve_knowledge_root(
-                    self.config.candidate_root, self.config.knowledge_root
-                ),
-                base_method,
-            )
             run_practice = RunPracticeStore(
                 self.run_dir,
                 base_method,
                 self.workflow_id,
-            )
-            self.state["artifacts"]["global_experience"] = (
-                global_experience.context()["documents"]
             )
             self.state["artifacts"]["run_practice"] = (
                 run_practice.context()["documents"]
@@ -725,6 +731,7 @@ class Day6Workflow:
                 "search_space": None,
                 "ablation_screening": None,
                 "trained_in_round": None,
+                "dataset_evaluation": None,
             }
             original_final: Optional[Dict[str, Any]] = None
             run_wide_training: Optional[TrainingConfig] = None
@@ -1116,7 +1123,33 @@ class Day6Workflow:
                 judgment = judge_candidate(
                     baseline_tuning, baseline_final, candidate_tuning, candidate_final,
                     self.config.minimum_psnr_delta, self.config.ssim_tolerance,
+                    getattr(self.config, "minimum_nmse_delta", 0.0),
                 )
+                cohort = None
+                if self.config.evolution_cases:
+                    if incumbent["dataset_evaluation"] is None:
+                        incumbent["dataset_evaluation"] = evaluate_across_cases(
+                            incumbent["name"], incumbent["builder"], baseline_tuning["best"],
+                            self.config.evolution_cases, round_dir / "incumbent_dataset",
+                            self.config.dataset_evaluation_steps,
+                            self.config.dataset_evaluation_validation_interval,
+                            self.config.dataset_evaluation_patience, self.config.device,
+                        )
+                    candidate_dataset = evaluate_across_cases(
+                        candidate_manifest["candidate_id"], candidate_builder(candidate_class),
+                        candidate_tuning["best"], self.config.evolution_cases,
+                        round_dir / "candidate_dataset", self.config.dataset_evaluation_steps,
+                        self.config.dataset_evaluation_validation_interval,
+                        self.config.dataset_evaluation_patience, self.config.device,
+                    )
+                    cohort = {"incumbent": incumbent["dataset_evaluation"],
+                              "candidate": candidate_dataset}
+                    judgment = judge_across_cases(
+                        judgment, cohort["incumbent"], cohort["candidate"],
+                        self.config.minimum_psnr_delta, self.config.ssim_tolerance,
+                        self.config.minimum_nmse_delta,
+                    )
+                    _write_json(round_dir / "dataset_evaluation.json", cohort)
                 judgment["budget_audit"].update(
                     {
                         "shared_training_config": training.to_dict(),
@@ -1165,6 +1198,7 @@ class Day6Workflow:
                         "search_space": candidate_search_space,
                         "ablation_screening": ablation_screening,
                         "trained_in_round": round_index,
+                        "dataset_evaluation": candidate_dataset if cohort else None,
                     }
                     self.state["accepted"] = True
                     self.state["accepted_rounds"].append(round_index)
@@ -1197,18 +1231,35 @@ class Day6Workflow:
                 mutation_metric_names = {"missing_psnr", "composite_ssim"}
                 if judgment["lpips_delta"] is not None:
                     mutation_metric_names.add("lpips")
+                incumbent_feedback_metrics = (
+                    {"missing_nmse": cohort["incumbent"]["summary"]["mean_missing_nmse"]}
+                    if cohort and self.config.evolution_cases[0]["data_type"] == "audio" else
+                    {"missing_psnr": cohort["incumbent"]["summary"]["mean_missing_psnr"],
+                     "composite_ssim": cohort["incumbent"]["summary"]["mean_composite_ssim"]}
+                    if cohort else baseline_final["metrics"]
+                )
+                candidate_feedback_metrics = (
+                    {"missing_nmse": cohort["candidate"]["summary"]["mean_missing_nmse"]}
+                    if cohort and self.config.evolution_cases[0]["data_type"] == "audio" else
+                    {"missing_psnr": cohort["candidate"]["summary"]["mean_missing_psnr"],
+                     "composite_ssim": cohort["candidate"]["summary"]["mean_composite_ssim"]}
+                    if cohort else candidate_final["metrics"]
+                )
                 incumbent_metric_summary = describe_metrics(
-                    baseline_final["metrics"],
+                    incumbent_feedback_metrics,
                     include_full_psnr=False,
                 )
                 candidate_metric_summary = describe_metrics(
-                    candidate_final["metrics"],
+                    candidate_feedback_metrics,
                     include_full_psnr=False,
                 )
                 metric_deltas = {
                     "missing_psnr_db": judgment["psnr_delta"],
                     "composite_ssim": judgment["ssim_delta"],
                 }
+                if "nmse_delta" in judgment:
+                    mutation_metric_names = {"missing_nmse"}
+                    metric_deltas = {"missing_nmse_reduction": judgment["nmse_delta"]}
                 if judgment["lpips_delta"] is not None:
                     metric_deltas["lpips"] = judgment["lpips_delta"]
                 result_summary = {
@@ -1226,11 +1277,20 @@ class Day6Workflow:
                     "training_behavior": judgment["training_behavior"],
                     "removal_audit": final_removal_audit,
                 }
+                if cohort:
+                    result_summary["metric_scope"] = "arithmetic mean over all valid same-type samples; every candidate sample must complete"
+                    result_summary["dataset_evaluation"] = {
+                        "incumbent": compact_case_feedback(cohort["incumbent"]),
+                        "candidate": compact_case_feedback(cohort["candidate"]),
+                        "incumbent_summary": cohort["incumbent"]["summary"],
+                        "candidate_summary": cohort["candidate"]["summary"],
+                    }
                 if ablation_screening is not None:
                     result_summary["ablation"] = ablation_screening
                 if self.config.visual_assessment:
                     result_summary["visual_assessment"] = visual_assessment
                 conditions = {
+                    "data_type": self.base_state["results"]["image_profile"].get("data_type", "color_image"),
                     "image_shape": list(observed.shape),
                     "mask_type": self.base_state["config"]["mask_type"],
                     "actual_missing_rate": self.base_state["results"]["image_profile"][
@@ -1277,7 +1337,6 @@ class Day6Workflow:
                 _write_json(round_dir / "practice_record.json", practice)
                 _write_json(round_dir / "experience_record.json", experience)
                 practice_artifacts = run_practice.record(practice)
-                experience_artifacts = global_experience.record(experience)
                 round_record = {
                     "round": round_index,
                     "incumbent_before": incumbent_name_before,
@@ -1299,6 +1358,7 @@ class Day6Workflow:
                     "candidate_tuning": candidate_tuning,
                     "baseline_final": baseline_final,
                     "candidate_final": candidate_final,
+                    "dataset_evaluation": cohort,
                     "ablation_screening": ablation_screening,
                     "result_summary": result_summary,
                     "experience": experience,
@@ -1325,15 +1385,18 @@ class Day6Workflow:
                     "suspected_causes": judgment["suspected_causes"],
                     "next_round_constraints": judgment["next_round_constraints"],
                 }
+                if cohort:
+                    feedback_record["dataset_evaluation"] = result_summary["dataset_evaluation"]
+                if "nmse_delta" in judgment:
+                    feedback_record.pop("psnr_delta")
+                    feedback_record.pop("ssim_delta")
+                    feedback_record["nmse_reduction"] = judgment["nmse_delta"]
                 if judgment["lpips_delta"] is not None:
                     feedback_record["lpips_delta"] = judgment["lpips_delta"]
                 if self.config.visual_assessment:
                     feedback_record["visual_assessment"] = visual_assessment
                 self.state["feedback_history"].append(feedback_record)
                 self.state["artifacts"]["run_practice"].update(practice_artifacts)
-                self.state["artifacts"]["global_experience"].update(
-                    experience_artifacts
-                )
                 self.trace.log_event(
                     "evolution_round_completed",
                     {
@@ -1368,6 +1431,7 @@ class Day6Workflow:
                         "incumbent_metrics": result_summary["incumbent_metrics"],
                         "candidate_metrics": result_summary["candidate_metrics"],
                         "deltas": result_summary["deltas"],
+                        "dataset_evaluation": result_summary.get("dataset_evaluation"),
                         "comparison_scope": (
                             "Aggregate evaluation feedback for reference-guided evolution; "
                             "no ground-truth tensor values are included."
@@ -1379,7 +1443,6 @@ class Day6Workflow:
                     self.state["algorithm_comparison_reference"] = comparison_reference
                     _write_json(comparison_reference_path, comparison_reference)
                     improver_context["evolution_memory"] = {
-                        "global_reusable_experience": global_experience.context(),
                         "current_run_practice": run_practice.context(),
                     }
                     improver_context["previous_round_result"] = practice
@@ -1453,6 +1516,7 @@ class Day6Workflow:
                     },
                     comparison=incumbent["acceptance_judgment"],
                     conditions={
+                        "data_type": self.base_state["results"]["image_profile"].get("data_type", "color_image"),
                         "base_method": base_method,
                         "evolution_rounds": len(self.state["rounds"]),
                         "accepted_rounds": self.state["accepted_rounds"],
@@ -1470,6 +1534,18 @@ class Day6Workflow:
                     "reconstruction": incumbent["final"]["artifacts"]["reconstruction"],
                     "metrics": incumbent["final"]["metrics"],
                     "final": incumbent["final"],
+                    "model_description": {
+                        "proposal": json.loads(
+                            (Path(incumbent["candidate_dir"]) / "idea.json").read_text(
+                                encoding="utf-8"
+                            )
+                        ),
+                        "source_path": str(Path(incumbent["candidate_dir"]) / "model.py"),
+                        "source_code": (Path(incumbent["candidate_dir"]) / "model.py").read_text(
+                            encoding="utf-8"
+                        ),
+                        "selected_config": incumbent["tuning"]["best"],
+                    },
                 }
                 self.state["best_evolved"] = evolved_result
 
@@ -1505,23 +1581,27 @@ class Day6Workflow:
                 )
             if evolved_result:
                 eligible_results.append(evolved_result)
-            winner = max(
-                eligible_results,
-                key=lambda item: (
-                    float("inf")
-                    if item["metrics"].get("missing_psnr") is None
-                    else item["metrics"]["missing_psnr"]
-                ),
+            winner = (
+                evolved_result or next(item for item in eligible_results if item["role"] == "tensor_baseline")
+                if self.config.evolution_cases else
+                max(eligible_results, key=lambda item: metric_score(item["metrics"]))
             )
             self.state["overall_comparison"] = {
                 "selection_rule": (
-                    "highest missing-region PSNR among interpolation, SIREN when "
-                    "enabled, the original tensor baseline, and the final accepted "
-                    "evolved incumbent"
+                    "last accepted whole-modality evolution incumbent; fixed baselines are references"
+                    if self.config.evolution_cases else
+                    "highest missing-region PSNR among interpolation, SIREN when enabled, "
+                    "the original tensor baseline, and the final accepted evolved incumbent"
                 ),
                 "eligible_results": eligible_results,
                 "winner": winner["algorithm"],
             }
+            if self.config.evolution_cases:
+                self.state["overall_comparison"]["whole_modality_summary"] = (
+                    incumbent["dataset_evaluation"]["summary"]
+                )
+            if "missing_nmse" in winner["metrics"] and not self.config.evolution_cases:
+                self.state["overall_comparison"]["selection_rule"] = "lowest missing original-waveform NMSE; PSNR/SSIM are not audio evaluation metrics"
             self.state["best_available"] = winner
             self.state["stage"] = "COMPLETED"
             self._save()
@@ -1556,4 +1636,7 @@ def run_day6_workflow(
     config: Day6WorkflowConfig,
     generator: Optional[CandidateGenerator] = None,
 ) -> Dict[str, Any]:
-    return Day6Workflow(config=config, generator=generator).run()
+    base_state = json.loads((Path(config.base_run_dir) / "state.json").read_text(encoding="utf-8"))
+    metadata = audio_metadata_for_gt(base_state.get("config", {}).get("image_path", ""))
+    with audio_metric_context(metadata):
+        return Day6Workflow(config=config, generator=generator).run()

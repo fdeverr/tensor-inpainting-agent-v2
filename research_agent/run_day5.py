@@ -55,10 +55,6 @@ def main() -> None:
     print("  eligible_for_training: %s" % state["validation"]["eligible_for_training"])
     print("  candidate_dir: %s" % state["artifacts"]["candidate_dir"])
     print("  validation: %s" % state["artifacts"]["validation"])
-    print(
-        "  global_experience: %s"
-        % state["artifacts"]["global_experience"]["experience_markdown"]
-    )
 
 
 if __name__ == "__main__":
