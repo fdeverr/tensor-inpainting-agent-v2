@@ -19,6 +19,8 @@ AUDIO_FRAME_SIZE="256"
 BASE_MODEL="auto"
 DEVICE="auto"
 LLM_MODE="auto"
+LLM_CONTEXT_TOKENS="131072"                 # 按实际模型上下文窗口修改，不能大于服务端限制
+LLM_OUTPUT_RESERVE_TOKENS="16384"           # 包含在上方总窗口内，须小于总窗口
 
 # 代表样本：候选结构/超参数搜索；每轮晋升仍由同类全部样本决定
 EVOLUTION_STEPS="1500"
@@ -44,10 +46,12 @@ SCREENING_TRIALS="2"                        # 1–3
 SCREENING_MAX_STEPS=""                      # 空值 = min(200, EVOLUTION_STEPS)
 SCREENING_PATIENCE="10"
 
-# SIREN 独立对比
+# SIREN：进化前整类调参，冻结配置后用 EVALUATION_* 评测并反馈给 LLM
+# 相同样本、mask、种子、配置和代码跨运行自动复用；缓存保存在 OUTPUT_DIR/.siren_cache/
 SIREN_COMPARISON="on"
-SIREN_MAX_STEPS=""                          # 空值 = EVOLUTION_STEPS
+SIREN_MAX_STEPS=""                          # 每个调参 trial；空值 = EVALUATION_STEPS
 SIREN_TUNING_TRIALS="4"                     # 1–4
+SIREN_LEARNING_RATES="0.00005,0.0001,0.0003"
 SIREN_VALIDATION_INTERVAL="25"
 SIREN_PATIENCE="20"
 
@@ -114,8 +118,9 @@ usage() {
   --screening-trials N            基线预赛 trial 数，1–3
   --screening-max-steps N          基线预赛步数
   --screening-patience N           基线预赛早停耐心
-  --siren-max-steps N             SIREN 训练步数
+  --siren-max-steps N             SIREN 每个调参 trial 的步数；最终使用 evaluation-steps
   --siren-tuning-trials N          SIREN 调参次数，1–4
+  --siren-learning-rates CSV      SIREN 调参学习率列表
   --siren-validation-interval N    SIREN GT 验证间隔
   --siren-patience N              SIREN 早停耐心
   --improvement-rounds N          进化轮数，默认 5
@@ -123,6 +128,8 @@ usage() {
   --tuning-trials N               调参次数，默认 4
   --llm-mode auto|off|required    默认 auto；读取 research_agent/.env
   --device auto|cpu|cuda          默认 auto
+  --llm-context-tokens N          模型上下文窗口（输入+输出，按实际模型设置）
+  --llm-output-reserve-tokens N   预留的生成输出上限
   --lpips                        开启 Image 的 LPIPS，默认关闭
   --full-reference-metrics on|off 同 LPIPS 开关，兼容 run_ai 参数名
   --no-reference-metrics on|off   MANIQA/CLIP-IQA/MUSIQ，仅 Image
@@ -208,6 +215,8 @@ RUN_ARGS=(
     --mask-type "$MASK_TYPE" --missing-rate "$MISSING_RATE" --seed "$SEED"
     --image-size "$IMAGE_SIZE" --audio-frame-size "$AUDIO_FRAME_SIZE"
     --base-model "$BASE_MODEL" --device "$DEVICE" --llm-mode "$LLM_MODE"
+    --llm-context-tokens "$LLM_CONTEXT_TOKENS"
+    --llm-output-reserve-tokens "$LLM_OUTPUT_RESERVE_TOKENS"
     --evolution-steps "$EVOLUTION_STEPS" --evaluation-steps "$EVALUATION_STEPS"
     --validation-interval "$VALIDATION_INTERVAL" --patience "$PATIENCE"
     --evaluation-validation-interval "$EVALUATION_VALIDATION_INTERVAL"
@@ -222,6 +231,7 @@ RUN_ARGS=(
     --method-shortlist-size "$METHOD_SHORTLIST_SIZE"
     --screening-trials "$SCREENING_TRIALS" --screening-patience "$SCREENING_PATIENCE"
     --siren-tuning-trials "$SIREN_TUNING_TRIALS"
+    --siren-learning-rates "$SIREN_LEARNING_RATES"
     --siren-validation-interval "$SIREN_VALIDATION_INTERVAL" --siren-patience "$SIREN_PATIENCE"
     --retrieval-top-k "$RETRIEVAL_TOP_K" --minimum-psnr-delta "$MINIMUM_PSNR_DELTA"
     --minimum-nmse-delta "$MINIMUM_NMSE_DELTA"

@@ -13,6 +13,8 @@ from research_agent.evolution_knowledge import (
     GlobalExperienceStore,
     RunPracticeStore,
     describe_metrics,
+    compact_run_practices, prepare_run_experience, commit_run_experience,
+    global_experience_context,
 )
 from research_agent.workflow_full import FullWorkflowConfig
 from research_agent.workflow_day6 import Day6WorkflowConfig
@@ -304,6 +306,8 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
         learning_rate_refinement_factor=3.0,
         max_steps=5,
         max_improvement_rounds=3,
+        dataset_algorithm_reference=None,
+        evolution_cases=None,
         validation_interval=1,
         patience=2,
         device="cpu",
@@ -319,7 +323,22 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
     workflow.run_dir.mkdir()
     workflow.state_path = workflow.run_dir / "state.json"
     workflow.trace = Trace()
-    workflow.generator = object()
+    summary_calls = []
+    prior_store = GlobalExperienceStore(tmp_path / "knowledge", "tucker", "color_image", {
+        "mask_type": "block", "requested_missing_rate": 0.4, "actual_missing_rate": 0.4,
+        "source_run_id": "prior-run"})
+    prior_store.record(_reusable_experience())
+    class OncePerRunGenerator:
+        def extract_experience(self, practice):
+            raise AssertionError("must not summarize each round")
+
+        def extract_run_experience(self, practices, outcome):
+            assert len(practices) == 3
+            assert [p["result"]["accepted"] for p in practices] == [True, False, False]
+            assert prior_store.context()["record_count"] == 1  # No per-round append.
+            summary_calls.append(practices)
+            return _reusable_experience()
+    workflow.generator = OncePerRunGenerator()
     workflow.base_state = {
         "run_id": "base-run",
         "selected_model": "tucker",
@@ -499,7 +518,12 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
     assert len(
         (workflow.run_dir / "knowledge" / "practice.jsonl").read_text().splitlines()
     ) == 3
-    assert not (tmp_path / "knowledge").exists()  # Cross-run knowledge is disabled.
+    assert len(summary_calls) == 1
+    assert state["global_experience"]["status"] == "committed"
+    assert state["global_experience"]["conditions"]["round_count"] == 3
+    assert prior_store.context()["record_count"] == 2
+    assert not list(workflow.run_dir.glob("round*/experience_record.json"))
+    assert all("experience" not in record for record in state["rounds"])
 
     assert len(generation_contexts) == 2
     assert all(
@@ -512,7 +536,7 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
     third_memory = third_context["evolution_memory"]["current_run_practice"]
     assert second_memory["round_count"] == 1
     assert third_memory["round_count"] == 2
-    assert "global_reusable_experience" not in third_context["evolution_memory"]
+    assert third_context["evolution_memory"]["global_reusable_experience"]["record_count"] == 1
     assert all(
         set(item) == {"framework", "goal", "method", "result"}
         for item in third_memory["current_run_practice"]
@@ -546,3 +570,166 @@ def test_accepted_candidate_becomes_incumbent_and_loop_continues(tmp_path, monke
     assert migrated_manifest["executable_search_space"] == {"rank": [1]}
     assert migrated_manifest["effective_search_space"] == {"rank": [1]}
     assert "allowed_search_space" not in migrated_manifest
+
+
+def _run_summary_fixture(tmp_path):
+    practice = _practice_record()
+    practice["framework"]["conditions"].update({"data_type": "color_image", "mask_type": "block",
+                                               "actual_missing_rate": 0.4, "training_budget": {"max_steps": 20}})
+    store = RunPracticeStore(tmp_path / "run", "tucker", "day6-test")
+    store.record(practice)
+    state = {"workflow_id": "day6-test", "stage": "COMPLETED", "rounds": [{}],
+             "best_available": {"algorithm": "tucker", "metrics": {"missing_psnr": 20.0}},
+             "artifacts": {"run_practice": store.context()["documents"]}, "config": {"dataset_evaluation_steps": 30}}
+    base = {"selected_model": "tucker", "config": {"mask_type": "block", "missing_rate": 0.4},
+            "results": {"image_profile": {"data_type": "color_image", "actual_missing_rate": 0.4}}}
+    return state, base, store
+
+
+def test_run_level_extraction_uses_all_practices_and_calls_llm_only_once():
+    practices = [_practice_record(), _practice_record()]
+    practices[0]["result"]["accepted"] = True
+    practices[0]["method"]["idea"] = "方法甲"
+    practices[1]["method"]["idea"] = "方法乙"
+    class RecordingLLM:
+        calls = []
+        def invoke(self, messages, temperature=0):
+            self.calls.append(messages)
+            return json.dumps({"experience": "同类任务中方法甲形成改善，方法乙仍需重新验证适用条件。", "confidence": "high"})
+    llm = RecordingLLM()
+    result = CandidateGenerator(llm).extract_run_experience(compact_run_practices(practices), {"algorithm": "winner"})
+    assert len(llm.calls) == 1
+    payload = json.loads(llm.calls[0][1]["content"])
+    assert len(payload["practice_tuples"]) == 2
+    assert [p["method"]["idea"] for p in payload["practice_tuples"]] == ["方法甲", "方法乙"]
+    assert result["confidence"] == "medium"  # A single run is not broad empirical validation.
+
+
+def test_run_summary_fallback_includes_successes_and_failures_with_one_attempt():
+    practices = [_practice_record(), _practice_record()]
+    practices[0]["result"]["accepted"] = True
+    practices[0]["method"]["idea"] = "成功机制甲"
+    practices[1]["method"]["idea"] = "失败机制乙"
+    class BrokenLLM:
+        calls = 0
+        def invoke(self, *args, **kwargs):
+            self.calls += 1
+            return "not JSON"
+    llm = BrokenLLM()
+    result = CandidateGenerator(llm).extract_run_experience(practices, {"algorithm": "winner"})
+    assert llm.calls == 1
+    assert result["confidence"] == "low"
+    assert "成功机制甲" in result["experience"] and "失败机制乙" in result["experience"]
+
+
+def test_summary_commit_is_once_per_run_and_verifies_practice_source(tmp_path):
+    state, base, practice = _run_summary_fixture(tmp_path)
+    pending = prepare_run_experience(CandidateGenerator(None), state, base, str(tmp_path / "candidates"),
+                                    str(tmp_path / "global"), source_run_id="complete-run")
+    assert not (tmp_path / "global").exists()  # Summary alone is not a global append.
+    first = commit_run_experience(pending)
+    commit_run_experience(first)
+    duplicate = {**pending, "experience": {"experience": "即使重新生成摘要措辞，也不能重复追加同一次运行。", "confidence": "low"}}
+    commit_run_experience(duplicate)
+    records = GlobalExperienceStore(tmp_path / "global", "tucker", "color_image").context()["reusable_experience"]
+    assert len(records) == 1
+    record = records[0]
+    assert record["source_run_id"] == "complete-run"
+    assert record["summary_scope"] == "whole_run_practice"
+    assert record["round_count"] == 1 and record["accepted_round_count"] == 0
+    assert record["requested_missing_rate"] == record["actual_missing_rate"] == 0.4
+    assert record["training_budget"]["max_steps"] == 20
+    practice.record(_practice_record())
+    with pytest.raises(ValueError, match="practice library changed"):
+        commit_run_experience(pending)
+
+
+@pytest.mark.parametrize("problem", ["failed", "missing_practice"])
+def test_incomplete_runs_do_not_create_global_experience(tmp_path, problem):
+    state, base, _ = _run_summary_fixture(tmp_path)
+    if problem == "failed":
+        state["stage"] = "FAILED"
+    else:
+        state["rounds"].append({})
+    with pytest.raises(ValueError):
+        prepare_run_experience(CandidateGenerator(None), state, base, str(tmp_path / "candidates"), str(tmp_path / "global"))
+    assert not (tmp_path / "global").exists()
+
+
+def test_global_retrieval_prefers_matching_conditions_and_never_mixes_modalities(tmp_path):
+    root = tmp_path / "global"
+    for run, pattern, rate in [("same", "block", 0.4), ("near", "block", 0.5), ("far", "block", 0.8), ("different", "slices", 0.4)]:
+        GlobalExperienceStore(root, "tucker", "color_image", {"mask_type": pattern,
+            "requested_missing_rate": rate, "actual_missing_rate": rate, "source_run_id": run}).record(_reusable_experience())
+    GlobalExperienceStore(root, "tucker", "audio", {"source_run_id": "audio"}).record(_reusable_experience())
+    store = GlobalExperienceStore(root, "tucker", "Image", {"mask_type": "block", "requested_missing_rate": 0.4})
+    context = store.context(3)
+    assert [record["source_run_id"] for record in context["reusable_experience"]] == ["same", "near", "far"]
+    assert context["record_count"] == 4
+    assert all(record["data_type"] == "color_image" for record in context["reusable_experience"])
+
+
+def test_corrupt_optional_global_memory_does_not_block_evolution(tmp_path):
+    _, base, _ = _run_summary_fixture(tmp_path)
+    directory = tmp_path / "global/Image/tucker"
+    directory.mkdir(parents=True)
+    (directory / "reusable_experience.jsonl").write_text("broken JSON\n")
+    context = global_experience_context(base, str(tmp_path / "candidates"), str(tmp_path / "global"))
+    assert context["status"] == "unavailable" and context["reusable_experience"] == []
+    assert (directory / "reusable_experience.jsonl").read_text() == "broken JSON\n"
+
+
+def test_concurrent_run_commits_do_not_lose_lessons(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    def commit(index):
+        GlobalExperienceStore(tmp_path, "tucker", "color_image", {"source_run_id": str(index)}).record(_reusable_experience())
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(commit, range(8)))
+    assert GlobalExperienceStore(tmp_path, "tucker", "color_image").context()["record_count"] == 8
+
+
+def test_practice_change_during_summary_cannot_get_a_matching_new_hash(tmp_path):
+    state, base, practice = _run_summary_fixture(tmp_path)
+    class ChangingGenerator:
+        def extract_run_experience(self, *args):
+            practice.record(_practice_record())
+            return _reusable_experience()
+    with pytest.raises(ValueError, match="changed during"):
+        prepare_run_experience(ChangingGenerator(), state, base, str(tmp_path / "candidates"), str(tmp_path / "global"))
+    assert not (tmp_path / "global").exists()
+
+
+def test_run_evidence_keeps_cohort_summary_and_failures_without_raw_curves():
+    practice = _practice_record()
+    practice["result"]["dataset_evaluation"] = {
+        "incumbent_summary": {"complete": True, "mean_missing_psnr": 20.0},
+        "candidate_summary": {"complete": False, "mean_missing_psnr": None},
+        "incumbent": [{"status": "completed", "sample": "a.mat", "metrics": {"missing_psnr": 20.0}, "training": {"raw_history": "not needed"}}],
+        "candidate": [{"status": "failed", "sample": "a.mat", "error": "OOM", "training": {"raw_history": "not needed"}}],
+    }
+    result = compact_run_practices([practice])[0]["result"]["dataset_evaluation"]
+    assert result["incumbent_summary"]["mean_missing_psnr"] == 20.0
+    assert result["sample_failures"] == [{"sample": "a.mat", "error": "OOM"}]
+    assert result["incumbent"][0]["metrics"] == {"missing_psnr": 20.0}
+    assert "training" not in json.dumps(result)
+
+
+def test_cohort_run_summary_does_not_confuse_representative_and_dataset_scores(tmp_path):
+    state, base, _ = _run_summary_fixture(tmp_path)
+    state["best_available"]["metrics"] = {"missing_psnr": 50.0}
+    state["overall_comparison"] = {"whole_modality_summary": {"mean_missing_psnr": 20.0}}
+    class CheckingGenerator:
+        def extract_run_experience(self, practices, outcome):
+            assert "metrics" not in outcome
+            assert outcome["whole_modality_summary"]["mean_missing_psnr"] == 20.0
+            return _reusable_experience()
+    result = prepare_run_experience(CheckingGenerator(), state, base,
+        str(tmp_path / "candidates"), str(tmp_path / "global"), cases=[{}, {}])
+    assert result["conditions"]["sample_count"] == 2
+
+
+def test_incomplete_base_metadata_disables_optional_memory_without_guessing(tmp_path):
+    context = global_experience_context({}, str(tmp_path / "candidates"), str(tmp_path / "global"))
+    assert context["status"] == "unavailable"
+    assert context["reusable_experience"] == []
+    assert not (tmp_path / "global").exists()

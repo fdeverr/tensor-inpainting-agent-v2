@@ -9,9 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 from .knowledge import LocalKnowledgeRetriever
 from .core.audio_metrics import active_audio_metadata, audio_metric_context, audio_metadata_for_gt, metric_score, trial_selection_loss
-from .dataset_evolution import evaluate_across_cases
+from .core.data import load_tensor_data, load_observation_mask
+from .core.siren_config import SIREN_LEARNING_RATES, siren_coordinate_mode, siren_tuning_candidates
+from .dataset_evolution import evaluate_across_cases, cohort_score
 from .method_selector import (
     MethodSelector,
     _default_hyperparameters,
@@ -59,6 +63,8 @@ class Day4WorkflowConfig(Day3WorkflowConfig):
     siren_comparison: bool = True
     siren_max_steps: int = 4000
     siren_tuning_trials: int = 4
+    siren_learning_rate_candidates: tuple[float, ...] = SIREN_LEARNING_RATES
+    siren_baseline_reference: Optional[Dict[str, Any]] = None
     siren_validation_interval: int = 25
     siren_patience: int = 20
 
@@ -114,6 +120,8 @@ class Day4WorkflowConfig(Day3WorkflowConfig):
             raise ValueError("siren_max_steps must be positive")
         if not 1 <= self.siren_tuning_trials <= 4:
             raise ValueError("siren_tuning_trials must be in [1, 4]")
+        if not self.siren_learning_rate_candidates or any(isinstance(rate, bool) or not 1e-5 <= rate <= 1 for rate in self.siren_learning_rate_candidates):
+            raise ValueError("invalid SIREN learning-rate candidates")
         if self.siren_validation_interval < 1 or self.siren_patience < 1:
             raise ValueError(
                 "siren_validation_interval and siren_patience must be positive"
@@ -331,39 +339,15 @@ def _candidates_from_plan(
     )
 
 
-def _siren_tuning_candidates(trial_count: int) -> List[Dict[str, Any]]:
+def _siren_tuning_candidates(trial_count: int, coordinate_mode="image", learning_rates=SIREN_LEARNING_RATES) -> List[Dict[str, Any]]:
     """Return a compact, deliberately diverse SIREN tuning design."""
 
-    configurations = [
-        {
-            "hidden_features": 128,
-            "hidden_layers": 3,
-            "first_omega_0": 30.0,
-            "hidden_omega_0": 30.0,
-        },
-        {
-            "hidden_features": 64,
-            "hidden_layers": 2,
-            "first_omega_0": 30.0,
-            "hidden_omega_0": 30.0,
-        },
-        {
-            "hidden_features": 128,
-            "hidden_layers": 2,
-            "first_omega_0": 20.0,
-            "hidden_omega_0": 20.0,
-        },
-        {
-            "hidden_features": 64,
-            "hidden_layers": 3,
-            "first_omega_0": 20.0,
-            "hidden_omega_0": 20.0,
-        },
-    ]
-    return [
-        {"hyperparameters": item, "learning_rate": 1e-4}
-        for item in configurations[:trial_count]
-    ]
+    candidates = siren_tuning_candidates(trial_count, coordinate_mode, learning_rates)
+    audio = active_audio_metadata()
+    if coordinate_mode == "audio" and audio:
+        for candidate in candidates:
+            candidate["hyperparameters"]["sample_count"] = audio["sample_count"]
+    return candidates
 
 
 class Day4Workflow(Day3Workflow):
@@ -690,12 +674,7 @@ class Day4Workflow(Day3Workflow):
             audio = cases[0]["data_type"] == "audio"
             def rank(item):
                 summary = item["dataset_evaluation"]["summary"]
-                if audio:
-                    return (summary["mean_missing_nmse"], item["method"])
-                finite_psnr = summary.get("mean_finite_missing_psnr")
-                return (-summary.get("perfect_count", 0),
-                        -(finite_psnr if finite_psnr is not None else float("inf")),
-                        -summary["mean_composite_ssim"], item["method"])
+                return (tuple(-value for value in cohort_score(summary)), item["method"])
             winner = min(eligible, key=rank)
             winner_summary = winner["dataset_evaluation"]["summary"]
             shortlist_source = ("The LLM" if selector_plan.get("selection_mode") in
@@ -752,13 +731,17 @@ class Day4Workflow(Day3Workflow):
         return digest.hexdigest()
 
     def _siren_training_cache(self, ground_truth_path: str) -> tuple[str, Path]:
+        audio = active_audio_metadata()
         payload = {
-            "cache_version": 2,
+            "cache_version": 4,
             "selection_protocol": "all_observed_train_missing_gt_checkpoint_selection",
             "model": "siren",
             "model_source_sha256": self._file_sha256(
                 str(Path(__file__).resolve().parent / "core/models/siren.py")
             ),
+            "protocol_source_sha256": {name: self._file_sha256(
+                str(Path(__file__).resolve().parent / name)) for name in
+                ("core/trainer.py", "core/models/base.py", "core/audio_metrics.py", "core/metrics.py")},
             "corrupted_sha256": self._file_sha256(
                 self.state["artifacts"]["corrupted"]
             ),
@@ -766,8 +749,13 @@ class Day4Workflow(Day3Workflow):
             "ground_truth_sha256": self._file_sha256(
                 ground_truth_path
             ),
+            "audio_metadata": ({key: audio.get(key) for key in
+                ("sample_count", "channels", "normalization", "original_min", "original_max", "sample_rate")}
+                if audio else None),
             "seed": self.config.seed,
-            "candidates": _siren_tuning_candidates(self.config.siren_tuning_trials),
+            "candidates": _siren_tuning_candidates(self.config.siren_tuning_trials,
+                siren_coordinate_mode(self.config.data_type, self.state["results"]["image_profile"]["image_shape"]),
+                self.config.siren_learning_rate_candidates),
             "max_steps": self.config.siren_max_steps,
             "validation_interval": self.config.siren_validation_interval,
             "patience": self.config.siren_patience,
@@ -778,6 +766,33 @@ class Day4Workflow(Day3Workflow):
         ).hexdigest()
         return fingerprint, Path(self.config.output_dir) / ".siren_cache" / fingerprint
 
+    def _reuse_siren_reference(self, ground_truth_path, baseline_dir):
+        """Reuse the representative's exact whole-modality result, never retune it."""
+        reference = self.config.siren_baseline_reference
+        case, result = reference["case"], reference["result"]
+        audio = active_audio_metadata()
+        if (case["seed"] != self.config.seed or
+                (audio is not None and case["sample_count"] != audio["sample_count"]) or
+                not np.array_equal(load_tensor_data(case["gt_path"]), load_tensor_data(ground_truth_path)) or
+                not np.array_equal(load_observation_mask(case["mask_path"]), load_observation_mask(self.state["artifacts"]["mask"]))):
+            raise ValueError("precomputed SIREN baseline does not match this GT/mask/seed")
+        baseline_dir.mkdir(parents=True, exist_ok=True)
+        artifacts = {}
+        for key, value in result["artifacts"].items():
+            source = Path(value)
+            target = baseline_dir / source.name
+            if source.resolve() != target.resolve():
+                shutil.copy2(source, target)
+            artifacts[key] = str(target)
+        training = {key: result[key] for key in ("model_name", "hyperparameters", "learning_rate",
+                    "final_train_mse", "observed_pixels_used", "parameter_count", "runtime_seconds")}
+        training.update(fitted_steps=result["selected_steps"], device=self.config.device, artifacts=artifacts)
+        best = {"hyperparameters": result["hyperparameters"], "learning_rate": result["learning_rate"],
+                "best_step": result["selected_steps"], "best_validation_mse": result["selection_validation_mse"]}
+        _write_json(baseline_dir / "tuning.json", {"status": "reused_whole_modality_selection",
+                    "best": best, "configuration": reference["configuration"], "protocol": reference["protocol"]})
+        return best, training
+
     def _run_additional_baselines(self, ground_truth_path: str) -> None:
         """Train SIREN once per data/config fingerprint and reuse it thereafter."""
 
@@ -786,6 +801,9 @@ class Day4Workflow(Day3Workflow):
                 "status": "skipped",
                 "reason": "SIREN comparison is disabled",
             }
+            return
+        if self.config.siren_baseline_reference and self.config.siren_baseline_reference.get("status") == "failed":
+            self.state["results"]["siren_comparison"] = dict(self.config.siren_baseline_reference)
             return
 
         baseline_dir = self.run_dir / "siren_baseline"
@@ -796,7 +814,11 @@ class Day4Workflow(Day3Workflow):
         cache_reused = bool(
             cache_manifest_path.is_file() and cached_baseline_dir.is_dir()
         )
-        if cache_reused:
+        if self.config.siren_baseline_reference:
+            best, training_data = self._reuse_siren_reference(ground_truth_path, baseline_dir)
+            cache_reused = True
+            print("♻️ SIREN 复用整类调参后同条件评测结果，跳过代表样本重复训练", flush=True)
+        elif cache_reused:
             cache_record = json.loads(
                 cache_manifest_path.read_text(encoding="utf-8")
             )
@@ -822,7 +844,9 @@ class Day4Workflow(Day3Workflow):
                     "model_name": "siren",
                     "seed": self.config.seed,
                     "candidates": _siren_tuning_candidates(
-                        self.config.siren_tuning_trials
+                        self.config.siren_tuning_trials,
+                        siren_coordinate_mode(self.config.data_type, self.state["results"]["image_profile"]["image_shape"]),
+                        self.config.siren_learning_rate_candidates,
                     ),
                     "max_steps": self.config.siren_max_steps,
                     "validation_interval": self.config.siren_validation_interval,
@@ -915,13 +939,14 @@ class Day4Workflow(Day3Workflow):
             "metrics": {key: evaluation.data[key] for key in metric_keys if key in evaluation.data},
             "training_cache": {
                 "reused": cache_reused,
+                "source": "whole_modality_evaluation" if self.config.siren_baseline_reference else "standalone_tuning",
                 "fingerprint": fingerprint,
                 "cache_dir": str(cache_dir),
             },
         }
         baseline_rows = [
             {
-                "algorithm": "nearest_neighbor_manhattan",
+                "algorithm": "linear_interpolation_waveform" if active_audio_metadata() else "nearest_neighbor_manhattan",
                 "metrics": self.state["results"]["interpolation_metrics"],
             },
             {
@@ -939,6 +964,8 @@ class Day4Workflow(Day3Workflow):
         )
         baseline_comparison = {
             "selection_rule": (
+                "lowest missing original-waveform NMSE among linear waveform interpolation, the selected tensor family, and SIREN"
+                if active_audio_metadata() else
                 "highest missing-region PSNR among Manhattan interpolation, "
                 "the selected tensor family, and SIREN"
             ),

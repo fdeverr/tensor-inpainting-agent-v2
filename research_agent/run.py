@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from .cli_options import add_optional_evaluation, parse_float_csv
+from .cli_options import add_optional_evaluation, parse_float_csv, add_llm_context_budget, apply_llm_context_budget
 
 from .workflow_full import (
     DEFAULT_RESEARCH_PROMPT,
@@ -25,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--approved-root", default="research_agent/algorithms/approved")
     parser.add_argument(
         "--knowledge-root",
-        help=argparse.SUPPRESS,  # Legacy no-op; retained for older launch commands.
+        help="cross-run experience root; one summary per completed run, defaults beside candidate-root",
     )
     parser.add_argument("--mask-type", choices=("random", "block", "slices", "sildes"), default="block")
     parser.add_argument("--missing-rate", type=float, default=0.4)
@@ -97,9 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--screening-patience", type=int, default=10)
     parser.add_argument("--siren-max-steps", type=int, default=4000)
     parser.add_argument("--siren-tuning-trials", type=int, default=4)
+    parser.add_argument("--siren-learning-rates", type=parse_float_csv, dest="siren_learning_rate_candidates", default=(5e-5, 1e-4, 3e-4))
     parser.add_argument("--siren-validation-interval", type=int, default=25)
     parser.add_argument("--siren-patience", type=int, default=20)
     parser.add_argument("--llm-mode", choices=("auto", "off", "required"), default="auto")
+    add_llm_context_budget(parser)
     parser.add_argument("--retrieval-top-k", type=int, default=8)
     parser.add_argument(
         "--minimum-psnr-delta",
@@ -114,6 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    apply_llm_context_budget(args)
     state = run_full_workflow(
         FullWorkflowConfig(
             image_path=args.image,
@@ -158,6 +161,7 @@ def main() -> None:
             screening_patience=args.screening_patience,
             siren_max_steps=args.siren_max_steps,
             siren_tuning_trials=args.siren_tuning_trials,
+            siren_learning_rate_candidates=args.siren_learning_rate_candidates,
             siren_validation_interval=args.siren_validation_interval,
             siren_patience=args.siren_patience,
             llm_mode=args.llm_mode,

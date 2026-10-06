@@ -17,6 +17,7 @@ from .t_svd import TSVDDecomposition
 from .tensor_ring import TensorRingDecomposition
 from .tensor_train import TensorTrainDecomposition
 from .tucker import TuckerDecomposition
+from ..audio_metrics import active_audio_metadata
 
 
 MODEL_CLASSES = {
@@ -86,6 +87,12 @@ def create_model(
     if model_name not in MODEL_CLASSES:
         raise ValueError("unknown model_name %r" % model_name)
     model_class = MODEL_CLASSES[model_name]
+    hyperparameters = dict(hyperparameters)
+    if model_name == "siren":
+        audio = active_audio_metadata()
+        hyperparameters.setdefault("coordinate_mode", "audio" if audio else "video" if len(image_shape) == 4 else "image")
+        if audio and hyperparameters["coordinate_mode"] == "audio":
+            hyperparameters["sample_count"] = audio["sample_count"]
     return model_class(
         image_shape=image_shape,
         initial_channel_mean=initial_channel_mean,

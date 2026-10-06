@@ -77,6 +77,18 @@ def _finite(value):
     return isinstance(value, (int, float)) and math.isfinite(value)
 
 
+def cohort_score(summary):
+    """Shared higher-is-better ranking, including explicit perfect-PSNR ties."""
+    if "mean_missing_nmse" in summary:
+        value = summary["mean_missing_nmse"]
+        return (-value if _finite(value) else -math.inf,)
+    finite_psnr = summary.get("mean_finite_missing_psnr", summary.get("mean_missing_psnr"))
+    ssim = summary.get("mean_composite_ssim")
+    return (summary.get("perfect_count", 0),
+            finite_psnr if _finite(finite_psnr) else -math.inf,
+            ssim if _finite(ssim) else -math.inf)
+
+
 def training_feedback(result):
     """Bounded per-sample curve evidence for LLM context; full history stays on disk."""
     path = (result.get("artifacts") or {}).get("history")
@@ -88,11 +100,12 @@ def training_feedback(result):
         compact_summary = {key: summary.get(key) for key in
                            ("record_count", "first", "last", "best_validation",
                             "relative_train_improvement", "relative_validation_improvement",
-                            "relative_validation_regression_after_best")}
+                            "relative_validation_regression_after_best", "training_loss_protocol")}
         compact_summary["signals"] = [item.get("code") for item in summary.get("signals", [])]
         if history:
             positions = sorted({0, len(history) // 4, len(history) // 2,
-                                3 * len(history) // 4, len(history) - 1})
+                                3 * len(history) // 4, len(history) - 1} |
+                               {index for index, item in enumerate(history) if item["step"] == result.get("selected_steps")})
             points = [{key: history[index].get(key) for key in
                        ("step", "data_train_loss", "total_train_loss", "validation_mse",
                         "missing_gt_psnr", "missing_gt_nmse")

@@ -11,7 +11,9 @@ from typing import Any, Dict, List, Optional
 
 from .agent_tools.framework import TraceLogger
 from .core.audio_metrics import audio_metric_context, audio_metadata_for_gt, metric_score
+from .core.siren_config import SIREN_LEARNING_RATES
 from .dataset_evolution import compact_case_feedback, evaluate_across_cases
+from .evolution_knowledge import commit_run_experience
 from .reporting import build_method_results, write_research_report
 from .schemas import SUPPORTED_TENSOR_MODEL_NAMES
 from .workflow import _make_run_id, _write_json
@@ -78,6 +80,8 @@ class FullWorkflowConfig:
     siren_comparison: bool = True
     siren_max_steps: int = 4000
     siren_tuning_trials: int = 4
+    siren_learning_rate_candidates: tuple[float, ...] = SIREN_LEARNING_RATES
+    siren_baseline_reference: Optional[Dict[str, Any]] = None
     siren_validation_interval: int = 25
     siren_patience: int = 20
 
@@ -167,6 +171,8 @@ class FullWorkflowConfig:
             raise ValueError("siren_max_steps must be positive")
         if not 1 <= self.siren_tuning_trials <= 4:
             raise ValueError("siren_tuning_trials must be in [1, 4]")
+        if not self.siren_learning_rate_candidates or any(isinstance(rate, bool) or not 1e-5 <= rate <= 1 for rate in self.siren_learning_rate_candidates):
+            raise ValueError("invalid SIREN learning-rate candidates")
         if self.siren_validation_interval < 1 or self.siren_patience < 1:
             raise ValueError(
                 "siren_validation_interval and siren_patience must be positive"
@@ -325,6 +331,8 @@ class FullResearchWorkflow:
                     siren_comparison=self.config.siren_comparison,
                     siren_max_steps=self.config.siren_max_steps,
                     siren_tuning_trials=self.config.siren_tuning_trials,
+                    siren_learning_rate_candidates=self.config.siren_learning_rate_candidates,
+                    siren_baseline_reference=self.config.siren_baseline_reference,
                     siren_validation_interval=(
                         self.config.siren_validation_interval
                     ),
@@ -376,6 +384,7 @@ class FullResearchWorkflow:
                     smoke_timeout_seconds=self.config.smoke_timeout_seconds,
                     visual_assessment=self.config.mutation_visual_assessment,
                     dataset_algorithm_reference=dataset_reference,
+                    evolution_cases=self.config.evolution_cases,
                 )
             )
             self._child_completed("day5", day5)
@@ -430,13 +439,19 @@ class FullResearchWorkflow:
                         dataset_evaluation_validation_interval=self.config.dataset_evaluation_validation_interval,
                         dataset_evaluation_patience=self.config.dataset_evaluation_patience,
                         dataset_algorithm_reference=dataset_reference,
+                        defer_global_experience_commit=True,
+                        experience_source_run_id=self.run_id,
                     )
                 )
                 self._child_completed("day6", day6)
                 self.state["artifacts"]["run_practice"] = day6["artifacts"][
                     "run_practice"
                 ]
+                if day6.get("global_experience"):
+                    self.state["global_experience"] = day6["global_experience"]
+                    self.state["artifacts"]["run_experience"] = day6["artifacts"].get("run_experience")
             else:
+                self.state["global_experience"] = {"status": "skipped", "reason": "no validated candidate; no completed evolution practices"}
                 print(
                     "\n⚠️  阶段 3/4 已跳过：Day 5 候选未通过代码验证。",
                     flush=True,
@@ -513,6 +528,29 @@ class FullResearchWorkflow:
                     "best_algorithm": winner["algorithm"],
                 },
             )
+            if day6 and day6.get("global_experience", {}).get("status") == "prepared":
+                try:
+                    summary = commit_run_experience(day6["global_experience"])
+                except Exception as error:
+                    self.state["global_experience"] = {"status": "failed", "error": "%s: %s" % (type(error).__name__, error)}
+                    self._save()
+                    print("⚠️ 全局经验写入失败，算法结果仍已完成：%s" % error, flush=True)
+                else:
+                    self.state["global_experience"] = day6["global_experience"] = summary
+                    self.state["artifacts"]["global_experience"] = summary["documents"]
+                    day6["artifacts"]["global_experience"] = summary["documents"]
+                    try:
+                        _write_json(Path(day6["artifacts"]["run_experience"]), summary)
+                        _write_json(Path(day6["artifacts"]["state"]), day6)
+                        self._save()
+                        write_research_report(str(self.report_path), self.state, day4, day5, day6)
+                    except Exception as error:
+                        summary["publication_warning"] = "%s: %s" % (type(error).__name__, error)
+                        print("⚠️ 全局经验已写入，但状态文件或报告刷新失败：%s" % error, flush=True)
+                        try:
+                            self._save()
+                        except OSError:
+                            pass
             return self.state
         except Exception as error:
             self.state["stage"] = "FAILED"

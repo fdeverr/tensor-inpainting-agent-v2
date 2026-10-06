@@ -39,14 +39,17 @@ usage() {
   --mutation-visual-assessment on|off   是否让视觉信息参与候选变异
   --siren-comparison on|off        是否训练 SIREN 独立对比基线（默认 on）
   --llm-mode auto|off|required    LLM 使用方式
+  --llm-context-tokens N          模型上下文窗口（输入+输出，按实际模型设置）
+  --llm-output-reserve-tokens N   预留的生成输出上限
 
 训练与评估：
-  --method-shortlist-size N       数值预赛的分解家族数
+  --method-shortlist-size N       LLM 推荐的张量分解短名单数量，3–5
   --screening-trials N            每个家族的预赛 trial 数
   --screening-max-steps N         预赛每个 trial 最大步数
   --screening-patience N          预赛早停耐心（验证次数）
   --siren-max-steps N             SIREN 每个 trial 最大步数
   --siren-tuning-trials N         SIREN 调参次数，范围 1–4
+  --siren-learning-rates CSV      SIREN 调参学习率列表
   --siren-validation-interval N   SIREN 验证间隔
   --siren-patience N              SIREN 早停耐心（验证次数）
   --validation-interval N         每 N 步验证一次
@@ -61,6 +64,7 @@ usage() {
   --output-dir PATH
   --candidate-root PATH
   --approved-root PATH
+  --knowledge-root PATH          全局经验库；每次完整运行结束总结一次
 
 示例：
   # 使用 smoke 预设
@@ -145,9 +149,12 @@ SCREENING_MAX_STEPS="400"
 SCREENING_PATIENCE="10"
 SIREN_MAX_STEPS="4000"
 SIREN_TUNING_TRIALS="4"
+SIREN_LEARNING_RATES="0.00005,0.0001,0.0003"
 SIREN_VALIDATION_INTERVAL="25"
 SIREN_PATIENCE="20"
 LLM_MODE="required"
+LLM_CONTEXT_TOKENS="131072"                 # 按实际模型上下文窗口修改，不能大于服务端限制
+LLM_OUTPUT_RESERVE_TOKENS="16384"           # 包含在上方总窗口内，须小于总窗口
 RETRIEVAL_TOP_K="8"
 MINIMUM_PSNR_DELTA="0.2"
 SSIM_TOLERANCE="0.002"
@@ -156,6 +163,7 @@ PROMPT=""
 OUTPUT_DIR="research_agent/outputs"
 CANDIDATE_ROOT="research_agent/algorithms/candidates"
 APPROVED_ROOT="research_agent/algorithms/approved"
+KNOWLEDGE_ROOT=""                          # 空值：跟随 candidate-root 同级的 evolution_knowledge
 
 case "$1" in
     -h|--help)
@@ -254,9 +262,12 @@ while [[ $# -gt 0 ]]; do
         --screening-patience) SCREENING_PATIENCE="$VALUE" ;;
         --siren-max-steps) SIREN_MAX_STEPS="$VALUE" ;;
         --siren-tuning-trials) SIREN_TUNING_TRIALS="$VALUE" ;;
+        --siren-learning-rates) SIREN_LEARNING_RATES="$VALUE" ;;
         --siren-validation-interval) SIREN_VALIDATION_INTERVAL="$VALUE" ;;
         --siren-patience) SIREN_PATIENCE="$VALUE" ;;
         --llm-mode) LLM_MODE="$VALUE" ;;
+        --llm-context-tokens) LLM_CONTEXT_TOKENS="$VALUE" ;;
+        --llm-output-reserve-tokens) LLM_OUTPUT_RESERVE_TOKENS="$VALUE" ;;
         --retrieval-top-k) RETRIEVAL_TOP_K="$VALUE" ;;
         --minimum-psnr-delta) MINIMUM_PSNR_DELTA="$VALUE" ;;
         --ssim-tolerance) SSIM_TOLERANCE="$VALUE" ;;
@@ -265,6 +276,7 @@ while [[ $# -gt 0 ]]; do
         --output-dir) OUTPUT_DIR="$VALUE" ;;
         --candidate-root) CANDIDATE_ROOT="$VALUE" ;;
         --approved-root) APPROVED_ROOT="$VALUE" ;;
+        --knowledge-root) KNOWLEDGE_ROOT="$VALUE" ;;
         *) die "未知选项: ${OPTION}（使用 --help 查看支持的选项）。" ;;
     esac
 done
@@ -391,12 +403,15 @@ RUN_ARGS=(
     --screening-patience "$SCREENING_PATIENCE"
     --siren-max-steps "$SIREN_MAX_STEPS"
     --siren-tuning-trials "$SIREN_TUNING_TRIALS"
+    --siren-learning-rates "$SIREN_LEARNING_RATES"
     --siren-validation-interval "$SIREN_VALIDATION_INTERVAL"
     --siren-patience "$SIREN_PATIENCE"
     --validation-interval "$VALIDATION_INTERVAL"
     --patience "$PATIENCE"
     --device "$DEVICE"
     --llm-mode "$LLM_MODE"
+    --llm-context-tokens "$LLM_CONTEXT_TOKENS"
+    --llm-output-reserve-tokens "$LLM_OUTPUT_RESERVE_TOKENS"
     --retrieval-top-k "$RETRIEVAL_TOP_K"
     --minimum-psnr-delta "$MINIMUM_PSNR_DELTA"
     --ssim-tolerance "$SSIM_TOLERANCE"
@@ -405,6 +420,9 @@ RUN_ARGS=(
     --candidate-root "$CANDIDATE_ROOT"
     --approved-root "$APPROVED_ROOT"
 )
+if [[ -n "$KNOWLEDGE_ROOT" ]]; then
+    RUN_ARGS+=(--knowledge-root "$KNOWLEDGE_ROOT")
+fi
 if [[ -n "$PROMPT" ]]; then
     RUN_ARGS+=(--prompt "$PROMPT")
 fi

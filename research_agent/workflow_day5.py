@@ -8,7 +8,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .agent_tools.framework import TraceLogger
 from .candidate import (
@@ -19,7 +19,9 @@ from .candidate import (
 from .candidate.generator import load_improver_context
 from .candidate.search_contract import evaluate_search_space_contract
 from .method_selector import llm_from_environment
+from .prompt_context import ContextBudgetError
 from .core.models.registry import MODEL_CLASSES
+from .evolution_knowledge import global_experience_context
 from .visual_evaluator import (
     MultimodalQualityEvaluator,
     visual_llm_from_environment,
@@ -52,6 +54,7 @@ class Day5WorkflowConfig:
     smoke_timeout_seconds: float = 10.0
     visual_assessment: bool = False
     dataset_algorithm_reference: Optional[Dict[str, Any]] = None
+    evolution_cases: Optional[List[Dict[str, Any]]] = None
 
     def validate(self) -> None:
         state_path = Path(self.base_run_dir) / "state.json"
@@ -134,12 +137,19 @@ class Day5Workflow:
             print("\n🧠 正在整理基线模型、图像特征和训练曲线供 LLM 分析…", flush=True)
             context = load_improver_context(self.config.base_run_dir)
             if self.config.dataset_algorithm_reference:
+                from .recovery_registry import historical_reference_for_framework
                 context["algorithm_comparison_reference"]["whole_modality_algorithms"] = (
-                    self.config.dataset_algorithm_reference
+                    historical_reference_for_framework(self.config.dataset_algorithm_reference, context["base_method"])
                 )
             context["evolution_memory"] = {
                 "current_run_practice": [],
+                "global_reusable_experience": global_experience_context(
+                    json.loads((Path(self.config.base_run_dir) / "state.json").read_text(encoding="utf-8")),
+                    self.config.candidate_root, self.config.knowledge_root, self.config.evolution_cases),
             }
+            memory_path = self.run_dir / "global_experience_context.json"
+            _write_json(memory_path, context["evolution_memory"]["global_reusable_experience"])
+            self.state["artifacts"]["global_experience_context"] = str(memory_path)
             context["mutation_visual_assessment_enabled"] = bool(
                 self.config.visual_assessment
             )
@@ -155,7 +165,7 @@ class Day5Workflow:
                 comparison_reference_path
             )
             print(
-                "\n🧬 首轮变异将参考插值、SIREN 与张量家族的结构化对比结果…",
+                "\n🧬 首轮变异将参考插值、SIREN 与胜出张量基线的结构化对比结果…",
                 flush=True,
             )
             initial_visual_assessment = {
@@ -239,6 +249,12 @@ class Day5Workflow:
                     )
                 else:
                     generation = self.generator.generate(generation_context)
+                audit = getattr(generation, "context_audit", [])
+                if audit:
+                    audit_path = self.run_dir / ("context_budget_validation_%d.json" % validation_round)
+                    _write_json(audit_path, {"calls": audit})
+                    self.state["artifacts"]["context_budget"] = str(audit_path)
+                    self.trace.log_event("llm_context_budget", {"calls": audit})
                 total_generation_attempts += generation.attempts
                 proposal = generation.proposal
                 print(
@@ -329,6 +345,7 @@ class Day5Workflow:
                             "validation_round": validation_round,
                             "repair_attempted": validation_round > 1,
                             "fallback_reason": generation.fallback_reason,
+                            "context_audit": audit,
                             "hypothesis": proposal.hypothesis,
                             "mutation_goal": proposal.mutation_goal,
                             "mutation_target": proposal.mutation_target,
@@ -537,6 +554,12 @@ class Day5Workflow:
             )
             return self.state
         except Exception as error:
+            if isinstance(error, ContextBudgetError):
+                audit_path = self.run_dir / "context_budget_failed.json"
+                _write_json(audit_path, {"calls": getattr(self.generator, "last_context_audit", []),
+                                         "error": str(error)})
+                self.state["artifacts"]["context_budget"] = str(audit_path)
+                self.trace.log_event("llm_context_budget_failed", {"error": str(error), "audit": str(audit_path)})
             self.state["stage"] = "FAILED"
             self.state["validation"] = {
                 "passed": False,

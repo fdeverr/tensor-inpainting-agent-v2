@@ -15,7 +15,7 @@ import torch
 from ..schemas import TrainingConfig
 from .data import load_tensor_data, load_tensor_prediction, save_image, save_mat_companion, save_tensor_data
 from .metrics import evaluate_reconstruction_metrics
-from .audio_metrics import active_audio_metadata, trial_selection_loss
+from .audio_metrics import active_audio_metadata, trial_selection_loss, training_observation_mask
 from .trainer import ModelBuilder, train_tensor_model
 
 
@@ -488,7 +488,7 @@ def final_fit_and_evaluate(
             runtime_seconds + selected_trial["runtime_seconds"]
         ),
         "parameter_count": parameter_count,
-        "observed_pixels_used": int(observed_mask.sum()),
+        "observed_pixels_used": int(training_observation_mask(observed_mask, observed_image.shape).sum()),
         "reused_without_retraining": reuse_selected,
         "artifacts": artifacts,
     }

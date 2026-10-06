@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from .cli_options import add_optional_evaluation, parse_float_csv
+from .cli_options import add_optional_evaluation, parse_float_csv, add_llm_context_budget, apply_llm_context_budget
 
 from .workflow_day6 import Day6WorkflowConfig, run_day6_workflow
 
@@ -23,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", default="research_agent/outputs")
     parser.add_argument("--llm-mode", choices=("auto", "off", "required"), default="auto")
+    add_llm_context_budget(parser)
     parser.add_argument(
         "--tuning-trials",
         type=int,
@@ -67,6 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    apply_llm_context_budget(args)
     state = run_day6_workflow(
         Day6WorkflowConfig(
             base_run_dir=args.base_run_dir,

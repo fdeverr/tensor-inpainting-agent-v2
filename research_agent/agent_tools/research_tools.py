@@ -28,7 +28,10 @@ from ..core.data import (
 from ..core.interpolation import nearest_neighbor_fill
 from ..core.masks import generate_observation_mask
 from ..core.metrics import evaluate_reconstruction_metrics
-from ..core.audio_metrics import active_audio_metadata, metric_score, trial_selection_loss
+from ..core.audio_metrics import (
+    active_audio_metadata, audio_valid_mask, training_observation_mask,
+    metric_score, trial_selection_loss,
+)
 from ..core.models import get_default_hyperparameters
 from ..core.models.registry import MODEL_CLASSES
 from ..core.trainer import fit_tensor_model_on_all_observations, train_tensor_model, observed_feature_mean
@@ -173,10 +176,12 @@ def _metric_payload(
     )
 
 
-def _missing_component_statistics(observed_mask: np.ndarray) -> tuple:
+def _missing_component_statistics(observed_mask: np.ndarray, valid_mask=None) -> tuple:
     """Return component count and largest-hole share using 4-connectivity."""
 
     missing = ~observed_mask
+    if valid_mask is not None:
+        missing &= valid_mask
     visited = np.zeros_like(missing, dtype=np.bool_)
     component_sizes = []
     height, width = missing.shape
@@ -200,7 +205,7 @@ def _missing_component_statistics(observed_mask: np.ndarray) -> tuple:
                     stack.append((next_y, next_x))
         component_sizes.append(size)
     largest = max(component_sizes) if component_sizes else 0
-    return len(component_sizes), float(largest / missing.size)
+    return len(component_sizes), float(largest / (int(valid_mask.sum()) if valid_mask is not None else missing.size))
 
 
 def _visible_structure_statistics(
@@ -400,7 +405,13 @@ class AnalyzeImageTool(ResearchTool):
                 )
             valid_count = parameters.get("valid_element_count")
             valid_count = observed_mask.size if valid_count is None else valid_count
-            if not 0 < valid_count <= observed_mask.size or (~observed_mask).sum() >= valid_count:
+            analysis_observed = training_observation_mask(observed_mask, ground_truth.shape)
+            if active_audio_metadata():
+                valid_count = int(audio_valid_mask(ground_truth.shape).sum())
+                missing_count = valid_count - int(analysis_observed.sum())
+            else:
+                missing_count = int((~observed_mask).sum())
+            if not 0 < valid_count <= analysis_observed.size or not 0 <= missing_count < valid_count:
                 raise ValueError("invalid valid_element_count")
             if parameters.get("data_type"):
                 if parameters["data_type"] not in {"color_image", "msi", "video", "audio"}:
@@ -420,15 +431,15 @@ class AnalyzeImageTool(ResearchTool):
             save_image(str(corrupted_preview_path), corrupted)
             save_mask(str(mask_path), observed_mask)
 
-            analysis_mask = observed_mask
+            analysis_mask = analysis_observed
             analysis_tensor = ground_truth
-            if observed_mask.ndim > 2:
-                means = observed_feature_mean(corrupted, observed_mask)
-                analysis_tensor = np.where(observed_mask, corrupted, means)
-                analysis_mask = observed_mask.reshape(height, width, -1).any(axis=-1)
+            if analysis_observed.ndim > 2:
+                means = observed_feature_mean(corrupted, analysis_observed)
+                analysis_tensor = np.where(analysis_observed, corrupted, means)
+                analysis_mask = analysis_observed.reshape(height, width, -1).any(axis=-1)
             visible_pixels = analysis_tensor.reshape(height, width, -1)[analysis_mask]
             component_count, largest_hole_ratio = _missing_component_statistics(
-                analysis_mask
+                analysis_mask, audio_valid_mask(ground_truth.shape).any(axis=-1) if active_audio_metadata() else None
             )
             structure_statistics = _visible_structure_statistics(
                 analysis_tensor,
@@ -443,9 +454,9 @@ class AnalyzeImageTool(ResearchTool):
                 "source_metadata": source_metadata,
                 "mask_type": mask_type,
                 "requested_missing_rate": missing_rate,
-                "actual_missing_rate": float((~observed_mask).sum() / valid_count),
-                "observed_pixels": int(valid_count - (~observed_mask).sum()),
-                "missing_pixels": int((~observed_mask).sum()),
+                "actual_missing_rate": float(missing_count / valid_count),
+                "observed_pixels": int(valid_count - missing_count),
+                "missing_pixels": missing_count,
                 "missing_component_count": component_count,
                 "largest_missing_component_image_ratio": largest_hole_ratio,
                 "image_aspect_ratio": float(max(height, width) / min(height, width)),
@@ -495,12 +506,12 @@ class AnalyzeImageTool(ResearchTool):
 
 
 class RunInterpolationTool(ResearchTool):
-    """Run nearest-neighbor filling without accessing ground truth."""
+    """Run modality-aware interpolation without accessing ground truth."""
 
     def __init__(self) -> None:
         super().__init__(
             name="run_interpolation",
-            description="仅根据缺损张量和二维空间 mask 运行最近邻插值并保存完整数据。",
+            description="仅根据缺损张量、观测 mask 和数据类型运行空间/时空最近邻或音频线性插值。",
         )
 
     def get_parameters(self) -> List[ToolParameter]:
@@ -509,6 +520,7 @@ class RunInterpolationTool(ResearchTool):
             ToolParameter(name="corrupted_path", type="string", description="缺损张量路径"),
             ToolParameter(name="mask_path", type="string", description="观测 mask 路径"),
             ToolParameter(name="output_path", type="string", description="插值结果路径"),
+            ToolParameter(name="data_type", type="string", description="显式语义：color_image/msi/video/audio", required=False),
             ToolParameter(
                 name="preview_path",
                 type="string",
@@ -540,7 +552,7 @@ class RunInterpolationTool(ResearchTool):
             mat_output_path = Path(
                 str(parameters.get("mat_output_path") or output_path.with_suffix(".mat"))
             )
-            reconstruction = nearest_neighbor_fill(corrupted, observed_mask)
+            reconstruction = nearest_neighbor_fill(corrupted, observed_mask, parameters.get("data_type"))
             save_tensor_data(str(output_path), reconstruction)
             mat_output = save_mat_companion(str(mat_output_path), reconstruction)
             save_image(str(preview_path), reconstruction)
@@ -551,10 +563,10 @@ class RunInterpolationTool(ResearchTool):
             if mat_output is not None:
                 artifacts["reconstruction_mat"] = mat_output
             return ToolResponse.success(
-                text="最近邻插值完成。",
+                text="波形线性插值完成。" if active_audio_metadata() else "最近邻插值完成。",
                 data={
                     "run_id": run_id,
-                    "algorithm": "nearest_neighbor_manhattan",
+                    "algorithm": "linear_interpolation_waveform" if active_audio_metadata() else "nearest_neighbor_manhattan",
                     "artifacts": artifacts,
                 },
             )

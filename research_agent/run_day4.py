@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from .cli_options import add_optional_evaluation
+from .cli_options import add_optional_evaluation, parse_float_csv, add_llm_context_budget, apply_llm_context_budget
 
 from .workflow_day4 import Day4WorkflowConfig, run_day4_workflow
 
@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--screening-patience", type=int, default=10)
     parser.add_argument("--siren-max-steps", type=int, default=4000)
     parser.add_argument("--siren-tuning-trials", type=int, default=4)
+    parser.add_argument("--siren-learning-rates", type=parse_float_csv, dest="siren_learning_rate_candidates", default=(5e-5, 1e-4, 3e-4))
     parser.add_argument("--siren-validation-interval", type=int, default=25)
     parser.add_argument("--siren-patience", type=int, default=20)
     parser.add_argument(
@@ -65,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="auto falls back to deterministic rules when LLM env vars are absent",
     )
     parser.add_argument("--retrieval-top-k", type=int, default=8)
+    add_llm_context_budget(parser)
     return parser
 
 
@@ -74,6 +76,7 @@ def _metric_text(value):
 
 def main() -> None:
     args = build_parser().parse_args()
+    apply_llm_context_budget(args)
     state = run_day4_workflow(
         Day4WorkflowConfig(
             image_path=args.image,
@@ -103,6 +106,7 @@ def main() -> None:
             screening_patience=args.screening_patience,
             siren_max_steps=args.siren_max_steps,
             siren_tuning_trials=args.siren_tuning_trials,
+            siren_learning_rate_candidates=args.siren_learning_rate_candidates,
             siren_validation_interval=args.siren_validation_interval,
             siren_patience=args.siren_patience,
         )

@@ -47,6 +47,7 @@ def test_launcher_forwards_selected_types_and_paths(tmp_path, fake_python, selec
     assert args.llm_mode == "off"
     assert args.evolution_steps == 1500 and args.evaluation_steps == 1000
     assert args.patience == 20 and args.evaluation_patience == 0
+    assert args.siren_learning_rate_candidates == (5e-5, 1e-4, 3e-4)
 
 
 def test_launcher_preserves_exit_status(tmp_path, fake_python):
@@ -75,7 +76,8 @@ def test_launcher_training_and_boolean_overrides(tmp_path, fake_python):
          "--evaluation-validation-interval", "5", "--evaluation-patience", "11",
          "--screening-max-steps", "20", "--siren-max-steps", "70", "--lpips",
          "--skip-siren-comparison", "--no-fair-learning-rate-refinement",
-         "--fair-learning-rates", "0.01,0.03"],
+         "--fair-learning-rates", "0.01,0.03", "--siren-learning-rates", "0.0001,0.0002",
+         "--llm-context-tokens", "65536", "--llm-output-reserve-tokens", "8192"],
         cwd=tmp_path, env={**os.environ, "PYTHON_BIN": str(fake_python)},
         capture_output=True, text=True, check=True,
     )
@@ -85,6 +87,8 @@ def test_launcher_training_and_boolean_overrides(tmp_path, fake_python):
     assert args.screening_max_steps == 20 and args.siren_max_steps == 70
     assert args.lpips and not args.siren_comparison and not args.fair_refine_learning_rate
     assert args.fair_learning_rate_candidates == (0.01, 0.03)
+    assert args.siren_learning_rate_candidates == (1e-4, 2e-4)
+    assert args.llm_context_tokens == 65536 and args.llm_output_reserve_tokens == 8192
 
 
 def test_directly_edited_script_defaults_are_effective(tmp_path, fake_python):
@@ -99,6 +103,8 @@ def test_directly_edited_script_defaults_are_effective(tmp_path, fake_python):
         ('FAIR_MAX_STEPS=""', 'FAIR_MAX_STEPS="100"'),
         ('LPIPS="off"', 'LPIPS="on"'),
         ('SIREN_COMPARISON="on"', 'SIREN_COMPARISON="off"'),
+        ('LLM_CONTEXT_TOKENS="131072"', 'LLM_CONTEXT_TOKENS="65536"'),
+        ('LLM_OUTPUT_RESERVE_TOKENS="16384"', 'LLM_OUTPUT_RESERVE_TOKENS="8192"'),
     ):
         content = content.replace(old, new, 1)
     script_copy.write_text(content)
@@ -108,6 +114,7 @@ def test_directly_edited_script_defaults_are_effective(tmp_path, fake_python):
         capture_output=True, text=True, check=True,
     )
     args = build_parser().parse_args(json.loads(result.stdout)["args"][2:])
+    assert args.llm_context_tokens == 65536 and args.llm_output_reserve_tokens == 8192
     assert args.data_types == ["MSI"]
     assert args.evolution_steps == 80 and args.patience == 9
     assert args.evaluation_patience == 12 and args.fair_max_steps == 100
@@ -133,6 +140,7 @@ def test_cli_builds_config_with_all_training_options(tmp_path, monkeypatch):
         "--method-max-steps-ceiling", "100", "--fair-max-steps", "60",
         "--screening-max-steps", "15", "--screening-patience", "2",
         "--siren-max-steps", "70", "--siren-patience", "6",
+        "--siren-learning-rates", "0.00005,0.0002",
         "--fair-learning-rates", "0.02,0.04", "--no-fair-learning-rate-refinement",
         "--smoke-timeout", "5", "--knowledge-root", str(tmp_path / "knowledge"),
         "--skip-siren-comparison", "--lpips", "--no-lpips", "--inventory-only",
@@ -148,6 +156,7 @@ def test_cli_builds_config_with_all_training_options(tmp_path, monkeypatch):
     assert config.method_max_steps_ceiling == 100 and config.fair_max_steps == 60
     assert config.screening_max_steps == 15 and config.screening_patience == 2
     assert config.siren_max_steps == 70 and config.siren_patience == 6
+    assert config.siren_learning_rate_candidates == (5e-5, 2e-4)
     assert config.fair_learning_rate_candidates == (0.02, 0.04)
     assert not config.fair_refine_learning_rate and not config.siren_comparison and not config.lpips
     assert config.smoke_timeout_seconds == 5

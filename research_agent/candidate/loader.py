@@ -23,7 +23,9 @@ from ..core.models.tensor_train import TensorTrainDecomposition
 from ..core.models.tucker import TuckerDecomposition
 
 
-def load_validated_candidate(candidate_dir: str) -> Tuple[type, Dict[str, Any]]:
+def load_validated_candidate(
+    candidate_dir: str, model_namespace: Dict[str, type] | None = None,
+) -> Tuple[type, Dict[str, Any]]:
     """Load only when validation passed and the code hash is unchanged."""
 
     directory = Path(candidate_dir)
@@ -62,11 +64,19 @@ def load_validated_candidate(candidate_dir: str) -> Tuple[type, Dict[str, Any]]:
         "TensorTrainDecomposition": TensorTrainDecomposition,
         "TensorRingDecomposition": TensorRingDecomposition,
     }
+    if model_namespace is not None:
+        # Historical candidates must inherit their frozen parents, not today's
+        # implementations. Keep all validation/hash gates above unchanged.
+        required = set(namespace) - {"__name__", "torch"}
+        if not required.issubset(model_namespace):
+            raise ValueError("archived candidate model namespace is incomplete")
+        namespace.update({name: model_namespace[name] for name in required})
+    interface = namespace["BaseTensorInpaintingModel"]
     exec(compile(source, str(model_path), "exec"), namespace, namespace)
     candidate_class = namespace.get("CandidateTensorInpaintingModel")
     if not isinstance(candidate_class, type):
         raise TypeError("CandidateTensorInpaintingModel is missing")
-    if not issubclass(candidate_class, BaseTensorInpaintingModel):
+    if not issubclass(candidate_class, interface):
         raise TypeError("candidate does not implement BaseTensorInpaintingModel")
     return candidate_class, manifest
 

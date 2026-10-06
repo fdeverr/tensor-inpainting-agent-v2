@@ -159,7 +159,7 @@ class CandidateProposal(BaseModel):
 
 
 class ExperienceExtraction(BaseModel):
-    """One compact, cross-run reusable lesson extracted from a round."""
+    """One compact, cross-run reusable lesson (workflows summarize a whole run)."""
 
     model_config = ConfigDict(extra="forbid")
 

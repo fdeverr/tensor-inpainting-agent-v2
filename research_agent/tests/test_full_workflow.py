@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import numpy as np
 import pytest
@@ -110,7 +111,11 @@ def test_one_command_workflow_writes_report_and_best_image(tmp_path, monkeypatch
 
     assert state["stage"] == "COMPLETED"
     assert set(state["child_runs"]) == {"day4", "day5", "day6"}
-    assert "global_experience" not in state["artifacts"]
+    assert state["global_experience"]["status"] == "committed"
+    records = [json.loads(line) for line in Path(state["artifacts"]["global_experience"]["experience_jsonl"]).read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["source_run_id"] == state["run_id"]
+    assert records[0]["round_count"] == 1
     assert Path(state["artifacts"]["best_completion"]).is_file()
     report_path = Path(state["artifacts"]["report"])
     assert report_path.is_file()
@@ -123,18 +128,63 @@ def test_one_command_workflow_writes_report_and_best_image(tmp_path, monkeypatch
     assert "多模态恢复质量观察" not in report
     assert "效果图对比" in report
     assert "证据边界" in report
+    assert "本次运行的全局经验摘要" in report
+    assert "committed" in report
     assert len(state["method_results"]) == 4
     assert set(state["artifacts"]["comparison_images"]) == {
-        "corrupted_input",
-        "interpolation_baseline",
-        "implicit_neural_baseline",
-        "tensor_baseline",
-        "candidate",
+        "corrupted_input", "interpolation_baseline", "implicit_neural_baseline",
+        "tensor_baseline", "candidate",
     }
-    assert all(
-        Path(path).is_file()
-        for path in state["artifacts"]["comparison_images"].values()
-    )
+    assert all(Path(path).is_file() for path in state["artifacts"]["comparison_images"].values())
+
+
+@pytest.mark.parametrize("failure", ["report", "summary", "report_refresh"])
+def test_memory_commit_only_after_full_success_and_failure_preserves_model(tmp_path, monkeypatch, failure):
+    image = tmp_path / "input.png"
+    _write_image(image)
+    def fail(*args, **kwargs):
+        raise RuntimeError("simulated " + failure + " failure")
+    if failure == "report_refresh":
+        from research_agent.workflow_full import write_research_report
+        calls = []
+        def fail_refresh(*args, **kwargs):
+            calls.append(1)
+            if len(calls) > 1:
+                fail()
+            return write_research_report(*args, **kwargs)
+        monkeypatch.setattr("research_agent.workflow_full.write_research_report", fail_refresh)
+    elif failure == "report":
+        monkeypatch.setattr("research_agent.workflow_full.write_research_report", fail)
+    elif failure == "summary":
+        monkeypatch.setattr("research_agent.candidate.generator.CandidateGenerator.extract_run_experience", fail)
+    config = FullWorkflowConfig(image_path=str(image), base_model="tucker", llm_mode="off", device="cpu",
+        output_dir=str(tmp_path / "outputs"), candidate_root=str(tmp_path / "candidates"),
+        approved_root=str(tmp_path / "approved"), knowledge_root=str(tmp_path / "global"),
+        method_max_steps=2, method_max_steps_ceiling=2, fair_max_steps=2, tuning_trials=1,
+        fair_learning_rate_candidates=(0.01,), fair_refine_learning_rate=False, max_improvement_rounds=1,
+        siren_comparison=False, image_size=None, validation_interval=1)
+    if failure == "report":
+        with pytest.raises(RuntimeError, match="simulated report failure"):
+            run_full_workflow(config)
+        state = json.loads(next((tmp_path / "outputs").glob("research-agent-*/state.json")).read_text())
+        assert state["stage"] == "FAILED"
+        day6 = json.loads(Path(state["artifacts"]["day6_state"]).read_text())
+        assert day6["global_experience"]["status"] == "prepared"
+    elif failure == "summary":
+        state = run_full_workflow(config)
+        assert state["stage"] == "COMPLETED"
+        assert state["global_experience"]["status"] == "failed"
+        assert Path(state["best_available"]["reconstruction"]).is_file()
+    else:
+        state = run_full_workflow(config)
+        assert state["stage"] == "COMPLETED"
+        assert state["global_experience"]["status"] == "committed"
+        assert "report_refresh" in state["global_experience"]["publication_warning"]
+        saved = json.loads(Path(state["artifacts"]["state"]).read_text())
+        assert saved["global_experience"]["status"] == "committed"
+        assert len(next((tmp_path / "global").glob("**/reusable_experience.jsonl")).read_text().splitlines()) == 1
+    if failure != "report_refresh":
+        assert not list((tmp_path / "global").glob("**/reusable_experience.jsonl"))
 
 
 def test_best_algorithm_description_uses_champion_not_last_rejected_candidate():

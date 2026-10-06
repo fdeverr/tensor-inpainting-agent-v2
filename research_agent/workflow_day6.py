@@ -44,8 +44,10 @@ from .core.models.registry import MODEL_CLASSES
 from .evolution_knowledge import (
     RunPracticeStore,
     describe_metrics,
+    global_experience_context, prepare_run_experience, commit_run_experience,
 )
 from .method_selector import llm_from_environment
+from .prompt_context import ContextBudgetError
 from .schemas import TrainingConfig
 from .visual_evaluator import (
     MultimodalQualityEvaluator,
@@ -86,8 +88,12 @@ class Day6WorkflowConfig:
     dataset_evaluation_validation_interval: int = 10
     dataset_evaluation_patience: int = 0
     dataset_algorithm_reference: Optional[Dict[str, Any]] = None
+    defer_global_experience_commit: bool = False
+    experience_source_run_id: Optional[str] = None
 
     def validate(self) -> None:
+        if not isinstance(self.defer_global_experience_commit, bool):
+            raise ValueError("defer_global_experience_commit must be a bool")
         if not (Path(self.base_run_dir) / "state.json").is_file():
             raise ValueError("base_run_dir must contain state.json")
         if not (Path(self.initial_candidate_dir) / "manifest.json").is_file():
@@ -447,6 +453,18 @@ class Day6Workflow:
                     )
                 else:
                     generation = self.generator.generate(generation_context)
+                audit = getattr(generation, "context_audit", [])
+                if audit:
+                    audit_path = self.run_dir / ("context_budget_round_%d_validation_%d.json" % (round_index, validation_round))
+                    _write_json(audit_path, {"calls": audit})
+                    self.state["artifacts"]["context_budget"] = str(audit_path)
+                    self.trace.log_event("llm_context_budget", {"calls": audit}, step=round_index)
+            except ContextBudgetError as error:
+                audit_path = self.run_dir / ("context_budget_round_%d_failed.json" % round_index)
+                _write_json(audit_path, getattr(error, "audit", {"error": str(error)}))
+                self.state["artifacts"]["context_budget"] = str(audit_path)
+                self.trace.log_event("llm_context_budget_failed", {"error": str(error), "audit": str(audit_path)}, step=round_index)
+                raise  # No safety template may replace a required oversized incumbent.
             except Exception as error:
                 failure = {
                     "improvement_round": round_index,
@@ -686,12 +704,18 @@ class Day6Workflow:
                 raise ValueError("base-run tensor artifacts have inconsistent shapes")
 
             base_method = self.base_state["selected_model"]
+            global_memory = global_experience_context(
+                self.base_state, self.config.candidate_root, self.config.knowledge_root, self.config.evolution_cases)
+            memory_path = self.run_dir / "global_experience_context.json"
+            _write_json(memory_path, global_memory)
+            self.state["artifacts"]["global_experience_context"] = str(memory_path)
             learning_rate = float(self.config.learning_rate_candidates[0])
             seed = int(self.base_state["config"]["seed"])
             improver_context = load_improver_context(self.config.base_run_dir)
             if self.config.dataset_algorithm_reference:
+                from .recovery_registry import historical_reference_for_framework
                 improver_context["algorithm_comparison_reference"]["whole_modality_algorithms"] = (
-                    self.config.dataset_algorithm_reference
+                    historical_reference_for_framework(self.config.dataset_algorithm_reference, base_method)
                 )
             improver_context["mutation_visual_assessment_enabled"] = bool(
                 self.config.visual_assessment
@@ -1328,14 +1352,7 @@ class Day6Workflow:
                         "incumbent_after": incumbent["name"],
                     },
                 }
-                extractor = getattr(self.generator, "extract_experience", None)
-                experience = (
-                    extractor(practice)
-                    if extractor is not None
-                    else CandidateGenerator(None).extract_experience(practice)
-                )
                 _write_json(round_dir / "practice_record.json", practice)
-                _write_json(round_dir / "experience_record.json", experience)
                 practice_artifacts = run_practice.record(practice)
                 round_record = {
                     "round": round_index,
@@ -1361,13 +1378,11 @@ class Day6Workflow:
                     "dataset_evaluation": cohort,
                     "ablation_screening": ablation_screening,
                     "result_summary": result_summary,
-                    "experience": experience,
                     "judgment": judgment,
                     "artifacts": {
                         "round_dir": str(round_dir),
                         "judgment": str(round_dir / "judgment.json"),
                         "practice": str(round_dir / "practice_record.json"),
-                        "experience": str(round_dir / "experience_record.json"),
                         "visual_assessment": str(
                             round_dir / "visual_assessment.json"
                         ),
@@ -1381,7 +1396,6 @@ class Day6Workflow:
                     "decision": judgment["decision"],
                     "psnr_delta": judgment["psnr_delta"],
                     "ssim_delta": judgment["ssim_delta"],
-                    "experience": experience,
                     "suspected_causes": judgment["suspected_causes"],
                     "next_round_constraints": judgment["next_round_constraints"],
                 }
@@ -1444,6 +1458,7 @@ class Day6Workflow:
                     _write_json(comparison_reference_path, comparison_reference)
                     improver_context["evolution_memory"] = {
                         "current_run_practice": run_practice.context(),
+                        "global_reusable_experience": global_memory,
                     }
                     improver_context["previous_round_result"] = practice
                     improver_context["previous_failure_feedback"] = list(
@@ -1551,7 +1566,7 @@ class Day6Workflow:
 
             eligible_results = [
                 {
-                    "algorithm": "nearest_neighbor_manhattan",
+                    "algorithm": "linear_interpolation_waveform" if "missing_nmse" in self.base_state["results"]["interpolation_metrics"] else "nearest_neighbor_manhattan",
                     "role": "interpolation_baseline",
                     "reconstruction": artifacts["interpolation"],
                     "metrics": self.base_state["results"]["interpolation_metrics"],
@@ -1615,6 +1630,30 @@ class Day6Workflow:
                     "stop_reason": self.state["stop_reason"],
                 },
             )
+            # Exactly one summary after all rounds. Parent workflows defer only
+            # the commit, so a failed report/export cannot pollute cross-run memory.
+            print("\n🧠 全部进化轮次结束，正在从实践知识库总结一次全局经验…", flush=True)
+            try:
+                summary = prepare_run_experience(
+                    self.generator, self.state, self.base_state,
+                    self.config.candidate_root, self.config.knowledge_root,
+                    self.config.evolution_cases, getattr(self.config, "experience_source_run_id", None))
+                if not getattr(self.config, "defer_global_experience_commit", False):
+                    summary = commit_run_experience(summary)
+                summary_path = self.run_dir / "run_experience.json"
+                self.state["global_experience"] = summary
+                self.state["artifacts"]["run_experience"] = str(summary_path)
+                if summary.get("documents"):
+                    self.state["artifacts"]["global_experience"] = summary["documents"]
+                _write_json(summary_path, summary)
+            except Exception as error:
+                if self.state.get("global_experience", {}).get("status") == "committed":
+                    self.state["global_experience"]["publication_warning"] = "%s: %s" % (type(error).__name__, error)
+                    print("⚠️ 全局经验已写入，但本次摘要文件保存失败：%s" % error, flush=True)
+                else:
+                    self.state["global_experience"] = {"status": "failed", "error": "%s: %s" % (type(error).__name__, error)}
+                    print("⚠️ 全局经验总结失败，保留实践与算法产物：%s" % error, flush=True)
+            self._save()
             return self.state
         except Exception as error:
             self.state["stage"] = "FAILED"

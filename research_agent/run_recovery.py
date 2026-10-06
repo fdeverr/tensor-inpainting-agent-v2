@@ -4,6 +4,7 @@ import argparse
 
 from .recovery import RecoveryConfig, run_recovery
 from .recovery_data import DATA_TYPES
+from .cli_options import add_llm_context_budget, apply_llm_context_budget
 
 
 TRAINING_OPTIONS = (
@@ -22,7 +23,7 @@ TRAINING_OPTIONS = (
     ("screening_trials", int, "基线预赛 trial 数，1–3"),
     ("screening_max_steps", int, "基线预赛步数；省略时 min(200, evolution-steps)"),
     ("screening_patience", int, "基线预赛早停耐心"),
-    ("siren_max_steps", int, "SIREN 对比预算；省略时等于 evolution-steps"),
+    ("siren_max_steps", int, "SIREN 每个调参 trial 的步数；省略时等于 evaluation-steps"),
     ("siren_tuning_trials", int, "SIREN 调参次数，1–4"),
     ("siren_validation_interval", int, "SIREN GT 验证间隔"),
     ("siren_patience", int, "SIREN 早停耐心"),
@@ -74,7 +75,7 @@ def build_parser():
     for name in ("candidate_root", "approved_root"):
         parser.add_argument("--" + name.replace("_", "-"), default=getattr(defaults, name))
     parser.add_argument("--knowledge-root", default=defaults.knowledge_root,
-                        help=argparse.SUPPRESS)  # Legacy no-op.
+                        help="global experience root, partitioned by modality/base method; one summary per complete evolution run")
     parser.add_argument("--data-types", nargs="+", choices=tuple(DATA_TYPES), default=list(DATA_TYPES))
     parser.add_argument("--representative", action="append", default=[], metavar="TYPE=FILE")
     parser.add_argument("--mask-type", choices=("random", "block", "slices", "sildes"), default="random")
@@ -91,6 +92,8 @@ def build_parser():
                             default=getattr(defaults, name), help=help_text)
     parser.add_argument("--fair-learning-rates", type=learning_rates, dest="fair_learning_rate_candidates",
                         default=defaults.fair_learning_rate_candidates, help="逗号分隔的学习率，如 0.001,0.01,0.1")
+    parser.add_argument("--siren-learning-rates", type=learning_rates, dest="siren_learning_rate_candidates",
+                        default=defaults.siren_learning_rate_candidates, help="SIREN 调参学习率，默认 0.00005,0.0001,0.0003")
     add_switch(parser, ("--fair-learning-rate-refinement",),
                ("--no-fair-learning-rate-refinement", "--skip-fair-learning-rate-refinement"),
                "fair_refine_learning_rate", defaults.fair_refine_learning_rate)
@@ -99,6 +102,7 @@ def build_parser():
     parser.add_argument("--base-model", default="auto")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--llm-mode", choices=("auto", "off", "required"), default="auto")
+    add_llm_context_budget(parser)
     add_switch(parser, ("--lpips", "--full-reference-metrics"),
                ("--no-lpips", "--skip-full-reference-metrics"), "lpips", False, "Image only")
     add_switch(parser, ("--siren-comparison",),
@@ -115,6 +119,7 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    apply_llm_context_budget(args)
     representatives = {}
     for item in args.representative:
         if "=" not in item:
@@ -132,6 +137,7 @@ def main():
         improvement_rounds=args.improvement_rounds, tuning_trials=args.tuning_trials,
         **{name: getattr(args, name) for name, _, _ in TRAINING_OPTIONS},
         fair_learning_rate_candidates=args.fair_learning_rate_candidates,
+        siren_learning_rate_candidates=args.siren_learning_rate_candidates,
         fair_refine_learning_rate=args.fair_refine_learning_rate,
         smoke_timeout_seconds=args.smoke_timeout_seconds,
         candidate_root=args.candidate_root, approved_root=args.approved_root,

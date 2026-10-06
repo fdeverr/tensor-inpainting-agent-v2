@@ -180,18 +180,19 @@ def test_siren_tuning_design_covers_width_depth_and_frequency():
 
     assert len(candidates) == 4
     assert {item["hyperparameters"]["hidden_features"] for item in candidates} == {
-        64,
         128,
+        256,
     }
     assert {item["hyperparameters"]["hidden_layers"] for item in candidates} == {
-        2,
         3,
+        4,
     }
     assert {item["hyperparameters"]["first_omega_0"] for item in candidates} == {
         20.0,
         30.0,
+        60.0,
     }
-    assert all(item["learning_rate"] == 1e-4 for item in candidates)
+    assert {item["learning_rate"] for item in candidates} == {5e-5, 1e-4, 3e-4}
 
 
 def test_numerical_screening_can_override_the_selector_seed():
@@ -473,7 +474,7 @@ def test_day4_fallback_selects_and_trains_a_valid_method(tmp_path):
     }
 
 
-def test_siren_training_is_reused_for_the_same_data_and_config(tmp_path):
+def test_siren_training_is_reused_for_the_same_data_and_config(tmp_path, monkeypatch):
     corrupted_path = tmp_path / "corrupted.npy"
     mask_path = tmp_path / "mask.npy"
     ground_truth_path = tmp_path / "ground_truth.npy"
@@ -484,7 +485,8 @@ def test_siren_training_is_reused_for_the_same_data_and_config(tmp_path):
         output_dir=str(tmp_path / "outputs"), siren_comparison=True, seed=7,
         siren_tuning_trials=1, siren_max_steps=12, siren_validation_interval=3,
         siren_patience=2, device="cpu", full_reference_metrics=False,
-        no_reference_metrics=False,
+        no_reference_metrics=False, data_type="Image", siren_baseline_reference=None,
+        siren_learning_rate_candidates=(5e-5, 1e-4, 3e-4),
     )
     calls = []
 
@@ -498,6 +500,7 @@ def test_siren_training_is_reused_for_the_same_data_and_config(tmp_path):
             "selected_model": "tucker",
             "artifacts": {"corrupted": str(corrupted_path), "mask": str(mask_path)},
             "results": {
+                "image_profile": {"image_shape": [4, 5, 3]},
                 "interpolation_metrics": {"missing_psnr": 10.0},
                 "tensor_metrics": {"missing_psnr": 11.0},
             },
@@ -560,6 +563,14 @@ def test_siren_training_is_reused_for_the_same_data_and_config(tmp_path):
         "evaluate_reconstruction"
     ]
     assert Path(second.state["artifacts"]["siren_reconstruction"]).is_file()
+    original_hash = Day4Workflow._file_sha256
+    monkeypatch.setattr(Day4Workflow, "_file_sha256", staticmethod(
+        lambda path: "changed-trainer" if path.endswith("core/trainer.py") else original_hash(path)))
+    third = make_workflow("run-third")
+    third._run_additional_baselines(str(ground_truth_path))
+    assert not third.state["results"]["siren_comparison"]["training_cache"]["reused"]
+    assert [tool for run, tool in calls if run == "run-third"] == [
+        "tune_tensor_model", "evaluate_reconstruction"]
 
 
 def test_day4_can_feed_one_shot_interpolation_visual_prior_to_selector(tmp_path):

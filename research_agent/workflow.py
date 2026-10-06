@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from .agent_tools import build_research_tool_registry
 from .agent_tools.framework import ToolStatus, TraceLogger
 from .schemas import SUPPORTED_MODEL_NAMES
+from .core.audio_metrics import active_audio_metadata
 
 
 STAGES = (
@@ -286,7 +287,8 @@ class Day3Workflow:
             self._transition("CREATED", "ANALYZED")
 
             interpolation_path = self.run_dir / "interpolated.npy"
-            print("🧩 正在计算 Manhattan 最近邻插值基线…", flush=True)
+            print("🧩 正在计算波形线性插值基线…" if active_audio_metadata() else
+                  "🧩 正在计算 Manhattan 最近邻插值基线…", flush=True)
             interpolation = self._call_tool(
                 "run_interpolation",
                 {
@@ -294,6 +296,7 @@ class Day3Workflow:
                     "corrupted_path": self.state["artifacts"]["corrupted"],
                     "mask_path": self.state["artifacts"]["mask"],
                     "output_path": str(interpolation_path),
+                    "data_type": self.state["results"]["image_profile"]["data_type"],
                 },
             )
             self.state["artifacts"]["interpolation"] = interpolation.data[
@@ -402,7 +405,7 @@ class Day3Workflow:
                 "evaluate_reconstruction",
                 {
                     "run_id": self.run_id,
-                    "algorithm_name": "nearest_neighbor_manhattan",
+                    "algorithm_name": "linear_interpolation_waveform" if active_audio_metadata() else "nearest_neighbor_manhattan",
                     "reconstruction_path": self.state["artifacts"]["interpolation"],
                     "ground_truth_path": ground_truth_path,
                     "mask_path": self.state["artifacts"]["mask"],

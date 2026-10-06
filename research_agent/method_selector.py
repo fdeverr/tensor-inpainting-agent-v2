@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .agent_tools.framework import TensorInpaintingLLM
+from .prompt_context import check_text_messages, invoke_with_output_budget, ContextBudgetError
 
 
 LLM_SAFE_SOURCE_METADATA_FIELDS = {
@@ -178,7 +179,7 @@ def _validate_sources(
 ) -> None:
     allowed = {
         item["source"] for item in retrieval["evidence"]
-    } | {rule["source"] for rule in retrieval["active_rules"]}
+    } | {item["source"] for item in retrieval.get("method_catalogue", [])} | {rule["source"] for rule in retrieval["active_rules"]}
     if visual_assessment and visual_assessment.get("status") == "completed":
         allowed.add(METHOD_SELECTION_VISUAL_SOURCE)
     allowed.update(row["source"] for row in _comparison_evidence(comparison_reference))
@@ -468,6 +469,11 @@ def deterministic_method_plan(
     for rule in retrieval["active_rules"]:
         scores[str(rule["prefer"])] += float(rule.get("weight", 1.0))
     method = max(method_names, key=lambda name: (scores[name], name))
+    available_evidence = retrieval["evidence"] + retrieval.get("method_catalogue", [])
+    if not any(scores.values()):
+        if not available_evidence:
+            raise ValueError("method selection has no applicable knowledge evidence")
+        method = max(available_evidence, key=lambda item: float(item.get("score", 0.0)))["method"]
     supporting_rules = [
         rule for rule in retrieval["active_rules"] if rule["prefer"] == method
     ]
@@ -479,7 +485,7 @@ def deterministic_method_plan(
         reason = " ".join(str(rule["reason"]) for rule in supporting_rules[:3])
     else:
         first_evidence = next(
-            item for item in retrieval["evidence"] if item["method"] == method
+            item for item in available_evidence if item["method"] == method
         )
         evidence = [
             EvidenceReference(
@@ -510,7 +516,7 @@ def deterministic_method_plan(
         confidence=float(min(1.0, max(0.0, confidence))),
         suggested_hyperparameters=_default_hyperparameters(method, profile),
         risks=[
-            "Held-out observed pixels may not represent the artificial missing pattern.",
+            "Knowledge rules are conditional priors, not measured winners; GT feedback is development evidence, not an untouched generalization test.",
             "A global low-rank model may blur or stripe local structure.",
         ],
         selection_mode="deterministic_fallback",
@@ -572,6 +578,7 @@ class MethodSelector:
         allowed_sources = [
             item["source"] for item in retrieval["evidence"]
         ] + [rule["source"] for rule in retrieval["active_rules"]]
+        allowed_sources.extend(item["source"] for item in retrieval.get("method_catalogue", []))
         completed_visual = bool(
             visual_assessment
             and visual_assessment.get("status") == "completed"
@@ -584,7 +591,7 @@ class MethodSelector:
         schema = MethodPlan.model_json_schema()
         user_payload = {
             "fixed_prompt": (
-                "请根据当前图像的缺失模式、统计特征、插值结果和张量分解经验文档，"
+                "请根据当前数据类型（Image/MSI/Video/audio）、缺失模式、实际张量模语义、统计特征与方法适用文档，"
                 "按推荐顺序提供恰好 %d 个不同的张量分解方法作为候选短名单。"
                 "method 必须等于 shortlist 第一项；最终家族由同预算数值预赛决定。"
                 % shortlist_size
@@ -609,6 +616,8 @@ class MethodSelector:
             ),
             "active_rules": retrieval["active_rules"],
             "evidence_chunks": retrieval["evidence"],
+            "method_catalogue": retrieval.get("method_catalogue", []),
+            "knowledge_selection_context": retrieval.get("selection_context", {}),
             "measured_whole_modality_comparisons": comparison_rows,
             "required_empirical_anchor": empirical_anchor,
             "allowed_evidence_sources": allowed_sources,
@@ -636,6 +645,10 @@ class MethodSelector:
                     "X = A ×₃ E; btd is Block-Term "
                     "Decomposition; tsvd is a low-tubal-rank t-product model. Every "
                     "reason must cite supplied profile values or allowed evidence sources. "
+                    "Read the all-family method_catalogue and knowledge_selection_context before ranking. "
+                    "Applicability rules are soft engineering priors, never measured superiority. Respect the "
+                    "actual three-mode layout, slice identifiability limits and signed-waveform semantics. "
+                    "Preview/mean-imputed statistics do not measure temporal frequency or tensor ranks. "
                     "If interpolation_visual_structure_assessment is available, use it only "
                     "as a coarse prior for the decomposition family and low/medium/high rank "
                     "regime. Translate that regime into two or three bounded candidates; "
@@ -714,7 +727,7 @@ class MethodSelector:
                 try:
                     attempt_count += 1
                     raw = self._content(
-                        self.llm.invoke(current_messages, temperature=0.0)
+                        invoke_with_output_budget(self.llm, current_messages, check_text_messages(current_messages))
                     )
                     raw_outputs.append(raw)
                     plan = MethodPlan.model_validate(_json_from_text(raw))
@@ -744,6 +757,8 @@ class MethodSelector:
                         "fallback_reason": None,
                         "messages": messages,
                     }
+                except ContextBudgetError:
+                    raise  # Do not silently replace selection with a rule when required input is oversized.
                 except Exception as error:
                     validation_errors.append(
                         "%s: %s" % (type(error).__name__, str(error))

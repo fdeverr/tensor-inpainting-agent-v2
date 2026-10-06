@@ -16,7 +16,8 @@ def _number(value: Optional[float], digits: int = 4) -> str:
 
 
 BUILTIN_FRAMEWORKS = {
-    "nearest_neighbor_manhattan": "Manhattan 最近邻插值：对每个缺失位置寻找曼哈顿距离最近的可见像素，复制其特征值；无需训练。",
+    "nearest_neighbor_manhattan": "Manhattan 最近邻插值：RGB 按二维空间、Video 按三维时空逐颜色通道独立寻找可见值；MSI 可沿有序光谱轴寻找邻近波段；无需训练。",
+    "linear_interpolation_waveform": "波形线性插值：沿整段有效时间轴逐声道插值，跨分帧边界，不使用隐藏 GT，也不参与训练。",
     "matrix": "低秩矩阵分解：将张量展开为 H × (W·F)，用两个可学习因子 U、V 的矩阵乘积重建，再恢复原始形状并加特征偏置。",
     "mode3": "Mode-3 分解：学习空间系数 A[H,W,R] 与特征因子 E[F,R]，沿秩维收缩得到完整张量，再加特征偏置。",
     "cp": "CP 分解：学习高度、宽度、特征三个因子，将 R 个秩一张量相加得到重建，再加特征偏置。",
@@ -28,7 +29,7 @@ BUILTIN_FRAMEWORKS = {
     "tsvd": "t-SVD 风格低秩模型：在特征轴的频域学习低秩因子，频域矩阵乘积后通过逆实数 FFT 恢复张量，再加特征偏置。",
     "tt": "Tensor Train 分解：学习三个链式核心，沿相邻核心之间的秩维收缩，得到完整张量并加入特征偏置。",
     "tensor_ring": "Tensor Ring 分解：学习高度、宽度、特征三个环状核心，闭合收缩环上的秩维，得到重建并加入特征偏置。",
-    "siren": "SIREN 隐式神经表示：归一化二维坐标 → 正弦激活的全连接隐藏层 → 线性特征输出 → 恢复图像/张量形状。",
+    "siren": "SIREN 隐式神经表示：Image/MSI 使用 (x,y)，Video 使用 (x,y,t)，audio 使用一维连续时间 t；归一化坐标 → 正弦激活隐藏层 → 线性通道输出 → 恢复原始存储形状。",
 }
 
 
@@ -102,11 +103,12 @@ def _best_algorithm_lines(
     if selected:
         lines += ["", "### 最佳配置", "", "```json",
                   json.dumps(selected, ensure_ascii=False, indent=2), "```"]
-    if algorithm != "nearest_neighbor_manhattan":
+    if algorithm not in {"nearest_neighbor_manhattan", "linear_interpolation_waveform"}:
         lines += ["", "训练与输出流程：波形张量预测 → 可见采样点损失反向传播 → 缺失原始波形 GT NMSE 选择 checkpoint → 直接复用 → 恢复已观测采样点。" if audio else
                   "训练与输出流程：完整张量预测 → 全部可见像素上的损失反向传播 → 缺失区 GT MSE 选择最佳 checkpoint → 直接复用该 checkpoint 的预测 → 恢复已观测像素，输出完整补全结果。",
                   "GT 用于参数/检查点选择，不进入梯度损失；音频效果仅用缺失原始波形 NMSE 评价。" if audio else
-                  "GT 用于参数/检查点选择，不进入梯度损失；PSNR、SSIM 用于效果评估。"]
+                  "GT 用于参数/检查点选择，不进入梯度损失；PSNR、SSIM 用于效果评估。",
+                  "训练曲线的 loss 与 GT 分数对应同一次参数更新后的模型。训练 loss 使用未裁剪预测，总 loss 含正则项；GT 选择和最终评分使用 [0,1] 裁剪预测。音频 padding 不参与训练与评分。"]
     return lines + [""]
 
 
@@ -118,7 +120,7 @@ def build_method_results(
 
     results = [
         {
-            "algorithm": "nearest_neighbor_manhattan",
+            "algorithm": "linear_interpolation_waveform" if "missing_nmse" in day4["results"]["interpolation_metrics"] else "nearest_neighbor_manhattan",
             "role": "interpolation_baseline",
             "metrics": day4["results"]["interpolation_metrics"],
             "runtime_seconds": None,
@@ -582,6 +584,17 @@ def render_research_report(
     visual_lines = _visual_assessment_lines(day5, day6)
     if visual_lines:
         lines.extend([""] + visual_lines)
+    experience = final_state.get("global_experience") or {}
+    if experience:
+        lines.extend(["", "## 本次运行的全局经验摘要", "",
+                      "全部进化轮次结束后，从本次实践知识库统一总结一次；每轮不再单独提炼或写入全局经验。",
+                      "- 状态：`%s`" % experience.get("status", "unknown")])
+        if experience.get("experience"):
+            lines.extend(["", experience["experience"]["experience"], "",
+                          "- 置信度：`%s`；证据轮数：`%s`。" % (experience["experience"]["confidence"], experience["conditions"]["round_count"]),
+                          "- 全局库：`%s`" % experience.get("documents", {}).get("experience_markdown", "等待完整运行结束后写入")])
+        if experience.get("error"):
+            lines.append("- 经验处理失败，但算法产物保留：%s" % experience["error"])
     lines.extend(
         [
             "",

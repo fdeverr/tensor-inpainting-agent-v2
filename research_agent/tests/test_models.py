@@ -127,6 +127,60 @@ def test_siren_forward_backward_matches_image_shape():
     assert all(parameter.grad is not None for parameter in model.parameters())
 
 
+def test_siren_audio_uses_original_time_across_frames_and_padding():
+    from research_agent.core.audio_metrics import audio_metric_context
+    with audio_metric_context({"data_type": "audio", "sample_count": 10}):
+        model = create_model("siren", (3, 4, 2), [0.4, 0.5], {"hidden_features": 16})
+    assert model.coordinates.shape == (12, 1)
+    torch.testing.assert_close(model.coordinates[:10, 0], torch.linspace(-1, 1, 10))
+    assert model.coordinates[10, 0] > 1  # Padding does not stretch valid time.
+    assert model.network[0].linear.in_features == 1
+    assert model.output_layer.out_features == 2
+    output = model()
+    assert output.shape == (3, 4, 2)
+    output.square().mean().backward()
+    assert all(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_siren_video_uses_time_as_input_and_only_channels_as_output():
+    model = create_model("siren", (2, 3, 4, 2), [0.4, 0.5] * 4, {"hidden_features": 16})
+    assert model.network[0].linear.in_features == 3
+    assert model.output_layer.out_features == 2
+    grid = model.coordinates.reshape(2, 3, 4, 3)
+    torch.testing.assert_close(grid[0, 0, :, 2], torch.linspace(-1, 1, 4))
+    assert (grid[0, 0, :, :2] == -1).all()
+    output = model()
+    assert output.shape == (2, 3, 4, 2)
+    output.square().mean().backward()
+    assert all(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_siren_audio_is_invariant_to_storage_frame_size():
+    from research_agent.core.audio_metrics import audio_metric_context
+    params = {"hidden_features": 16, "hidden_layers": 2}
+    with audio_metric_context({"data_type": "audio", "sample_count": 10}):
+        small_frames = create_model("siren", (3, 4, 2), [0.4, 0.5], params)
+        large_frames = create_model("siren", (2, 8, 2), [0.4, 0.5], params)
+    large_frames.load_state_dict(small_frames.state_dict())
+    torch.testing.assert_close(small_frames.coordinates[:10], large_frames.coordinates[:10])
+    torch.testing.assert_close(small_frames().reshape(-1, 2)[:10], large_frames().reshape(-1, 2)[:10])
+
+
+@pytest.mark.parametrize("shape,mode,mean", [((3, 4, 2), "audio", [0.4, 0.5]),
+    ((3, 4, 2), "image", [0.4, 0.5]), ((3, 4, 2, 2), "video", [0.4, 0.5] * 2)])
+def test_siren_coordinate_chunks_preserve_outputs_and_gradients(shape, mode, mean):
+    params = {"hidden_features": 16, "hidden_layers": 2, "coordinate_mode": mode}
+    whole = create_model("siren", shape, mean, {**params, "coordinate_batch_size": 1000})
+    chunks = create_model("siren", shape, mean, {**params, "coordinate_batch_size": 3})
+    chunks.load_state_dict(whole.state_dict())
+    expected, actual = whole(), chunks()
+    torch.testing.assert_close(actual, expected)
+    expected.square().mean().backward()
+    actual.square().mean().backward()
+    for left, right in zip(whole.parameters(), chunks.parameters()):
+        torch.testing.assert_close(left.grad, right.grad, rtol=1e-4, atol=1e-6)
+
+
 @pytest.mark.parametrize("model_name,hyperparameters,expected_parameters", MODEL_CASES)
 def test_tensor_model_forward_backward_and_parameters(
     model_name,

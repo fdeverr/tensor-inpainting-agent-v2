@@ -1,6 +1,24 @@
 """Shared switches for optional, expensive evaluation stages."""
 
 import argparse
+import os
+
+from .prompt_context import ContextBudget
+
+
+def add_llm_context_budget(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--llm-context-tokens", type=int,
+                        default=os.getenv("LLM_CONTEXT_TOKENS", "131072"),
+                        help="configured model context window (input plus reserved output)")
+    parser.add_argument("--llm-output-reserve-tokens", type=int,
+                        default=os.getenv("LLM_OUTPUT_RESERVE_TOKENS", "16384"),
+                        help="output reserve within the context window; caps generation output")
+
+
+def apply_llm_context_budget(args) -> None:
+    budget = ContextBudget(args.llm_context_tokens, args.llm_output_reserve_tokens)
+    os.environ["LLM_CONTEXT_TOKENS"] = str(budget.context_tokens)
+    os.environ["LLM_OUTPUT_RESERVE_TOKENS"] = str(budget.output_reserve_tokens)
 
 
 def parse_float_csv(value: str) -> tuple[float, ...]:

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import math
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -112,6 +115,136 @@ def resolve_knowledge_root(candidate_root: str, configured_root: Optional[str]) 
     return Path(candidate_root).parent / "evolution_knowledge"
 
 
+def experience_conditions(base_state, cases=None):
+    """Keep experimental applicability explicit; a representative is not a cohort."""
+    profile = base_state["results"]["image_profile"]
+    config = base_state["config"]
+    rates = [case["actual_missing_rate"] for case in (cases or []) if "actual_missing_rate" in case]
+    conditions = {
+        "mask_type": "slices" if config["mask_type"] == "sildes" else config["mask_type"],
+        "requested_missing_rate": config.get("missing_rate", profile.get("requested_missing_rate", profile["actual_missing_rate"])),
+        "actual_missing_rate": profile["actual_missing_rate"],
+        "evaluation_scope": "all_same_type_samples" if cases else "single_sample",
+        "sample_count": len(cases) if cases else 1,
+    }
+    if rates:
+        conditions["actual_missing_rate_range"] = [min(rates), max(rates)]
+    return conditions
+
+
+def global_experience_context(base_state, candidate_root, configured_root, cases=None):
+    profile = (base_state.get("results") or {}).get("image_profile") or {}
+    base_method = base_state.get("selected_model")
+    try:
+        if not base_method:
+            raise ValueError("global experience requires an explicitly selected base method")
+        store = GlobalExperienceStore(resolve_knowledge_root(candidate_root, configured_root),
+            base_method, profile.get("data_type", "color_image"),
+            experience_conditions(base_state, cases))
+        return {"status": "completed", **store.context(limit=20)}
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print("⚠️ 历史经验暂不可读，本轮继续使用当前实践与对照：%s" % error, flush=True)
+        return {"status": "unavailable", "base_method": base_method,
+                "data_type": profile.get("data_type", "color_image"), "record_count": 0,
+                "retrieved_count": 0, "reusable_experience": [], "error": str(error)}
+
+
+def compact_run_practices(practices):
+    """Represent every round, excluding full curves, tensors and redundant trials."""
+    evidence = []
+    for practice in practices:
+        if set(practice) != {"framework", "goal", "method", "result"}:
+            raise ValueError("run summary requires complete practice tuples")
+        result = practice["result"]
+        compact = {key: result[key] for key in (
+            "incumbent_metrics", "candidate_metrics", "deltas", "decision", "accepted",
+            "incumbent_after", "metric_scope", "training_behavior", "removal_audit",
+        ) if key in result}
+        cohort = result.get("dataset_evaluation")
+        if cohort:
+            compact["dataset_evaluation"] = {key: cohort.get(key) for key in ("incumbent_summary", "candidate_summary")}
+            for role in ("incumbent", "candidate"):
+                compact["dataset_evaluation"][role] = [
+                    {key: sample[key] for key in ("sample", "status", "metrics", "error") if key in sample}
+                    for sample in cohort.get(role, [])]
+            compact["dataset_evaluation"]["sample_failures"] = [
+                {"sample": sample.get("sample"), "error": sample.get("error")}
+                for role in ("incumbent", "candidate") for sample in cohort.get(role, []) if sample.get("status") != "completed"]
+        ablation = result.get("ablation") or {}
+        if ablation:
+            compact["ablation_attribution"] = ablation.get("attribution", {"classification": "unavailable"})
+        visual = result.get("visual_assessment") or {}
+        if visual.get("status") == "completed":
+            assessment = visual.get("assessment", {})
+            compact["visual_assessment"] = {key: assessment.get(key) for key in
+                ("comparison", "candidate_improvements", "candidate_regressions", "mutation_guidance", "confidence")}
+        evidence.append({"framework": practice["framework"], "goal": practice["goal"],
+                         "method": practice["method"], "result": compact})
+    return evidence
+
+
+def prepare_run_experience(generator, state, base_state, candidate_root, configured_root,
+                           cases=None, source_run_id=None):
+    """Summarize the persisted practice library exactly once after a complete run."""
+    if state.get("stage") != "COMPLETED":
+        raise ValueError("only completed evolution runs may produce global experience")
+    path = Path(state["artifacts"]["run_practice"]["practice_jsonl"])
+    source_bytes = path.read_bytes()
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    practices = _parse_jsonl(source_bytes.decode("utf-8"))
+    if not practices:
+        return {"status": "skipped", "reason": "no completed practice tuples"}
+    if len(practices) != len(state["rounds"]):
+        raise ValueError("practice library does not cover every completed evolution round")
+    extractor = getattr(generator, "extract_run_experience", None)
+    if extractor is None:
+        from .candidate.generator import CandidateGenerator
+        extractor = CandidateGenerator(None).extract_run_experience
+    outcome = dict(state["best_available"])
+    if cases:
+        # The representative's reconstruction metrics are not the cohort score.
+        outcome.pop("metrics", None)
+        outcome["whole_modality_summary"] = state.get("overall_comparison", {}).get("whole_modality_summary")
+    summary = extractor(compact_run_practices(practices), outcome)
+    from .candidate.schemas import ExperienceExtraction
+    summary = ExperienceExtraction.model_validate(summary).model_dump()
+    if hashlib.sha256(path.read_bytes()).hexdigest() != source_sha256:
+        raise ValueError("practice library changed during run-level summarization")
+    conditions = experience_conditions(base_state, cases)
+    conditions.update({
+        "source_run_id": source_run_id or state["workflow_id"],
+        "summary_scope": "whole_run_practice", "round_count": len(practices),
+        "accepted_round_count": sum(bool(p["result"].get("accepted")) for p in practices),
+        "source_practice_jsonl": str(path.resolve()),
+        "source_practice_sha256": source_sha256,
+        "final_algorithm": state["best_available"]["algorithm"],
+        "training_budget": practices[0]["framework"].get("conditions", {}).get("training_budget"),
+        "evaluation_steps": state.get("config", {}).get("dataset_evaluation_steps") if cases else None,
+        "metric_protocol": "missing_original_waveform_nmse" if base_state["results"]["image_profile"].get("data_type") == "audio" else "missing_region_psnr_and_composite_ssim",
+    })
+    profile = base_state["results"]["image_profile"]
+    return {"status": "prepared", "experience": summary,
+            "context_audit": getattr(generator, "last_summary_context_audit", {}),
+            "root": str(resolve_knowledge_root(candidate_root, configured_root)),
+            "base_method": base_state["selected_model"],
+            "data_type": profile.get("data_type", "color_image"), "conditions": conditions}
+
+
+def commit_run_experience(summary):
+    """Idempotent commit; the summary must still match its original practice log."""
+    if summary.get("status") == "skipped":
+        return summary
+    if summary.get("status") not in {"prepared", "committed"}:
+        raise ValueError("run experience is not prepared")
+    conditions = summary["conditions"]
+    path = Path(conditions["source_practice_jsonl"])
+    if hashlib.sha256(path.read_bytes()).hexdigest() != conditions["source_practice_sha256"]:
+        raise ValueError("practice library changed after run-level summarization")
+    store = GlobalExperienceStore(summary["root"], summary["base_method"], summary["data_type"], conditions)
+    artifacts = store.record(summary["experience"])
+    return {**summary, "status": "committed", "documents": artifacts}
+
+
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as stream:
@@ -121,10 +254,17 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     if not path.is_file():
         return []
+    return _parse_jsonl(path.read_text(encoding="utf-8"))
+
+
+def _parse_jsonl(contents):
     records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in contents.splitlines():
         if line.strip():
-            records.append(json.loads(line))
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError("knowledge JSONL records must be JSON objects")
+            records.append(record)
     return records
 
 
@@ -137,15 +277,29 @@ def _write_jsonl(path: Path, records: List[Dict[str, Any]]) -> None:
     temporary.replace(path)
 
 
+@contextmanager
+def _experience_lock(directory):
+    """Serialize read/modify/replace across concurrent Linux/macOS runs."""
+    import fcntl
+    with (directory / ".experience.lock").open("a") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 class GlobalExperienceStore:
     """Persistent compact principles reused across independent runs."""
 
     def __init__(self, root: str | Path, base_method: str,
                  data_type: Optional[str] = None, conditions: Optional[Dict[str, Any]] = None) -> None:
+        normalization = {"Image": "color_image", "MSI": "msi", "Video": "video"}
+        data_type = normalization.get(data_type, data_type)
         aliases = {"color_image": "Image", "msi": "MSI", "video": "Video", "audio": "audio"}
         if data_type is not None and data_type not in aliases:
             raise ValueError("unsupported experience data_type")
-        if Path(base_method).name != base_method:
+        if not base_method or base_method in {".", ".."} or Path(base_method).name != base_method:
             raise ValueError("invalid base_method")
         self.conditions = conditions or {}
         self.data_type = data_type
@@ -154,14 +308,15 @@ class GlobalExperienceStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.experience_jsonl = self.directory / "reusable_experience.jsonl"
         self.experience_markdown = self.directory / "reusable_experience.md"
-        records = self._compact_records(_read_jsonl(self.experience_jsonl))
-        if records or self.experience_jsonl.exists():
-            _write_jsonl(self.experience_jsonl, records)
-        self._write_markdown(records)
+        with _experience_lock(self.directory):
+            records = self._compact_records(_read_jsonl(self.experience_jsonl))
+            if records or self.experience_jsonl.exists():
+                _write_jsonl(self.experience_jsonl, records)
+            self._write_markdown(records)
 
     @staticmethod
     def _compact_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Normalize legacy verbose records into the two-field compact schema."""
+        """Normalize legacy lessons while retaining tagged applicability/evidence."""
 
         compact: List[Dict[str, Any]] = []
         seen = set()
@@ -175,8 +330,15 @@ class GlobalExperienceStore:
                 confidence = "low"
             metadata = {key: record[key] for key in (
                 "data_type", "base_method", "mask_type", "requested_missing_rate",
-                "actual_missing_rate", "source_run_id"
+                "actual_missing_rate", "source_run_id", "summary_scope", "round_count",
+                "accepted_round_count", "source_practice_jsonl", "source_practice_sha256",
+                "final_algorithm", "evaluation_scope", "sample_count", "actual_missing_rate_range",
+                "training_budget", "evaluation_steps", "metric_protocol",
             ) if key in record} if record.get("data_type") else {}
+            if metadata:
+                metadata["data_type"] = {"Image": "color_image", "MSI": "msi", "Video": "video"}.get(metadata["data_type"], metadata["data_type"])
+                if metadata.get("mask_type") == "sildes":
+                    metadata["mask_type"] = "slices"
             identity = (lesson, metadata.get("data_type"), metadata.get("mask_type"),
                         metadata.get("actual_missing_rate"), metadata.get("source_run_id"))
             if identity in seen:
@@ -203,16 +365,39 @@ class GlobalExperienceStore:
                 lines.append("  - 适用条件：`%s / %s / 缺失率 %s`；来源：`%s`" % (
                     record["data_type"], record.get("mask_type"), record.get("actual_missing_rate"),
                     record.get("source_run_id", "unknown")))
+                if record.get("summary_scope") == "whole_run_practice":
+                    lines.append("  - 运行级总结：%s 轮实践，%s 轮晋级；最终输出：`%s`；评测范围：`%s`（%s 个样本）。" % (
+                        record.get("round_count"), record.get("accepted_round_count"), record.get("final_algorithm"),
+                        record.get("evaluation_scope"), record.get("sample_count")))
+                    lines.append("  - 原始实践：`%s`；校验值：`%s`。" % (
+                        record.get("source_practice_jsonl"), record.get("source_practice_sha256")))
         self.experience_markdown.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def context(self, limit: int = 50) -> Dict[str, Any]:
+        if limit < 1:
+            raise ValueError("experience retrieval limit must be positive")
         records = _read_jsonl(self.experience_jsonl)
+        eligible = [(index, record) for index, record in enumerate(records)
+                    if not self.data_type or record.get("data_type") == self.data_type and record.get("base_method") == self.base_method]
+        rate = self.conditions.get("requested_missing_rate", self.conditions.get("actual_missing_rate"))
+        pattern = self.conditions.get("mask_type")
+        def relevance(index_record):
+            index, record = index_record
+            historical_rate = record.get("requested_missing_rate", record.get("actual_missing_rate"))
+            distance = abs(historical_rate - rate) if isinstance(historical_rate, (int, float)) and isinstance(rate, (int, float)) else math.inf
+            return (record.get("mask_type") == pattern, -distance, index)
+        selected = [dict(record) for _, record in sorted(eligible, key=relevance, reverse=True)[:limit]]
+        if self.data_type:
+            for record in selected:
+                record.setdefault("summary_scope", "legacy_unspecified")
         return {
             "base_method": self.base_method,
             "data_type": self.data_type,
             "current_conditions": self.conditions,
             "record_count": len(records),
-            "reusable_experience": records[-limit:],
+            "retrieved_count": len(selected),
+            "retrieval_rule": "same modality/base method; matching mask type, nearest requested missing rate, newest first; advisory only",
+            "reusable_experience": selected,
             "documents": {
                 "experience_jsonl": str(self.experience_jsonl),
                 "experience_markdown": str(self.experience_markdown),
@@ -223,7 +408,12 @@ class GlobalExperienceStore:
         self,
         experience: Dict[str, Any],
     ) -> Dict[str, str]:
-        """Append one unique two-field lesson and discard run-specific metadata."""
+        """Append one run-level lesson, retaining applicability and source evidence."""
+
+        with _experience_lock(self.directory):
+            return self._record_locked(experience)
+
+    def _record_locked(self, experience):
 
         payload = dict(experience)
         if self.data_type:
@@ -234,6 +424,13 @@ class GlobalExperienceStore:
             raise ValueError("experience must contain a non-empty general lesson")
         new_record = record[0]
         records = self._compact_records(_read_jsonl(self.experience_jsonl))
+        if new_record.get("summary_scope") == "whole_run_practice":
+            previous = [record for record in records if record.get("summary_scope") == "whole_run_practice"
+                        and record.get("source_run_id") == new_record.get("source_run_id")]
+            if previous:
+                if previous[0].get("source_practice_sha256") != new_record.get("source_practice_sha256"):
+                    raise ValueError("run already summarized with different practice evidence")
+                return {"experience_jsonl": str(self.experience_jsonl), "experience_markdown": str(self.experience_markdown)}
         if new_record not in records:
             records.append(new_record)
             _write_jsonl(self.experience_jsonl, records)
@@ -245,7 +442,7 @@ class GlobalExperienceStore:
 
 
 class RunPracticeStore:
-    """Practice trajectory visible only to later rounds of the current Day 6 run."""
+    """Run-local trajectory for later rounds and one end-of-run distillation."""
 
     def __init__(self, run_dir: str | Path, base_method: str, workflow_id: str) -> None:
         self.directory = Path(run_dir) / "knowledge"
@@ -257,7 +454,7 @@ class RunPracticeStore:
                 "# 当前运行算法进化实践\n\n"
                 "- Workflow：`%s`\n- 基础分解：`%s`\n\n"
                 "每条实践严格保存为（当前框架与条件、目标、方法、结果）四元组。"
-                "本实践库只服务于当前运行，不会被其他运行读取。\n"
+                "原始实践只服务于当前运行；完整运行结束后统一提炼一次全局经验，其他运行仅读取该摘要。\n"
                 % (workflow_id, base_method),
                 encoding="utf-8",
             )

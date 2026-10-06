@@ -39,6 +39,29 @@ def audio_metadata_for_gt(path):
     return None
 
 
+def audio_valid_mask(tensor_shape, metadata=None):
+    """Identify real waveform samples independently of the observation mask."""
+    audio = metadata if metadata is not None else active_audio_metadata()
+    if audio is None:
+        raise ValueError("audio validity requires waveform metadata")
+    if len(tensor_shape) != 3 or tensor_shape[-1] != audio["channels"]:
+        raise ValueError("audio metadata does not match the framed waveform shape")
+    total = int(np.prod(tensor_shape[:2]))
+    count = audio["sample_count"]
+    if not 1 <= count <= total:
+        raise ValueError("invalid audio sample_count")
+    return np.broadcast_to((np.arange(total) < count).reshape(*tensor_shape[:2], 1), tensor_shape)
+
+
+def training_observation_mask(observed_mask, tensor_shape):
+    """Exclude padding from supervision without changing the experiment mask."""
+    if active_audio_metadata() is None:
+        return observed_mask.copy()
+    expanded = (np.broadcast_to(observed_mask[..., None], tensor_shape)
+                if observed_mask.ndim == 2 else observed_mask)
+    return expanded & audio_valid_mask(tensor_shape)
+
+
 def restore_waveform(tensor, metadata):
     waveform = np.asarray(tensor, dtype=np.float64).reshape(-1, metadata["channels"])
     if len(waveform) < metadata["sample_count"]:

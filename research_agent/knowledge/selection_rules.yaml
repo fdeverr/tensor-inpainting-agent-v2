@@ -1,108 +1,270 @@
+# Soft shortlist priors, NOT empirical scores or recovery guarantees.
+# Current implementation semantics and limitations: README.md and methods/*.md.
+# data_types scopes prevent framed audio from receiving RGB/spatial heuristics.
+# Thresholds in retriever.py are heuristic; missing-rate warnings do not force a family/rank.
 rules:
-  - condition: block_missing
-    prefer: tucker
-    weight: 2.0
-    reason: Tucker's separate spatial ranks are a flexible baseline for a contiguous hole.
-    keywords: [block, contiguous, spatial, hole]
+  - condition: "block_missing"
+    prefer: "tucker"
+    weight: 1
+    data_types: ["Image"]
+    reason: "A contiguous image hole supports testing a flexible global core, not guaranteed recovery."
+    keywords: ["block","core"]
 
-  - condition: random_missing
-    prefer: matrix
+  - condition: "random_missing"
+    prefer: "matrix"
+    weight: 1
+    data_types: ["Image"]
+    reason: "Dispersed image observations support a simple fixed-unfolding control; confirm row/column coverage."
+    keywords: ["random","matrix"]
+
+  - condition: "channel_correlation_high"
+    prefer: "tucker"
     weight: 1.5
-    reason: Matrix factorization is a strong simple baseline when observations are dispersed.
-    keywords: [random, dispersed, matrix, observed]
+    data_types: ["Image"]
+    reason: "Image feature-correlation proxy supports trying a small color rank with separate spatial ranks."
+    keywords: ["correlation","rank"]
 
-  - condition: channel_correlation_high
-    prefer: tucker
-    weight: 2.5
-    reason: Tucker can allocate a small channel rank while retaining separate spatial ranks.
-    keywords: [channel, correlation, RGB, channel rank]
+  - condition: "channel_correlation_high"
+    prefer: "mode3"
+    weight: 0.35
+    data_types: ["Image"]
+    reason: "Color-subspace control only: independent pixel coefficients cannot recover jointly hidden colors."
+    keywords: ["mode3","subspace"]
 
-  - condition: channel_correlation_high
-    prefer: mode3
-    weight: 1.0
-    reason: A mode-3 E directly models a low-dimensional RGB subspace, but its independent spatial coefficients limit extrapolation.
-    keywords: [channel, correlation, RGB, mode-3, A mode3 E, channel subspace]
+  - condition: "channel_correlation_high"
+    prefer: "tsvd"
+    weight: 0.25
+    data_types: ["Image"]
+    reason: "An alternative RGB coupling parameterization; its channel FFT is not a temporal or physical spectrum."
+    keywords: ["tsvd","FFT"]
 
-  - condition: channel_correlation_high
-    prefer: tsvd
+  - condition: "channel_correlation_low"
+    prefer: "cp"
+    weight: 0.5
+    data_types: ["Image","MSI","Video"]
+    reason: "A compact separable-factor alternative, not evidence that low correlation implies low CP rank."
+    keywords: ["CP","rank"]
+
+  - condition: "large_contiguous_hole"
+    prefer: "tucker"
     weight: 0.75
-    reason: t-SVD couples spatial matrices through third-mode Fourier tubes, although RGB provides only two real-FFT frequency bins.
-    keywords: [channel, correlation, RGB, t-SVD, tubal rank, t-product]
+    data_types: ["Image","MSI","Video"]
+    reason: "Test a flexible core against compact alternatives; projected 2-D holes do not describe spectral/time slices."
+    keywords: ["block","core"]
 
-  - condition: channel_correlation_low
-    prefer: cp
-    weight: 1.0
-    reason: CP preserves explicit image modes without assuming a compressed Tucker channel core.
-    keywords: [channel, CP, mode, rank one]
-
-  - condition: large_contiguous_hole
-    prefer: tucker
-    weight: 2.0
-    reason: A dominant hole calls for the more expressive global interaction core, while still warning about extrapolation risk.
-    keywords: [large hole, block, core, extrapolation]
-
-  - condition: large_contiguous_hole
-    prefer: hierarchical_tucker
-    weight: 1.0
-    reason: Hierarchical Tucker compresses spatial interactions through a dimension tree while retaining separate height and width factors.
-    keywords: [large hole, hierarchy, dimension tree, spatial transfer]
-
-  - condition: many_small_holes
-    prefer: cp
-    weight: 1.5
-    reason: CP is parameter-efficient when many missing pixels remain surrounded by observations.
-    keywords: [many holes, random, parameter efficient, CP]
-
-  - condition: image_aspect_ratio_high
-    prefer: tucker
-    weight: 1.5
-    reason: Tucker supports unequal height and width ranks for anisotropic images.
-    keywords: [aspect ratio, anisotropic, height rank, width rank]
-
-  - condition: image_aspect_ratio_high
-    prefer: tt
-    weight: 1.5
-    reason: Tensor Train offers a parameter-efficient sequential factorization for anisotropic spatial modes.
-    keywords: [aspect ratio, anisotropic, Tensor Train, TT rank, mode ordering]
-
-  - condition: local_smoothness_high
-    prefer: matrix
-    weight: 1.0
-    reason: A simple global low-rank unfolding is often sufficient for very smooth visible structure.
-    keywords: [smooth, low rank, matrix, global]
-
-  - condition: local_smoothness_high
-    prefer: nonnegative_tucker
+  - condition: "large_contiguous_hole"
+    prefer: "hierarchical_tucker"
     weight: 0.75
-    reason: Nonnegative Tucker is compatible with nonnegative image intensity structure and yields additive parts, but its positivity constraint may reduce flexibility.
-    keywords: [smooth, nonnegative, image intensity, additive parts, Tucker]
+    data_types: ["Image","MSI","Video"]
+    reason: "Compare fixed-tree transfer coupling with a dense Tucker core; do not discard the shallow hierarchy by name."
+    keywords: ["hierarchical","transfer"]
 
-  - condition: local_smoothness_high
-    prefer: nonnegative_cp
+  - condition: "many_small_holes"
+    prefer: "cp"
+    weight: 0.75
+    data_types: ["Image","MSI","Video"]
+    reason: "Dispersed spatial support motivates a compact factor test; full tensor index coverage must still be checked."
+    keywords: ["CP","random"]
+
+  - condition: "image_aspect_ratio_high"
+    prefer: "tucker"
+    weight: 0.75
+    data_types: ["Image","MSI","Video"]
+    reason: "Separate first/second spatial ranks can test anisotropy; aspect ratio is not a rank estimate."
+    keywords: ["rank","anisotropic"]
+
+  - condition: "image_aspect_ratio_high"
+    prefer: "tt"
+    weight: 0.75
+    data_types: ["Image","MSI","Video"]
+    reason: "Compare a fixed ordered chain with independently ranked cores; no automatic ordering search."
+    keywords: ["TT","ordering"]
+
+  - condition: "local_smoothness_high"
+    prefer: "matrix"
+    weight: 0.5
+    data_types: ["Image","MSI","Video"]
+    reason: "A smooth spatial proxy supports trying a simple low-rank unfolding, not a guarantee for hidden values."
+    keywords: ["matrix","low rank"]
+
+  - condition: "local_smoothness_high"
+    prefer: "nonnegative_tucker"
+    weight: 0.3
+    data_types: ["Image","MSI"]
+    reason: "Nonnegative intensity is compatible with an additive test, but does not prove nonnegative latent factors."
+    keywords: ["nonnegative","Tucker"]
+
+  - condition: "local_smoothness_high"
+    prefer: "nonnegative_cp"
+    weight: 0.3
+    data_types: ["Image","MSI"]
+    reason: "Compact additive control for intensity data; compare with signed factors instead of assuming positivity helps."
+    keywords: ["nonnegative","CP"]
+
+  - condition: "high_frequency_high"
+    prefer: "tucker"
+    weight: 0.4
+    data_types: ["Image","MSI","Video"]
+    reason: "A spatial preview proxy motivates a capacity comparison; it is not a temporal/spectral frequency measurement."
+    keywords: ["rank","texture"]
+
+  - condition: "high_frequency_high"
+    prefer: "btd"
+    weight: 0.5
+    data_types: ["Image","MSI","Video"]
+    reason: "Compare multiple global Tucker terms with one term; BTD does not automatically create local patches."
+    keywords: ["BTD","blocks"]
+
+  - condition: "high_frequency_high"
+    prefer: "tensor_ring"
+    weight: 0.5
+    data_types: ["Image","MSI","Video"]
+    reason: "Test different cyclic coupling capacity while tracking parameters and convergence."
+    keywords: ["TR","ring"]
+
+  - condition: "many_small_holes"
+    prefer: "tensor_ring"
+    weight: 0.4
+    data_types: ["Image","MSI","Video"]
+    reason: "A compact cyclic-factor alternative under dispersed support, not proof of slice identifiability."
+    keywords: ["ring","random"]
+
+  - condition: "data_type_msi"
+    prefer: "tucker"
+    weight: 0.5
+    data_types: ["MSI"]
+    reason: "Try separate spatial and band capacity; band rank is not restricted to RGB rank three."
+    keywords: ["MSI","band"]
+
+  - condition: "data_type_msi"
+    prefer: "mode3"
+    weight: 0.4
+    data_types: ["MSI"]
+    reason: "Band-subspace control for partially observed spectra; whole missing bands and spatial holes need extra constraints."
+    keywords: ["MSI","subspace"]
+
+  - condition: "data_type_msi"
+    prefer: "cp"
+    weight: 0.4
+    data_types: ["MSI"]
+    reason: "Include a compact separable spatial-spectral control instead of only dense cores."
+    keywords: ["MSI","CP"]
+
+  - condition: "channel_correlation_high"
+    prefer: "tucker"
     weight: 0.6
-    reason: Nonnegative CP provides a compact additive parts model for nonnegative image intensities, but may underfit complex signed interactions.
-    keywords: [smooth, nonnegative, CP, additive parts, image intensity]
+    data_types: ["MSI","Video"]
+    reason: "Cross-band/frame correlation is only a proxy for shared features, not a multilinear-rank estimate."
+    keywords: ["feature","correlation"]
 
-  - condition: high_frequency_high
-    prefer: tucker
-    weight: 1.0
-    reason: Tucker offers more flexible spatial capacity, although later spatial priors may still be needed.
-    keywords: [high frequency, texture, spatial rank, Tucker]
+  - condition: "feature_mode_large"
+    prefer: "hierarchical_tucker"
+    weight: 0.6
+    data_types: ["MSI","Video"]
+    reason: "A larger feature mode allows a non-RGB transfer bottleneck; current full feature leaf can cost F squared."
+    keywords: ["hierarchical","feature"]
 
-  - condition: high_frequency_high
-    prefer: btd
-    weight: 1.25
-    reason: BTD sums several compact Tucker blocks and can allocate multiple components to repeated or heterogeneous texture.
-    keywords: [high frequency, texture, BTD, Block-Term, multiple blocks]
+  - condition: "feature_mode_large"
+    prefer: "tt"
+    weight: 0.5
+    data_types: ["MSI","Video"]
+    reason: "Feature-side chain rank can exceed three when F exceeds RGB size; check actual memory and convergence."
+    keywords: ["TT","feature"]
 
-  - condition: high_frequency_high
-    prefer: tensor_ring
-    weight: 1.25
-    reason: Tensor Ring adds cyclic cross-mode capacity that can represent repeated texture more flexibly than a small CP model.
-    keywords: [high frequency, repeated texture, Tensor Ring, cyclic rank]
+  - condition: "ordered_feature_mode"
+    prefer: "tsvd"
+    weight: 0.6
+    data_types: ["MSI","Video"]
+    reason: "Test FFT coupling along bands or grayscale time, with circular-boundary caution; not a TNN solver."
+    keywords: ["tsvd","FFT"]
 
-  - condition: many_small_holes
-    prefer: tensor_ring
-    weight: 1.0
-    reason: Tensor Ring is a compact alternative when dispersed observations support cyclic cross-mode interactions.
-    keywords: [many holes, dispersed, Tensor Ring, cyclic interaction]
+  - condition: "data_type_video"
+    prefer: "tucker"
+    weight: 0.5
+    data_types: ["Video"]
+    reason: "Spatial x spatial x joint time-color model; not four independent Tucker modes."
+    keywords: ["Video","Tucker"]
+
+  - condition: "data_type_video"
+    prefer: "tt"
+    weight: 0.4
+    data_types: ["Video"]
+    reason: "Ordered spatial-to-joint-feature chain provides a distinct compact alternative, without a separate time core."
+    keywords: ["Video","TT"]
+
+  - condition: "data_type_video"
+    prefer: "matrix"
+    weight: 0.35
+    data_types: ["Video"]
+    reason: "Spatial unfolding control H x (W*T*C), not the usual HW x T frame matrix."
+    keywords: ["Video","matrix"]
+
+  - condition: "slices_missing"
+    prefer: "tsvd"
+    weight: 0.15
+    data_types: ["MSI","Video"]
+    reason: "FFT-coupled alternative worth testing, not a guarantee for arbitrary entire-band/frame missingness; RGB time-color mixing remains a caveat."
+    keywords: ["slices","FFT"]
+
+  - condition: "data_type_audio"
+    prefer: "matrix"
+    weight: 0.6
+    data_types: ["audio"]
+    reason: "A framed-waveform matrix control; repetitions are a hypothesis, not inferred from image smoothness."
+    keywords: ["audio","frame"]
+
+  - condition: "data_type_audio"
+    prefer: "cp"
+    weight: 0.5
+    data_types: ["audio"]
+    reason: "Test separable frame/waveform/channel structure; mono is a matrix parameterization, not a high-order advantage."
+    keywords: ["audio","CP"]
+
+  - condition: "data_type_audio"
+    prefer: "tt"
+    weight: 0.4
+    data_types: ["audio"]
+    reason: "Alternative frame-matrix parameterization; mono terminal rank is one and frame size matters."
+    keywords: ["audio","TT"]
+
+  - condition: "data_type_audio"
+    prefer: "tucker"
+    weight: 0.3
+    data_types: ["audio"]
+    reason: "Compare independent frame/within-frame capacities; no built-in temporal continuity."
+    keywords: ["audio","Tucker"]
+
+  - condition: "audio_mono"
+    prefer: "matrix"
+    weight: 0.4
+    data_types: ["audio"]
+    reason: "Singleton channel means matrix structure; image aspect ratio and RGB correlation rules must not apply."
+    keywords: ["mono","matrix"]
+
+  - condition: "audio_mono"
+    prefer: "tsvd"
+    weight: 0.15
+    data_types: ["audio"]
+    reason: "Numerical parameterization control only: length-one channel FFT is not temporal FFT or STFT."
+    keywords: ["mono","tsvd"]
+
+  - condition: "random_missing"
+    prefer: "cp"
+    weight: 0.2
+    data_types: ["audio"]
+    reason: "Scattered real-time missing points may retain per-frame support; this must be checked, not assumed."
+    keywords: ["audio","random"]
+
+  - condition: "block_missing"
+    prefer: "matrix"
+    weight: 0
+    data_types: ["audio"]
+    reason: "Continuous waveform gap warning: entire missing frame rows have no data constraints; no blanket low-rank recovery guarantee."
+    keywords: ["audio","block"]
+
+  - condition: "slices_missing"
+    prefer: "matrix"
+    weight: 0
+    data_types: ["audio"]
+    reason: "Audio slices are continuous real-time gaps, not an image stripe; whole missing frames need temporal priors."
+    keywords: ["audio","slices"]

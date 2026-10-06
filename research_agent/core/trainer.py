@@ -16,7 +16,7 @@ import torch
 from ..schemas import TrainingConfig
 from .masks import split_observed_mask
 from .models import create_model
-from .audio_metrics import active_audio_metadata, restore_waveform
+from .audio_metrics import active_audio_metadata, restore_waveform, audio_valid_mask, training_observation_mask
 
 
 ModelBuilder = Callable[
@@ -27,6 +27,9 @@ ModelBuilder = Callable[
 
 def observed_feature_mean(data: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Visible-only initialization; entirely missing features use visible global mean."""
+    mask = training_observation_mask(mask, data.shape)
+    if not mask.any():
+        raise ValueError("at least one genuinely observed sample is required")
     if mask.ndim == 2:
         return data[mask].mean(axis=0)
     flat_data = data.reshape(*data.shape[:2], -1)
@@ -267,23 +270,30 @@ def train_tensor_model(
     """Fit one model and select its checkpoint.
 
     When ``ground_truth`` is provided, every observed pixel is used for gradient
-    training and the missing-region GT MSE selects checkpoints.  The GT tensor is
+    training and the missing-region GT MSE of the clipped output selects checkpoints.  The GT tensor is
     never included in the optimization loss.  Omitting it preserves the legacy
     held-out-observed diagnostic path for low-level callers.
     """
 
     config.validate()
     _validate_training_arrays(observed_image, observed_mask, ground_truth)
+    audio_metadata = active_audio_metadata()
+    effective_mask = training_observation_mask(observed_mask, observed_image.shape)
+    if not effective_mask.any():
+        raise ValueError("at least one genuinely observed sample is required")
     set_reproducibility(seed, config.deterministic)
     device = resolve_device(config.device)
     if ground_truth is not None:
-        train_mask_np = observed_mask.copy()
-        validation_mask_np = ~observed_mask
+        train_mask_np = effective_mask
+        validation_mask_np = (~effective_mask & audio_valid_mask(observed_image.shape)
+                              if audio_metadata else ~observed_mask)
+        if not validation_mask_np.any():
+            raise ValueError("ground-truth selection requires a missing valid sample, not just padding")
         selection_reference_np = ground_truth
         selection_metric = "missing_region_ground_truth_mse"
     else:
         train_mask_np, validation_mask_np = split_observed_mask(
-            observed_mask,
+            effective_mask,
             validation_ratio=config.validation_observed_ratio,
             seed=seed + 10_003,
             strategy=config.validation_strategy,
@@ -318,12 +328,13 @@ def train_tensor_model(
     nmse_factor = None
     if audio is not None:
         waveform = restore_waveform(ground_truth, audio)
-        missing = (~observed_mask).reshape(-1, audio["channels"])[:audio["sample_count"]]
+        missing = validation_mask_np.reshape(-1, audio["channels"])[:audio["sample_count"]]
         energy = float(np.square(waveform[missing]).sum())
         scale = (audio["original_max"] - audio["original_min"]) if audio["normalization"] == "min_max" else 0.0 if audio["normalization"] == "constant_to_zero" else 1.0
         nmse_factor = scale * scale * int(missing.sum()) / energy if energy > 0 else None
         selection_metric = "missing_original_waveform_nmse"
     best_selection_score = float("inf")
+    patience_reference_score = float("inf")
     best_step = 0
     best_state = None
     checks_without_improvement = 0
@@ -361,15 +372,22 @@ def train_tensor_model(
                 progress.update(
                     step=step,
                     train_loss=float(total_loss.detach().item()),
+                    status="训练中（更新前损失）",
                 )
             continue
 
         model.eval()
         with torch.no_grad():
             current_prediction = model()
+            if not bool(torch.isfinite(current_prediction).all()):
+                raise FloatingPointError("checkpoint prediction became NaN or Inf at step %d" % step)
+            current_terms = model.loss_terms(current_prediction, observed, train_mask)
+            current_total_loss = sum(current_terms.values())
+            if not bool(torch.isfinite(current_total_loss)):
+                raise FloatingPointError("checkpoint training loss became NaN or Inf at step %d" % step)
             validation_mse = float(
                 _validation_mse(
-                    current_prediction, selection_reference, validation_mask
+                    current_prediction.clamp(0.0, 1.0), selection_reference, validation_mask
                 ).item()
             )
         missing_psnr = (
@@ -380,8 +398,11 @@ def train_tensor_model(
         history.append(
             {
                 "step": step,
-                "total_train_loss": float(total_loss.detach().item()),
-                "data_train_loss": float(loss_terms["data_loss"].detach().item()),
+                "total_train_loss": float(current_total_loss.item()),
+                "data_train_loss": float(current_terms["data_loss"].item()),
+                "training_loss_timing": "post_optimizer_step",
+                "training_prediction_scope": "raw_unclipped_output",
+                "regularization_losses": {name: float(value.item()) for name, value in current_terms.items() if name != "data_loss"},
                 "validation_mse": validation_mse,
                 "selection_metric": selection_metric,
                 "missing_gt_mse": validation_mse if ground_truth is not None else None,
@@ -397,18 +418,22 @@ def train_tensor_model(
             if value is not None:
                 selection_score = value
 
-        if selection_score < best_selection_score - config.early_stopping_min_delta:
+        # Keep the actual best output. min_delta controls patience, not which
+        # checkpoint is returned: a small real improvement must not be discarded.
+        if selection_score < best_selection_score:
             best_selection_score = selection_score
             best_validation_mse = validation_mse
             best_step = step
             best_state = copy.deepcopy(model.state_dict())
+        if selection_score < patience_reference_score - config.early_stopping_min_delta:
+            patience_reference_score = selection_score
             checks_without_improvement = 0
         else:
             checks_without_improvement += 1
 
         progress.update(
             step=step,
-            train_loss=float(total_loss.detach().item()),
+            train_loss=float(current_total_loss.item()),
             validation_loss=selection_score,
         )
 
@@ -418,7 +443,7 @@ def train_tensor_model(
 
     progress.finish(
         step=step,
-        train_loss=float(total_loss.detach().item()),
+        train_loss=float(current_total_loss.item()),
         validation_loss=selection_score,
         status=("早停，best=%d" % best_step) if stopped_early else ("完成，best=%d" % best_step),
     )
@@ -482,7 +507,8 @@ def fit_tensor_model_on_all_observations(
 
     set_reproducibility(seed, config.deterministic)
     device = resolve_device(config.device)
-    initial_channel_mean = observed_feature_mean(observed_image, observed_mask)
+    effective_mask = training_observation_mask(observed_mask, observed_image.shape)
+    initial_channel_mean = observed_feature_mean(observed_image, effective_mask)
     model = _build_model(
         model_name=model_name,
         image_shape=tuple(observed_image.shape),
@@ -491,7 +517,7 @@ def fit_tensor_model_on_all_observations(
         model_builder=model_builder,
     ).to(device)
     observed = torch.as_tensor(observed_image, dtype=torch.float32, device=device)
-    fit_mask = torch.as_tensor(observed_mask, dtype=torch.bool, device=device)
+    fit_mask = torch.as_tensor(effective_mask, dtype=torch.bool, device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     history = []
     started_at = time.perf_counter()
@@ -527,17 +553,25 @@ def fit_tensor_model_on_all_observations(
                 progress.update(
                     step=step,
                     train_loss=float(total_loss.detach().item()),
+                    status="训练中（更新前损失）",
                 )
             continue
         model.eval()
         with torch.no_grad():
             current_prediction = model()
+            if not bool(torch.isfinite(current_prediction).all()):
+                raise FloatingPointError("final-fit checkpoint prediction became NaN or Inf at step %d" % step)
             current_terms = model.loss_terms(current_prediction, observed, fit_mask)
+            if not bool(torch.isfinite(sum(current_terms.values()))):
+                raise FloatingPointError("final-fit checkpoint loss became NaN or Inf at step %d" % step)
         history.append(
             {
                 "step": step,
                 "total_train_loss": float(sum(current_terms.values()).item()),
                 "data_train_loss": float(current_terms["data_loss"].item()),
+                "training_loss_timing": "post_optimizer_step",
+                "training_prediction_scope": "raw_unclipped_output",
+                "regularization_losses": {name: float(value.item()) for name, value in current_terms.items() if name != "data_loss"},
             }
         )
         progress.update(
@@ -571,6 +605,6 @@ def fit_tensor_model_on_all_observations(
         runtime_seconds=float(time.perf_counter() - started_at),
         parameter_count=sum(parameter.numel() for parameter in model.parameters()),
         device=str(device),
-        fit_mask=observed_mask.copy(),
+        fit_mask=effective_mask.copy(),
         state_dict=checkpoint_state,
     )

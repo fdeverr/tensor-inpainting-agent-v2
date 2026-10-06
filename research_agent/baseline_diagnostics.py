@@ -131,6 +131,11 @@ def summarize_baseline_history(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return {
         "record_count": len(records),
+        "training_loss_protocol": {
+            "timing": sorted({item.get("training_loss_timing", "legacy_unspecified") for item in history}),
+            "prediction_scope": sorted({item.get("training_prediction_scope", "legacy_unspecified") for item in history}),
+            "total_loss_includes_regularization": True,
+        },
         "first": first,
         "last": last,
         "minimum_recorded_train_loss": min(

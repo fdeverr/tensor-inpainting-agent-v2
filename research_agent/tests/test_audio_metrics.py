@@ -86,7 +86,7 @@ def test_audio_reference_ranks_lower_nmse_and_describes_no_image_metrics():
     }}
     reference = _algorithm_comparison_reference(state)
     assert reference["selection_metric"] == "missing_nmse"
-    assert reference["winner"] == "nearest_neighbor_manhattan"
+    assert reference["winner"] == "linear_interpolation_waveform"
     assert reference["selected_tensor_nmse_above_best"] == pytest.approx(0.2)
     assert "selected_tensor_gap_to_best_missing_psnr_db" not in reference
     assert list(describe_metrics({"missing_nmse": 0.2})) == ["missing_nmse"]
@@ -106,3 +106,24 @@ def test_audio_llm_prompt_has_nmse_objective_not_image_objective():
     protocol = payload["evolution_protocol"]
     assert "psnr_feedback_rule" not in protocol
     assert "Audio uses only missing original-waveform NMSE" in protocol["optimization_objective_rule"]
+
+
+def test_audio_profile_excludes_padding_even_when_padding_mask_is_missing(tmp_path):
+    from research_agent.agent_tools.research_tools import AnalyzeImageTool
+    gt, mask, metadata, _ = audio_case()
+    source = tmp_path / "audio.npy"
+    np.save(source, gt)
+    profiles = []
+    for padding_observed in (True, False):
+        mask.reshape(-1, 2)[5] = padding_observed
+        mask_path = tmp_path / "mask.npy"
+        np.save(mask_path, mask)
+        with audio_metric_context(metadata):
+            response = AnalyzeImageTool().run({"run_id": "test", "image_path": str(source),
+                "run_dir": str(tmp_path / str(padding_observed)), "mask_type": "random",
+                "missing_rate": 0.4, "seed": 1, "image_size": None,
+                "data_type": "audio", "observation_mask_path": str(mask_path), "valid_element_count": 10})
+        profiles.append(response.data["profile"])
+    assert profiles[0]["observed_pixels"] == profiles[1]["observed_pixels"] == 6
+    assert profiles[0]["actual_missing_rate"] == profiles[1]["actual_missing_rate"] == 0.4
+    assert profiles[0]["visible_channel_mean"] == profiles[1]["visible_channel_mean"]
